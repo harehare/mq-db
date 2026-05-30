@@ -6,7 +6,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
-use mqdb::{DocumentStore, MqEngine, SqlEngine, block::BlockType};
+use mqdb::{DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI structure
@@ -41,6 +41,10 @@ enum Commands {
         /// Path to .mqdb store file
         #[arg(short, long, default_value = "store.mqdb")]
         db: PathBuf,
+
+        /// Output format
+        #[arg(long, short = 'F', default_value = "table")]
+        format: OutputFormat,
     },
 
     /// Run an mq query over the store
@@ -51,6 +55,10 @@ enum Commands {
         /// Path to .mqdb store file
         #[arg(short, long, default_value = "store.mqdb")]
         db: PathBuf,
+
+        /// Output format
+        #[arg(long, short = 'F', default_value = "table")]
+        format: OutputFormat,
     },
 
     /// Run a SQL query over the store
@@ -65,6 +73,10 @@ enum Commands {
         /// Read SQL from a file
         #[arg(short, long)]
         file: Option<PathBuf>,
+
+        /// Output format
+        #[arg(long, short = 'F', default_value = "table")]
+        format: OutputFormat,
     },
 
     /// Interactive REPL (supports both mq and SQL)
@@ -112,6 +124,23 @@ enum Commands {
         #[arg(short, long, default_value = "store.mqdb")]
         db: PathBuf,
     },
+}
+
+#[derive(Clone, ValueEnum, Debug, Default)]
+enum OutputFormat {
+    /// Unicode box-drawing table (default)
+    #[default]
+    Table,
+    /// JSON array of objects
+    Json,
+    /// CSV with header row
+    Csv,
+    /// Tab-separated values with header row
+    Tsv,
+    /// GFM Markdown table / reconstructed Markdown (for mq)
+    Markdown,
+    /// HTML table / HTML blocks (for mq)
+    Html,
 }
 
 #[derive(Clone, ValueEnum, Debug)]
@@ -246,110 +275,177 @@ fn main() -> anyhow::Result<()> {
         }
 
         // ── list ─────────────────────────────────────────────────────────────
-        Commands::List { db } => {
+        Commands::List { db, format } => {
             let store = load_store(&db)?;
             if store.is_empty() {
                 println!("(no documents indexed)");
                 return Ok(());
             }
 
-            // Compute column widths
-            let path_width = store
-                .documents()
-                .iter()
-                .map(|d| {
-                    d.path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().len())
+            match format {
+                OutputFormat::Json
+                | OutputFormat::Csv
+                | OutputFormat::Tsv
+                | OutputFormat::Markdown
+                | OutputFormat::Html => {
+                    let engine = SqlEngine::new(&store).map_err(|e| anyhow::anyhow!("{}", e))?;
+                    let out = engine
+                        .execute("SELECT id, path, title, tags FROM documents")
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    match format {
+                        OutputFormat::Json => print!("{}", out.to_json()),
+                        OutputFormat::Csv => print!("{}", out.to_csv()),
+                        OutputFormat::Tsv => print!("{}", out.to_tsv()),
+                        OutputFormat::Markdown => print!("{}", out.to_markdown_table()),
+                        OutputFormat::Html => print!("{}", out.to_html_table()),
+                        OutputFormat::Table => unreachable!(),
+                    }
+                }
+                OutputFormat::Table => {
+                    // Compute column widths
+                    let path_width = store
+                        .documents()
+                        .iter()
+                        .map(|d| {
+                            d.path
+                                .as_ref()
+                                .map(|p| p.to_string_lossy().len())
+                                .unwrap_or(10)
+                                .min(52)
+                        })
+                        .max()
                         .unwrap_or(10)
-                        .min(52)
-                })
-                .max()
-                .unwrap_or(10)
-                .max(12); // "Path / Title" header
-            let tag_width = store
-                .documents()
-                .iter()
-                .map(|d| d.zone_maps.tags.join(", ").len())
-                .max()
-                .unwrap_or(0)
-                .max(4); // "Tags" header
+                        .max(12); // "Path / Title" header
+                    let tag_width = store
+                        .documents()
+                        .iter()
+                        .map(|d| d.zone_maps.tags.join(", ").len())
+                        .max()
+                        .unwrap_or(0)
+                        .max(4); // "Tags" header
 
-            let sep_id = "──────";
-            let sep_path = "─".repeat(path_width + 2);
-            let sep_blocks = "────────";
-            let sep_tags = "─".repeat(tag_width.max(4) + 2);
+                    let sep_id = "──────";
+                    let sep_path = "─".repeat(path_width + 2);
+                    let sep_blocks = "────────";
+                    let sep_tags = "─".repeat(tag_width.max(4) + 2);
 
-            println!(
-                "┌{}┬{}┬{}┬{}┐",
-                sep_id, sep_path, sep_blocks, sep_tags
-            );
-            println!(
-                "│ {:<4} │ {:<path_width$} │ {:>6} │ {:<tag_w$} │",
-                "ID",
-                "Path / Title",
-                "Blocks",
-                "Tags",
-                path_width = path_width,
-                tag_w = tag_width.max(4),
-            );
-            println!(
-                "├{}┼{}┼{}┼{}┤",
-                sep_id, sep_path, sep_blocks, sep_tags
-            );
+                    println!(
+                        "┌{}┬{}┬{}┬{}┐",
+                        sep_id, sep_path, sep_blocks, sep_tags
+                    );
+                    println!(
+                        "│ {:<4} │ {:<path_width$} │ {:>6} │ {:<tag_w$} │",
+                        "ID",
+                        "Path / Title",
+                        "Blocks",
+                        "Tags",
+                        path_width = path_width,
+                        tag_w = tag_width.max(4),
+                    );
+                    println!(
+                        "├{}┼{}┼{}┼{}┤",
+                        sep_id, sep_path, sep_blocks, sep_tags
+                    );
 
-            for doc in store.documents() {
-                let path_str = doc
-                    .path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| {
-                        doc.zone_maps.title.clone().unwrap_or_else(|| format!("<doc {}>", doc.id))
-                    });
-                let path_display = if path_str.len() > path_width {
-                    format!("…{}", &path_str[path_str.len() - path_width + 1..])
-                } else {
-                    path_str.clone()
-                };
-                let tags = doc.zone_maps.tags.join(", ");
-                println!(
-                    "│ {:>4} │ {:<path_width$} │ {:>6} │ {:<tag_w$} │",
-                    doc.id,
-                    path_display,
-                    doc.blocks.len(),
-                    tags,
-                    path_width = path_width,
-                    tag_w = tag_width.max(4),
-                );
+                    for doc in store.documents() {
+                        let path_str = doc
+                            .path
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| {
+                                doc.zone_maps
+                                    .title
+                                    .clone()
+                                    .unwrap_or_else(|| format!("<doc {}>", doc.id))
+                            });
+                        let path_display = if path_str.len() > path_width {
+                            format!("…{}", &path_str[path_str.len() - path_width + 1..])
+                        } else {
+                            path_str.clone()
+                        };
+                        let tags = doc.zone_maps.tags.join(", ");
+                        println!(
+                            "│ {:>4} │ {:<path_width$} │ {:>6} │ {:<tag_w$} │",
+                            doc.id,
+                            path_display,
+                            doc.blocks.len(),
+                            tags,
+                            path_width = path_width,
+                            tag_w = tag_width.max(4),
+                        );
+                    }
+
+                    println!(
+                        "└{}┴{}┴{}┴{}┘",
+                        sep_id, sep_path, sep_blocks, sep_tags
+                    );
+                    println!(
+                        "{} document{}",
+                        store.len(),
+                        if store.len() == 1 { "" } else { "s" }
+                    );
+                }
             }
-
-            println!(
-                "└{}┴{}┴{}┴{}┘",
-                sep_id, sep_path, sep_blocks, sep_tags
-            );
-            println!(
-                "{} document{}",
-                store.len(),
-                if store.len() == 1 { "" } else { "s" }
-            );
         }
 
         // ── mq ───────────────────────────────────────────────────────────────
-        Commands::Mq { code, db } => {
+        Commands::Mq { code, db, format } => {
             let store = load_store(&db)?;
             let results = MqEngine::eval_store(&code, &store)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             if results.is_empty() {
                 println!("(no results)");
             } else {
-                for line in &results {
-                    println!("{}", line);
+                match format {
+                    OutputFormat::Json => {
+                        let items: Vec<String> = results
+                            .iter()
+                            .map(|s| {
+                                format!(
+                                    "\"{}\"",
+                                    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+                                )
+                            })
+                            .collect();
+                        println!("[{}]", items.join(","));
+                    }
+                    OutputFormat::Csv => {
+                        println!("content");
+                        for line in &results {
+                            let cell = if line.contains(',')
+                                || line.contains('"')
+                                || line.contains('\n')
+                            {
+                                format!("\"{}\"", line.replace('"', "\"\""))
+                            } else {
+                                line.clone()
+                            };
+                            println!("{}", cell);
+                        }
+                    }
+                    OutputFormat::Tsv => {
+                        println!("content");
+                        for line in &results {
+                            println!("{}", line);
+                        }
+                    }
+                    OutputFormat::Markdown => {
+                        println!("{}", mq_to_markdown(&results));
+                    }
+                    OutputFormat::Html => {
+                        print!("{}", mq_to_html(&results));
+                    }
+                    OutputFormat::Table => {
+                        for line in &results {
+                            println!("{}", line);
+                        }
+                    }
                 }
             }
         }
 
         // ── sql ──────────────────────────────────────────────────────────────
-        Commands::Sql { query, db, file } => {
+        Commands::Sql { query, db, file, format } => {
             let sql = if let Some(f) = file {
                 std::fs::read_to_string(&f)
                     .map_err(|e| anyhow::anyhow!("Cannot read file {}: {}", f.display(), e))?
@@ -362,7 +458,14 @@ fn main() -> anyhow::Result<()> {
             let store = load_store(&db)?;
             let engine = SqlEngine::new(&store).map_err(|e| anyhow::anyhow!("{}", e))?;
             let out = engine.execute(&sql).map_err(|e| anyhow::anyhow!("{}", e))?;
-            print!("{}", out.to_table());
+            match format {
+                OutputFormat::Table => print!("{}", out.to_table()),
+                OutputFormat::Json => print!("{}", out.to_json()),
+                OutputFormat::Csv => print!("{}", out.to_csv()),
+                OutputFormat::Tsv => print!("{}", out.to_tsv()),
+                OutputFormat::Markdown => print!("{}", out.to_markdown_table()),
+                OutputFormat::Html => print!("{}", out.to_html_table()),
+            }
         }
 
         // ── repl ─────────────────────────────────────────────────────────────
@@ -562,6 +665,121 @@ fn main() -> anyhow::Result<()> {
 
 fn digits(n: u32) -> usize {
     if n == 0 { 1 } else { n.ilog10() as usize + 1 }
+}
+
+/// Join mq results back into reconstructed Markdown, separated by blank lines.
+/// Adjacent list items are kept together without a blank line between them.
+fn mq_to_markdown(results: &[String]) -> String {
+    let mut out = String::new();
+    for (i, block) in results.iter().enumerate() {
+        if i > 0 {
+            let prev = &results[i - 1];
+            let prev_is_list = prev.trim_start().starts_with("- ") || prev.trim_start().starts_with("* ") || prev.trim_start().chars().next().is_some_and(|c| c.is_ascii_digit());
+            let curr_is_list = block.trim_start().starts_with("- ") || block.trim_start().starts_with("* ") || block.trim_start().chars().next().is_some_and(|c| c.is_ascii_digit());
+            if prev_is_list && curr_is_list {
+                out.push('\n');
+            } else {
+                out.push_str("\n\n");
+            }
+        }
+        out.push_str(block);
+    }
+    out
+}
+
+/// Convert mq results (markdown block strings) to HTML.
+fn mq_to_html(results: &[String]) -> String {
+    let mut out = String::new();
+    for block in results {
+        out.push_str(&md_block_to_html(block));
+        out.push('\n');
+    }
+    out
+}
+
+fn md_block_to_html(s: &str) -> String {
+    let trimmed = s.trim();
+
+    // Headings: # … ######
+    for depth in (1u8..=6).rev() {
+        let prefix = "#".repeat(depth as usize);
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            if rest.starts_with(' ') || rest.is_empty() {
+                let text = html_escape(rest.trim());
+                return format!("<h{depth}>{text}</h{depth}>");
+            }
+        }
+    }
+
+    // Fenced code block
+    if trimmed.starts_with("```") {
+        let first_line = trimmed.lines().next().unwrap_or("");
+        let lang = first_line.trim_start_matches('`').trim();
+        let code: String = trimmed
+            .lines()
+            .skip(1)
+            .take_while(|l| !l.trim_start().starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let escaped = html_escape(&code);
+        return if lang.is_empty() {
+            format!("<pre><code>{escaped}</code></pre>")
+        } else {
+            format!("<pre><code class=\"language-{lang}\">{escaped}</code></pre>")
+        };
+    }
+
+    // Blockquote
+    if trimmed.starts_with("> ") {
+        let inner = trimmed
+            .lines()
+            .map(|l| l.strip_prefix("> ").unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!("<blockquote><p>{}</p></blockquote>", html_escape(&inner));
+    }
+
+    // Horizontal rule
+    if matches!(trimmed, "---" | "***" | "___") {
+        return "<hr>".to_string();
+    }
+
+    // Unordered list
+    if trimmed.lines().all(|l| {
+        let l = l.trim();
+        l.is_empty() || l.starts_with("- ") || l.starts_with("* ")
+    }) && trimmed.lines().any(|l| l.trim().starts_with("- ") || l.trim().starts_with("* ")) {
+        let items: String = trimmed
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let text = l.trim().trim_start_matches("- ").trim_start_matches("* ");
+                format!("<li>{}</li>", html_escape(text))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!("<ul>\n{items}\n</ul>");
+    }
+
+    // Ordered list
+    if trimmed.lines().all(|l| {
+        let l = l.trim();
+        l.is_empty() || l.chars().next().is_some_and(|c| c.is_ascii_digit())
+    }) && trimmed.lines().any(|l| l.trim().chars().next().is_some_and(|c| c.is_ascii_digit())) {
+        let items: String = trimmed
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let text = l.trim().splitn(2, ". ").nth(1).unwrap_or(l.trim());
+                format!("<li>{}</li>", html_escape(text))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return format!("<ol>\n{items}\n</ol>");
+    }
+
+    // Paragraph (default)
+    format!("<p>{}</p>", html_escape(trimmed))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

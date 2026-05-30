@@ -6,8 +6,8 @@ description = "Markdown-specialized embedded database with interval-indexed bloc
 license = "MIT"
 
 [dependencies]
-mq-markdown = { path = "../mq/crates/mq-markdown" }
-mq-lang = { path = "../mq/crates/mq-lang" }
+mq-markdown = "0.5.31"
+mq-lang = "0.5.31"
 serde_yaml = "0.9"
 thiserror = "2.0"
 sqlparser = "0.62"
