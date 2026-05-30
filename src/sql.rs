@@ -57,7 +57,7 @@ use crate::{
     DocumentStore, MqdbError,
     block::{Block, BlockType, Properties, PropertyValue},
     document::Document,
-    indexes::IndexHint,
+    indexes::{DocumentIndex, IndexHint},
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -828,15 +828,28 @@ fn like_dp(s: &[char], p: &[char], si: usize, pi: usize) -> bool {
 
 /// Custom SQL execution engine backed by a [`DocumentStore`] reference.
 ///
-/// Zero-copy: `SqlEngine::new` is O(1). All queries walk `Vec<Block>` directly.
+/// Secondary indexes are built once on construction (O(n) in total block count)
+/// and reused for every query. Commands that do not create a `SqlEngine`
+/// (mq, list, show, stats …) pay no index-construction cost.
 pub struct SqlEngine<'a> {
     store: &'a DocumentStore,
+    /// One `DocumentIndex` per document, in the same order as `store.documents()`.
+    indexes: Vec<DocumentIndex>,
 }
 
 impl<'a> SqlEngine<'a> {
-    /// Create a new engine. O(1) — no data is copied.
+    /// Build the engine and its secondary indexes. O(n) in total block count.
     pub fn new(store: &'a DocumentStore) -> Result<Self, MqdbError> {
-        Ok(Self { store })
+        let indexes = store
+            .documents()
+            .iter()
+            .map(|doc| DocumentIndex::build(&doc.blocks))
+            .collect();
+        Ok(Self { store, indexes })
+    }
+
+    fn documents_with_indexes(&self) -> impl Iterator<Item = (&Document, &DocumentIndex)> {
+        self.store.documents().iter().zip(self.indexes.iter())
     }
 
     /// Execute a SQL SELECT query against the store.
@@ -1011,7 +1024,7 @@ impl<'a> SqlEngine<'a> {
                 let mut rows = Vec::new();
                 let mut global_idx: u32 = 0;
 
-                for (doc, doc_idx) in self.store.documents_with_indexes() {
+                for (doc, doc_idx) in self.documents_with_indexes() {
                     // Try index-based access first
                     if let Some(local_indices) = hint.resolve(doc_idx) {
                         // Only materialise the pre-filtered blocks

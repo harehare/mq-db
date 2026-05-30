@@ -33,6 +33,8 @@ pub struct Document {
     pub path: Option<PathBuf>,
     /// Flattened, interval-indexed block list.
     pub blocks: Vec<Block>,
+    /// Authoritative block count — valid even when `blocks` is empty (catalog-only mode).
+    pub block_count: u32,
     /// Per-document statistics for query pruning.
     pub zone_maps: ZoneMaps,
 }
@@ -49,10 +51,28 @@ impl Document {
         blocks: Vec<Block>,
         zone_maps: ZoneMaps,
     ) -> Self {
+        let block_count = blocks.len() as u32;
         Self {
             id,
             path,
             blocks,
+            block_count,
+            zone_maps,
+        }
+    }
+
+    /// Construct from catalog metadata only; `blocks` will be empty.
+    pub fn from_catalog(
+        id: DocumentId,
+        path: Option<PathBuf>,
+        block_count: u32,
+        zone_maps: ZoneMaps,
+    ) -> Self {
+        Self {
+            id,
+            path,
+            blocks: Vec::new(),
+            block_count,
             zone_maps,
         }
     }

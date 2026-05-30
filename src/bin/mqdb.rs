@@ -34,6 +34,10 @@ enum Commands {
         /// Recursively walk directories
         #[arg(short, long)]
         recursive: bool,
+
+        /// Do not store source line/column spans (saves ~21 bytes per block)
+        #[arg(long)]
+        no_spans: bool,
     },
 
     /// List all indexed documents
@@ -207,6 +211,19 @@ fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
     DocumentStore::load(db).map_err(|e| anyhow::anyhow!("Failed to load store: {}", e))
 }
 
+/// Load only catalog metadata (zone maps, paths, block counts) — no block data.
+/// Use this for commands that don't need block content.
+fn load_catalog_store(db: &Path) -> anyhow::Result<DocumentStore> {
+    if !db.exists() {
+        anyhow::bail!(
+            "Store file not found: {}\nRun `mqdb index <files...>` to create it.",
+            db.display()
+        );
+    }
+    DocumentStore::load_catalog_only(db)
+        .map_err(|e| anyhow::anyhow!("Failed to load store: {}", e))
+}
+
 fn bar(count: usize, max: usize, width: usize) -> String {
     if max == 0 {
         return " ".repeat(width);
@@ -242,13 +259,16 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         // ── index ────────────────────────────────────────────────────────────
-        Commands::Index { paths, output, recursive } => {
+        Commands::Index { paths, output, recursive, no_spans } => {
             let files = collect_md_files(&paths, recursive);
             if files.is_empty() {
                 anyhow::bail!("No Markdown files found in the specified paths.");
             }
 
             let mut store = DocumentStore::new();
+            if no_spans {
+                store.set_store_spans(false);
+            }
             let mut errors = 0usize;
             for path in &files {
                 match store.add_file(path) {
@@ -276,7 +296,8 @@ fn main() -> anyhow::Result<()> {
 
         // ── list ─────────────────────────────────────────────────────────────
         Commands::List { db, format } => {
-            let store = load_store(&db)?;
+            // Catalog-only: skip deserialising all block data for a listing.
+            let store = load_catalog_store(&db)?;
             if store.is_empty() {
                 println!("(no documents indexed)");
                 return Ok(());
@@ -368,7 +389,7 @@ fn main() -> anyhow::Result<()> {
                             "│ {:>4} │ {:<path_width$} │ {:>6} │ {:<tag_w$} │",
                             doc.id,
                             path_display,
-                            doc.blocks.len(),
+                            doc.block_count,
                             tags,
                             path_width = path_width,
                             tag_w = tag_width.max(4),
