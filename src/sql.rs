@@ -57,7 +57,7 @@ use crate::{
     DocumentStore, MqdbError,
     block::{Block, BlockType, Properties, PropertyValue},
     document::Document,
-    indexes::IndexHint,
+    indexes::{DocumentIndex, IndexHint},
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -828,15 +828,28 @@ fn like_dp(s: &[char], p: &[char], si: usize, pi: usize) -> bool {
 
 /// Custom SQL execution engine backed by a [`DocumentStore`] reference.
 ///
-/// Zero-copy: `SqlEngine::new` is O(1). All queries walk `Vec<Block>` directly.
+/// Secondary indexes are built once on construction (O(n) in total block count)
+/// and reused for every query. Commands that do not create a `SqlEngine`
+/// (mq, list, show, stats …) pay no index-construction cost.
 pub struct SqlEngine<'a> {
     store: &'a DocumentStore,
+    /// One `DocumentIndex` per document, in the same order as `store.documents()`.
+    indexes: Vec<DocumentIndex>,
 }
 
 impl<'a> SqlEngine<'a> {
-    /// Create a new engine. O(1) — no data is copied.
+    /// Build the engine and its secondary indexes. O(n) in total block count.
     pub fn new(store: &'a DocumentStore) -> Result<Self, MqdbError> {
-        Ok(Self { store })
+        let indexes = store
+            .documents()
+            .iter()
+            .map(|doc| DocumentIndex::build(&doc.blocks))
+            .collect();
+        Ok(Self { store, indexes })
+    }
+
+    fn documents_with_indexes(&self) -> impl Iterator<Item = (&Document, &DocumentIndex)> {
+        self.store.documents().iter().zip(self.indexes.iter())
     }
 
     /// Execute a SQL SELECT query against the store.
@@ -1011,7 +1024,7 @@ impl<'a> SqlEngine<'a> {
                 let mut rows = Vec::new();
                 let mut global_idx: u32 = 0;
 
-                for (doc, doc_idx) in self.store.documents_with_indexes() {
+                for (doc, doc_idx) in self.documents_with_indexes() {
                     // Try index-based access first
                     if let Some(local_indices) = hint.resolve(doc_idx) {
                         // Only materialise the pre-filtered blocks
@@ -1576,6 +1589,7 @@ impl BlockType {
 mod tests {
     use super::*;
     use crate::DocumentStore;
+    use rstest::rstest;
 
     fn make_store() -> DocumentStore {
         let mut s = DocumentStore::new();
@@ -1692,5 +1706,55 @@ mod tests {
             "SqlEngine::new took {}ms — should be O(1)",
             elapsed.as_millis()
         );
+    }
+
+    // make_store() produces:
+    //   "# Doc\n\n## Architecture\n\nDetails\n\n```rust\nfn main(){}\n```\n\n## Other\n\nOther\n"
+    // → heading×3, paragraph×2, code×1  (6 blocks total)
+
+    #[rstest]
+    #[case("SELECT content FROM blocks WHERE block_type = 'heading'", 3)]
+    #[case("SELECT content FROM blocks WHERE block_type = 'paragraph'", 2)]
+    #[case("SELECT content FROM blocks WHERE block_type = 'code'", 1)]
+    #[case("SELECT content FROM blocks WHERE block_type = 'list'", 0)]
+    fn test_sql_where_block_type_param(#[case] sql: &str, #[case] expected: usize) {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        assert_eq!(engine.execute(sql).unwrap().rows.len(), expected);
+    }
+
+    #[rstest]
+    #[case("SELECT content FROM blocks WHERE content LIKE '%Doc%'", 1)]
+    #[case("SELECT content FROM blocks WHERE content LIKE '%chitect%'", 1)]
+    #[case("SELECT content FROM blocks WHERE content LIKE '%Other%'", 2)]
+    #[case("SELECT content FROM blocks WHERE content LIKE '%Details%'", 1)]
+    #[case("SELECT content FROM blocks WHERE content LIKE '%nonexistent%'", 0)]
+    fn test_sql_like_pattern_param(#[case] sql: &str, #[case] expected: usize) {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        assert_eq!(engine.execute(sql).unwrap().rows.len(), expected);
+    }
+
+    #[rstest]
+    #[case("SELECT content FROM blocks LIMIT 1", 1)]
+    #[case("SELECT content FROM blocks LIMIT 3", 3)]
+    #[case("SELECT content FROM blocks LIMIT 5", 5)]
+    #[case("SELECT content FROM blocks LIMIT 1000", 6)]
+    fn test_sql_limit_row_count_param(#[case] sql: &str, #[case] expected: usize) {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        assert_eq!(engine.execute(sql).unwrap().rows.len(), expected);
+    }
+
+    #[rstest]
+    #[case("SELECT count(*) FROM blocks", "6")]
+    #[case("SELECT count(*) FROM blocks WHERE block_type = 'heading'", "3")]
+    #[case("SELECT count(*) FROM blocks WHERE block_type = 'code'", "1")]
+    fn test_sql_count_aggregate_param(#[case] sql: &str, #[case] expected: &str) {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine.execute(sql).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0], expected);
     }
 }

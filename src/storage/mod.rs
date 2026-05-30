@@ -165,13 +165,15 @@ mod tests {
     };
 
     use super::*;
+    use rstest::rstest;
+
     use crate::{
         DocumentStore,
         block::{BlockType, Properties, PropertyValue, Span},
         document::{Document, ZoneMaps},
         storage::{
             catalog::CatalogEntry,
-            codec::{decode_zone_map, encode_zone_map},
+            codec::{decode_block, decode_zone_map, encode_block, encode_zone_map},
         },
     };
 
@@ -354,5 +356,48 @@ mod tests {
         assert_eq!(loaded.documents(), store.documents());
 
         cleanup(&path);
+    }
+
+    #[rstest]
+    #[case(BlockType::Heading)]
+    #[case(BlockType::Paragraph)]
+    #[case(BlockType::Code)]
+    #[case(BlockType::List)]
+    #[case(BlockType::TableCell)]
+    #[case(BlockType::TableRow)]
+    #[case(BlockType::TableAlign)]
+    #[case(BlockType::Blockquote)]
+    #[case(BlockType::HorizontalRule)]
+    #[case(BlockType::Html)]
+    #[case(BlockType::Yaml)]
+    #[case(BlockType::Toml)]
+    #[case(BlockType::Math)]
+    #[case(BlockType::Definition)]
+    #[case(BlockType::Footnote)]
+    fn block_codec_round_trip_param(#[case] block_type: BlockType) {
+        let block = sample_block(block_type, 42);
+        let encoded = encode_block(&block);
+        let (decoded, consumed) = decode_block(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, block);
+    }
+
+    #[rstest]
+    #[case(Some("My Title"))]
+    #[case(None)]
+    #[case(Some("title with spaces and unicode: こんにちは"))]
+    fn zone_map_title_round_trip_param(#[case] title: Option<&str>) {
+        let zone_maps = ZoneMaps {
+            max_heading_depth: 3,
+            heading_slugs: ["intro", "usage"].iter().map(|s| s.to_string()).collect(),
+            heading_contents: ["Intro", "Usage"].iter().map(|s| s.to_string()).collect(),
+            code_languages: ["rust", "python"].iter().map(|s| s.to_string()).collect(),
+            frontmatter_keys: ["title", "tags"].iter().map(|s| s.to_string()).collect(),
+            title: title.map(|s| s.to_string()),
+            tags: vec!["db".to_string(), "markdown".to_string()],
+        };
+        let encoded = encode_zone_map(&zone_maps);
+        let decoded = decode_zone_map(&encoded).unwrap();
+        assert_eq!(decoded, zone_maps);
     }
 }

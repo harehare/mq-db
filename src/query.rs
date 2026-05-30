@@ -318,6 +318,7 @@ pub struct LintViolation<'a> {
 mod tests {
     use super::*;
     use crate::DocumentStore;
+    use rstest::rstest;
 
     fn store_with(sources: &[&str]) -> DocumentStore {
         let mut s = DocumentStore::new();
@@ -429,5 +430,62 @@ mod tests {
         let q = store.query().code_lang("rust");
         let results = q.blocks();
         assert_eq!(results.len(), 2);
+    }
+
+    #[rstest]
+    #[case(BlockType::Heading, 3)]
+    #[case(BlockType::Paragraph, 1)]
+    #[case(BlockType::Code, 1)]
+    #[case(BlockType::List, 1)]
+    fn test_block_type_filter_count_param(#[case] block_type: BlockType, #[case] expected: usize) {
+        let store = store_with(&[
+            "# H1\n\n## H2\n\n### H3\n\nParagraph\n\n```rust\ncode\n```\n\n- item\n",
+        ]);
+        assert_eq!(store.query().block_type(block_type).blocks().len(), expected);
+    }
+
+    #[rstest]
+    #[case(1, 1, "H1")]
+    #[case(2, 1, "H2")]
+    #[case(3, 1, "H3")]
+    fn test_heading_depth_count_param(
+        #[case] depth: u8,
+        #[case] expected: usize,
+        #[case] content: &str,
+    ) {
+        let store = store_with(&["# H1\n\n## H2\n\n### H3\n"]);
+        let results = store.query().heading_depth(depth).blocks();
+        assert_eq!(results.len(), expected);
+        assert_eq!(results[0].content, content);
+    }
+
+    #[rstest]
+    #[case("Hello", 1)]
+    #[case("World", 1)]
+    #[case("Goodbye", 1)]
+    #[case("nonexistent_xyz", 0)]
+    fn test_content_contains_count_param(#[case] needle: &str, #[case] expected: usize) {
+        let store = store_with(&["# Hello World\n\n## Goodbye\n"]);
+        assert_eq!(store.query().content_contains(needle).blocks().len(), expected);
+    }
+
+    #[rstest]
+    #[case("rust", 1)]
+    #[case("python", 1)]
+    #[case("go", 0)]
+    fn test_code_lang_count_param(#[case] lang: &str, #[case] expected: usize) {
+        let store = store_with(&["```rust\nfn x(){}\n```\n\n```python\nx=1\n```\n"]);
+        assert_eq!(store.query().code_lang(lang).blocks().len(), expected);
+    }
+
+    #[rstest]
+    #[case(1, 1)]
+    #[case(2, 2)]
+    #[case(3, 3)]
+    #[case(100, 4)]
+    fn test_limit_count_param(#[case] limit: usize, #[case] expected: usize) {
+        let store = store_with(&["# A\n\n# B\n\n# C\n\n# D\n"]);
+        let results = store.query().heading_depth(1).limit(limit).blocks();
+        assert_eq!(results.len(), expected);
     }
 }

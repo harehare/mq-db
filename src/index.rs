@@ -313,6 +313,7 @@ pub fn build_blocks(doc_id: DocumentId, nodes: &[Node]) -> Vec<Block> {
 mod tests {
     use super::*;
     use mq_markdown::Markdown;
+    use rstest::rstest;
 
     fn parse_blocks(md: &str) -> Vec<Block> {
         let doc = md.parse::<Markdown>().unwrap();
@@ -435,5 +436,57 @@ mod tests {
             .unwrap();
         assert_eq!(tags.len(), 2);
         assert_eq!(tags[0].as_str(), Some("rust"));
+    }
+
+    #[rstest]
+    #[case(1, "# Heading\n\nparagraph\n", "Heading")]
+    #[case(2, "## Heading\n\nparagraph\n", "Heading")]
+    #[case(3, "### Heading\n\nparagraph\n", "Heading")]
+    #[case(4, "#### Heading\n\nparagraph\n", "Heading")]
+    #[case(5, "##### Heading\n\nparagraph\n", "Heading")]
+    #[case(6, "###### Heading\n\nparagraph\n", "Heading")]
+    fn test_heading_depth_param(#[case] depth: u8, #[case] md: &str, #[case] content: &str) {
+        let blocks = parse_blocks(md);
+        let h = blocks
+            .iter()
+            .find(|b| b.block_type == BlockType::Heading)
+            .unwrap();
+        assert_eq!(h.heading_depth(), Some(depth));
+        assert_eq!(&h.content, content);
+    }
+
+    #[rstest]
+    #[case("rust")]
+    #[case("python")]
+    #[case("go")]
+    #[case("javascript")]
+    #[case("typescript")]
+    #[case("bash")]
+    fn test_code_language_param(#[case] lang: &str) {
+        let md = format!("```{lang}\ncode body\n```\n");
+        let blocks = parse_blocks(&md);
+        let code = blocks
+            .iter()
+            .find(|b| b.block_type == BlockType::Code)
+            .unwrap();
+        assert_eq!(code.code_lang(), Some(lang));
+    }
+
+    #[rstest]
+    #[case("title", "My Title")]
+    #[case("author", "Alice")]
+    #[case("version", "1.0.0")]
+    #[case("description", "A test document")]
+    fn test_frontmatter_string_key_param(#[case] key: &str, #[case] value: &str) {
+        let md = format!("---\n{key}: {value}\n---\n\n# Doc\n");
+        let blocks = parse_blocks(&md);
+        let yaml = blocks
+            .iter()
+            .find(|b| b.block_type == BlockType::Yaml)
+            .unwrap();
+        assert_eq!(
+            yaml.properties.get(key).and_then(|v| v.as_str()),
+            Some(value),
+        );
     }
 }
