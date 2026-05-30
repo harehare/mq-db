@@ -1,18 +1,4 @@
 //! mqdb CLI – Markdown-specialised embedded database command-line tool.
-//!
-//! # Commands
-//!
-//! ```text
-//! mqdb index <paths...> [--output store.mqdb] [--recursive]
-//! mqdb list  [--db store.mqdb]
-//! mqdb mq    <code>  [--db store.mqdb]
-//! mqdb sql   <query> [--db store.mqdb]
-//! mqdb repl  [--db store.mqdb] [--mode mq|sql]
-//! mqdb lint  [--db store.mqdb] [--depth <n>]
-//! mqdb stats [--db store.mqdb]
-//! mqdb show  <doc_id> [--db store.mqdb]
-//! mqdb tui   [--db store.mqdb]
-//! ```
 
 use std::{
     io::{BufRead, Write},
@@ -147,7 +133,6 @@ impl std::fmt::Display for ReplMode {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Collect all Markdown file paths from a list of paths/directories.
 fn collect_md_files(paths: &[PathBuf], recursive: bool) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for path in paths {
@@ -183,7 +168,6 @@ fn is_markdown(path: &Path) -> bool {
     )
 }
 
-/// Load a DocumentStore from disk, or return a helpful error.
 fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
     if !db.exists() {
         anyhow::bail!(
@@ -192,6 +176,32 @@ fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
         );
     }
     DocumentStore::load(db).map_err(|e| anyhow::anyhow!("Failed to load store: {}", e))
+}
+
+fn bar(count: usize, max: usize, width: usize) -> String {
+    if max == 0 {
+        return " ".repeat(width);
+    }
+    let filled = (count * width / max).min(width);
+    let empty = width - filled;
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn block_type_icon(bt: &BlockType) -> &'static str {
+    match bt {
+        BlockType::Heading => "#",
+        BlockType::Paragraph => "¶",
+        BlockType::Code => "{}",
+        BlockType::List => "•",
+        BlockType::TableCell | BlockType::TableRow | BlockType::TableAlign => "▦",
+        BlockType::Blockquote => "❝",
+        BlockType::HorizontalRule => "─",
+        BlockType::Html => "<>",
+        BlockType::Yaml | BlockType::Toml => "≡",
+        BlockType::Math => "∑",
+        BlockType::Definition => "§",
+        BlockType::Footnote => "†",
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -213,7 +223,7 @@ fn main() -> anyhow::Result<()> {
             let mut errors = 0usize;
             for path in &files {
                 match store.add_file(path) {
-                    Ok(_) => {}
+                    Ok(_) => eprintln!("  ✓ {}", path.display()),
                     Err(e) => {
                         eprintln!("  ✗ {}: {}", path.display(), e);
                         errors += 1;
@@ -225,12 +235,12 @@ fn main() -> anyhow::Result<()> {
                 .save(&output)
                 .map_err(|e| anyhow::anyhow!("Failed to save store: {}", e))?;
 
+            let indexed = files.len() - errors;
             println!(
-                "✓ Indexed {} file{} ({} error{}) → {}",
-                files.len() - errors,
-                if files.len() - errors == 1 { "" } else { "s" },
-                errors,
-                if errors == 1 { "" } else { "s" },
+                "\nIndexed {} file{}{} → {}",
+                indexed,
+                if indexed == 1 { "" } else { "s" },
+                if errors > 0 { format!("  ({} failed)", errors) } else { String::new() },
                 output.display()
             );
         }
@@ -239,32 +249,89 @@ fn main() -> anyhow::Result<()> {
         Commands::List { db } => {
             let store = load_store(&db)?;
             if store.is_empty() {
-                println!("(no documents)");
+                println!("(no documents indexed)");
                 return Ok(());
             }
-            println!("{:<6}  {:<50}  {:<8}  Tags", "ID", "Path / Title", "Blocks");
-            println!("{}", "─".repeat(80));
+
+            // Compute column widths
+            let path_width = store
+                .documents()
+                .iter()
+                .map(|d| {
+                    d.path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().len())
+                        .unwrap_or(10)
+                        .min(52)
+                })
+                .max()
+                .unwrap_or(10)
+                .max(12); // "Path / Title" header
+            let tag_width = store
+                .documents()
+                .iter()
+                .map(|d| d.zone_maps.tags.join(", ").len())
+                .max()
+                .unwrap_or(0)
+                .max(4); // "Tags" header
+
+            let sep_id = "──────";
+            let sep_path = "─".repeat(path_width + 2);
+            let sep_blocks = "────────";
+            let sep_tags = "─".repeat(tag_width.max(4) + 2);
+
+            println!(
+                "┌{}┬{}┬{}┬{}┐",
+                sep_id, sep_path, sep_blocks, sep_tags
+            );
+            println!(
+                "│ {:<4} │ {:<path_width$} │ {:>6} │ {:<tag_w$} │",
+                "ID",
+                "Path / Title",
+                "Blocks",
+                "Tags",
+                path_width = path_width,
+                tag_w = tag_width.max(4),
+            );
+            println!(
+                "├{}┼{}┼{}┼{}┤",
+                sep_id, sep_path, sep_blocks, sep_tags
+            );
+
             for doc in store.documents() {
-                let path = doc
+                let path_str = doc
                     .path
                     .as_ref()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| {
-                        doc.zone_maps
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| format!("<doc {}>", doc.id))
+                        doc.zone_maps.title.clone().unwrap_or_else(|| format!("<doc {}>", doc.id))
                     });
+                let path_display = if path_str.len() > path_width {
+                    format!("…{}", &path_str[path_str.len() - path_width + 1..])
+                } else {
+                    path_str.clone()
+                };
                 let tags = doc.zone_maps.tags.join(", ");
                 println!(
-                    "{:<6}  {:<50}  {:<8}  {}",
+                    "│ {:>4} │ {:<path_width$} │ {:>6} │ {:<tag_w$} │",
                     doc.id,
-                    &path[..path.len().min(50)],
+                    path_display,
                     doc.blocks.len(),
-                    tags
+                    tags,
+                    path_width = path_width,
+                    tag_w = tag_width.max(4),
                 );
             }
-            println!("\n{} document{}", store.len(), if store.len() == 1 { "" } else { "s" });
+
+            println!(
+                "└{}┴{}┴{}┴{}┘",
+                sep_id, sep_path, sep_blocks, sep_tags
+            );
+            println!(
+                "{} document{}",
+                store.len(),
+                if store.len() == 1 { "" } else { "s" }
+            );
         }
 
         // ── mq ───────────────────────────────────────────────────────────────
@@ -272,11 +339,12 @@ fn main() -> anyhow::Result<()> {
             let store = load_store(&db)?;
             let results = MqEngine::eval_store(&code, &store)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            for line in &results {
-                println!("{}", line);
-            }
             if results.is_empty() {
                 println!("(no results)");
+            } else {
+                for line in &results {
+                    println!("{}", line);
+                }
             }
         }
 
@@ -309,13 +377,17 @@ fn main() -> anyhow::Result<()> {
             let q = store.query();
             let violations = q.lint_heading_followed_by(depth, &[BlockType::List]);
             if violations.is_empty() {
-                println!("✓ No lint violations found (H{} → List rule).", depth);
+                println!("✓  No violations  (H{} must not be immediately followed by a list)", depth);
             } else {
+                let n = violations.len();
                 println!(
-                    "Found {} violation{}:\n",
-                    violations.len(),
-                    if violations.len() == 1 { "" } else { "s" }
+                    "✗  {} violation{}  (H{} immediately followed by list)\n",
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    depth
                 );
+                println!("  {:<40}  heading", "file");
+                println!("  {}  {}", "─".repeat(40), "─".repeat(30));
                 for v in &violations {
                     let path = v
                         .document
@@ -323,13 +395,12 @@ fn main() -> anyhow::Result<()> {
                         .as_ref()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|| format!("<doc {}>", v.document.id));
-                    println!(
-                        "  {}  H{} \"{}\" immediately followed by {}",
-                        path,
-                        depth,
-                        v.heading.content,
-                        v.offending.block_type.as_str()
-                    );
+                    let path_display = if path.len() > 40 {
+                        format!("…{}", &path[path.len() - 39..])
+                    } else {
+                        path
+                    };
+                    println!("  {:<40}  \"{}\"", path_display, v.heading.content);
                 }
             }
         }
@@ -337,37 +408,64 @@ fn main() -> anyhow::Result<()> {
         // ── stats ─────────────────────────────────────────────────────────────
         Commands::Stats { db } => {
             let store = load_store(&db)?;
-            let mut type_counts = std::collections::HashMap::new();
-            let mut lang_counts = std::collections::HashMap::new();
+            let mut type_counts: std::collections::HashMap<BlockType, usize> =
+                std::collections::HashMap::new();
+            let mut lang_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             let mut total_blocks = 0usize;
 
             for doc in store.documents() {
                 total_blocks += doc.blocks.len();
                 for block in &doc.blocks {
-                    *type_counts.entry(block.block_type.clone()).or_insert(0usize) += 1;
+                    *type_counts.entry(block.block_type.clone()).or_insert(0) += 1;
                     if block.block_type == BlockType::Code
                         && let Some(lang) = block.code_lang()
                     {
-                        *lang_counts.entry(lang.to_string()).or_insert(0usize) += 1;
+                        *lang_counts.entry(lang.to_string()).or_insert(0) += 1;
                     }
                 }
             }
 
-            println!("Documents : {}", store.len());
-            println!("Blocks    : {}", total_blocks);
-            println!("\nBlock type breakdown:");
-            let mut types: Vec<_> = type_counts.iter().collect();
-            types.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+            println!("  Documents  {}", store.len());
+            println!("  Blocks     {}", total_blocks);
+
+            let mut types: Vec<(BlockType, usize)> =
+                type_counts.into_iter().collect();
+            types.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+            let max_type = types.first().map(|(_, v)| *v).unwrap_or(1);
+
+            println!("\n  Block types");
+            println!("  {}", "─".repeat(56));
             for (bt, count) in &types {
-                println!("  {:<20} {}", bt.as_str(), count);
+                let pct = count * 100 / total_blocks.max(1);
+                let b = bar(*count, max_type, 20);
+                let icon = block_type_icon(bt);
+                println!(
+                    "  {:>2}  {:<12}  {}  {:>5}  ({:>2}%)",
+                    icon,
+                    bt.as_str(),
+                    b,
+                    count,
+                    pct,
+                );
             }
 
             if !lang_counts.is_empty() {
-                println!("\nCode block languages:");
-                let mut langs: Vec<_> = lang_counts.iter().collect();
-                langs.sort_by_key(|(_, v)| std::cmp::Reverse(**v));
+                let mut langs: Vec<(String, usize)> =
+                    lang_counts.into_iter().collect();
+                langs.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+                let max_lang = langs.first().map(|(_, v)| *v).unwrap_or(1);
+                let total_code: usize = langs.iter().map(|(_, v)| v).sum();
+
+                println!("\n  Code languages");
+                println!("  {}", "─".repeat(56));
                 for (lang, count) in &langs {
-                    println!("  {:<20} {}", lang, count);
+                    let pct = count * 100 / total_code.max(1);
+                    let b = bar(*count, max_lang, 20);
+                    println!(
+                        "  {{}}  {:<12}  {}  {:>5}  ({:>2}%)",
+                        lang, b, count, pct
+                    );
                 }
             }
         }
@@ -384,36 +482,65 @@ fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| format!("<doc {}>", doc.id));
-            println!("Document: {}  (id={})", path, doc.id);
+
+            println!("  {}", path);
             if let Some(title) = &doc.zone_maps.title {
-                println!("Title: {}", title);
+                println!("  title   {}", title);
             }
-            println!("Blocks: {}", doc.blocks.len());
+            println!("  blocks  {}", doc.blocks.len());
+            if !doc.zone_maps.tags.is_empty() {
+                println!("  tags    {}", doc.zone_maps.tags.join(", "));
+            }
             println!();
+
+            // Column widths
+            let pre_w = doc.blocks.iter().map(|b| digits(b.pre)).max().unwrap_or(3).max(3);
+            let post_w = doc.blocks.iter().map(|b| digits(b.post)).max().unwrap_or(4).max(4);
+
             println!(
-                "{:<6}  {:<6}  {:<6}  {:<16}  content",
-                "pre", "post", "depth", "type"
+                "  {:<pre_w$}  {:<post_w$}  {:<16}  content",
+                "pre", "post", "type",
+                pre_w = pre_w, post_w = post_w,
             );
-            println!("{}", "─".repeat(70));
+            println!(
+                "  {}  {}  {}  {}",
+                "─".repeat(pre_w),
+                "─".repeat(post_w),
+                "─".repeat(16),
+                "─".repeat(40),
+            );
 
             for block in &doc.blocks {
-                let depth_indent = "  ".repeat(
-                    (block.pre as usize / 2).min(8),
-                );
-                let preview: String = block.content.chars().take(50).collect();
-                let preview = if block.content.len() > 50 {
+                let depth = block.heading_depth().unwrap_or(0) as usize;
+                let indent = if depth > 1 {
+                    format!("{}", "  ".repeat(depth - 1))
+                } else {
+                    String::new()
+                };
+                let type_label = match block.block_type {
+                    BlockType::Heading => format!(
+                        "heading H{}",
+                        block.heading_depth().unwrap_or(0)
+                    ),
+                    ref bt => bt.as_str().to_string(),
+                };
+                let preview: String = block.content.chars().take(48).collect();
+                let preview = if block.content.chars().count() > 48 {
                     format!("{}…", preview)
                 } else {
                     preview
                 };
+                // Strip newlines for display
+                let preview = preview.replace('\n', " ");
                 println!(
-                    "{:<6}  {:<6}  {:<6}  {:<16}  {}{}",
+                    "  {:<pre_w$}  {:<post_w$}  {:<16}  {}{}",
                     block.pre,
                     block.post,
-                    block.heading_depth().map_or(String::new(), |d| format!("H{}", d)),
-                    block.block_type.as_str(),
-                    depth_indent,
-                    preview
+                    type_label,
+                    indent,
+                    preview,
+                    pre_w = pre_w,
+                    post_w = post_w,
                 );
             }
         }
@@ -433,6 +560,10 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn digits(n: u32) -> usize {
+    if n == 0 { 1 } else { n.ilog10() as usize + 1 }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // REPL
 // ─────────────────────────────────────────────────────────────────────────────
@@ -441,8 +572,8 @@ fn run_repl(store: DocumentStore, initial_mode: ReplMode) -> anyhow::Result<()> 
     let stdin = std::io::stdin();
     let mut mode = initial_mode;
 
-    println!("mqdb REPL  (type .help for commands, .quit to exit)");
-    println!("Mode: {}  (.mode mq | .mode sql to switch)\n", mode);
+    println!("mqdb  (.help for commands  .quit to exit)");
+    println!("mode: {}  (.mode mq | .mode sql)\n", mode);
 
     loop {
         print!("{}> ", mode);
@@ -450,7 +581,7 @@ fn run_repl(store: DocumentStore, initial_mode: ReplMode) -> anyhow::Result<()> 
 
         let mut line = String::new();
         match stdin.lock().read_line(&mut line) {
-            Ok(0) => break, // EOF (Ctrl+D)
+            Ok(0) => break,
             Ok(_) => {}
             Err(e) => anyhow::bail!("Read error: {}", e),
         }
@@ -465,65 +596,59 @@ fn run_repl(store: DocumentStore, initial_mode: ReplMode) -> anyhow::Result<()> 
             ".help" => print_repl_help(),
             ".mode mq" => {
                 mode = ReplMode::Mq;
-                println!("Switched to mq mode.");
+                println!("→ mq mode");
             }
             ".mode sql" => {
                 mode = ReplMode::Sql;
-                println!("Switched to SQL mode.");
+                println!("→ sql mode");
             }
-            _ => {
-                match mode {
-                    ReplMode::Sql => {
-                        match SqlEngine::new(&store) {
-                            Ok(engine) => match engine.execute(input) {
-                                Ok(out) => print!("{}", out.to_table()),
-                                Err(e) => eprintln!("Error: {}", e),
-                            },
-                            Err(e) => eprintln!("Engine error: {}", e),
-                        }
-                    }
-                    ReplMode::Mq => match MqEngine::eval_store(input, &store) {
-                        Ok(results) => {
-                            if results.is_empty() {
-                                println!("(no results)");
-                            } else {
-                                for r in results {
-                                    println!("{}", r);
-                                }
+            _ => match mode {
+                ReplMode::Sql => match SqlEngine::new(&store) {
+                    Ok(engine) => match engine.execute(input) {
+                        Ok(out) => print!("{}", out.to_table()),
+                        Err(e) => eprintln!("error: {}", e),
+                    },
+                    Err(e) => eprintln!("error: {}", e),
+                },
+                ReplMode::Mq => match MqEngine::eval_store(input, &store) {
+                    Ok(results) => {
+                        if results.is_empty() {
+                            println!("(no results)");
+                        } else {
+                            for r in results {
+                                println!("{}", r);
                             }
                         }
-                        Err(e) => eprintln!("Error: {}", e),
-                    },
-                }
-            }
+                    }
+                    Err(e) => eprintln!("error: {}", e),
+                },
+            },
         }
     }
 
-    println!("Bye!");
+    println!("bye");
     Ok(())
 }
 
 fn print_repl_help() {
     println!(
         r#"
-mqdb REPL commands:
-  .mode sql        Switch to SQL mode
-  .mode mq         Switch to mq mode
-  .quit / .exit    Exit the REPL
-  .help            Show this help
+  .mode sql    switch to SQL mode
+  .mode mq     switch to mq mode
+  .quit        exit
 
-SQL mode examples:
-  SELECT block_type, count(*) FROM blocks GROUP BY block_type;
-  SELECT content FROM blocks WHERE block_type = 'heading' ORDER BY pre;
-  SELECT b.content FROM blocks b
-    WHERE under(b.pre, b.post,
-      (SELECT pre FROM blocks WHERE content = 'Architecture'),
-      (SELECT post FROM blocks WHERE content = 'Architecture'));
+  SQL examples
+    SELECT block_type, count(*) FROM blocks GROUP BY block_type;
+    SELECT content FROM blocks WHERE block_type = 'heading' ORDER BY pre;
+    SELECT b.content FROM blocks b
+      WHERE under(b.pre, b.post,
+        (SELECT pre FROM blocks WHERE content = 'Architecture'),
+        (SELECT post FROM blocks WHERE content = 'Architecture'));
 
-mq mode examples:
-  .h1              Extract all H1 headings
-  .code            Extract all code blocks
-  select(.block_type == "heading")
+  mq examples
+    .h1
+    .code
+    select(.block_type == "heading")
 "#
     );
 }
