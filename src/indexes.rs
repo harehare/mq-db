@@ -276,6 +276,7 @@ impl IndexHint {
 mod tests {
     use super::*;
     use mq_markdown::Markdown;
+    use rstest::rstest;
 
     use crate::index::build_blocks;
 
@@ -376,5 +377,54 @@ mod tests {
         let blocks = blocks_from("# H1\n");
         let idx = DocumentIndex::build(&blocks);
         assert!(IndexHint::FullScan.resolve(&idx).is_none());
+    }
+
+    #[rstest]
+    #[case(BlockType::Heading, 2)]
+    #[case(BlockType::Paragraph, 1)]
+    #[case(BlockType::Code, 1)]
+    #[case(BlockType::List, 1)]
+    #[case(BlockType::Blockquote, 0)]
+    fn test_bitmap_block_type_count_param(#[case] block_type: BlockType, #[case] expected: usize) {
+        let blocks =
+            blocks_from("# H1\n\n## H2\n\nParagraph\n\n```rust\ncode\n```\n\n- item\n");
+        let idx = DocumentIndex::build(&blocks);
+        assert_eq!(idx.bitmap.get(&block_type).len(), expected);
+    }
+
+    #[rstest]
+    #[case(1, 1)]
+    #[case(2, 2)]
+    #[case(3, 1)]
+    #[case(4, 0)]
+    fn test_hash_depth_count_param(#[case] depth: u8, #[case] expected: usize) {
+        let blocks = blocks_from("# H1\n\n## H2a\n\n## H2b\n\n### H3\n");
+        let idx = DocumentIndex::build(&blocks);
+        assert_eq!(idx.hash.by_depth(depth).len(), expected);
+    }
+
+    #[rstest]
+    #[case("rust", 1)]
+    #[case("python", 1)]
+    #[case("go", 0)]
+    fn test_hash_lang_count_param(#[case] lang: &str, #[case] expected: usize) {
+        let blocks = blocks_from("```rust\nfn main(){}\n```\n\n```python\npass\n```\n");
+        let idx = DocumentIndex::build(&blocks);
+        assert_eq!(idx.hash.by_lang(lang).len(), expected);
+    }
+
+    #[rstest]
+    #[case(vec![BlockType::Heading], 2)]
+    #[case(vec![BlockType::Paragraph], 1)]
+    #[case(vec![BlockType::Code], 1)]
+    #[case(vec![BlockType::Heading, BlockType::Code], 3)]
+    fn test_index_hint_block_type_count_param(
+        #[case] types: Vec<BlockType>,
+        #[case] expected: usize,
+    ) {
+        let blocks = blocks_from("# H1\n\n## H2\n\nParagraph\n\n```rust\ncode\n```\n");
+        let idx = DocumentIndex::build(&blocks);
+        let result = IndexHint::BlockType(types).resolve(&idx).unwrap();
+        assert_eq!(result.len(), expected);
     }
 }

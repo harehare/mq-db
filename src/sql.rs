@@ -1589,6 +1589,7 @@ impl BlockType {
 mod tests {
     use super::*;
     use crate::DocumentStore;
+    use rstest::rstest;
 
     fn make_store() -> DocumentStore {
         let mut s = DocumentStore::new();
@@ -1705,5 +1706,55 @@ mod tests {
             "SqlEngine::new took {}ms — should be O(1)",
             elapsed.as_millis()
         );
+    }
+
+    // make_store() produces:
+    //   "# Doc\n\n## Architecture\n\nDetails\n\n```rust\nfn main(){}\n```\n\n## Other\n\nOther\n"
+    // → heading×3, paragraph×2, code×1  (6 blocks total)
+
+    #[rstest]
+    #[case("SELECT content FROM blocks WHERE block_type = 'heading'", 3)]
+    #[case("SELECT content FROM blocks WHERE block_type = 'paragraph'", 2)]
+    #[case("SELECT content FROM blocks WHERE block_type = 'code'", 1)]
+    #[case("SELECT content FROM blocks WHERE block_type = 'list'", 0)]
+    fn test_sql_where_block_type_param(#[case] sql: &str, #[case] expected: usize) {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        assert_eq!(engine.execute(sql).unwrap().rows.len(), expected);
+    }
+
+    #[rstest]
+    #[case("SELECT content FROM blocks WHERE content LIKE '%Doc%'", 1)]
+    #[case("SELECT content FROM blocks WHERE content LIKE '%chitect%'", 1)]
+    #[case("SELECT content FROM blocks WHERE content LIKE '%Other%'", 2)]
+    #[case("SELECT content FROM blocks WHERE content LIKE '%Details%'", 1)]
+    #[case("SELECT content FROM blocks WHERE content LIKE '%nonexistent%'", 0)]
+    fn test_sql_like_pattern_param(#[case] sql: &str, #[case] expected: usize) {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        assert_eq!(engine.execute(sql).unwrap().rows.len(), expected);
+    }
+
+    #[rstest]
+    #[case("SELECT content FROM blocks LIMIT 1", 1)]
+    #[case("SELECT content FROM blocks LIMIT 3", 3)]
+    #[case("SELECT content FROM blocks LIMIT 5", 5)]
+    #[case("SELECT content FROM blocks LIMIT 1000", 6)]
+    fn test_sql_limit_row_count_param(#[case] sql: &str, #[case] expected: usize) {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        assert_eq!(engine.execute(sql).unwrap().rows.len(), expected);
+    }
+
+    #[rstest]
+    #[case("SELECT count(*) FROM blocks", "6")]
+    #[case("SELECT count(*) FROM blocks WHERE block_type = 'heading'", "3")]
+    #[case("SELECT count(*) FROM blocks WHERE block_type = 'code'", "1")]
+    fn test_sql_count_aggregate_param(#[case] sql: &str, #[case] expected: &str) {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine.execute(sql).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0], expected);
     }
 }

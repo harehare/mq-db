@@ -20,6 +20,7 @@ crossterm = "0.28"
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+rstest = "0.23"
 duckdb = "1.10503"
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 
