@@ -161,11 +161,13 @@ impl ZoneMaps {
                     for (k, v) in block.properties.iter() {
                         maps.frontmatter_keys.insert(k.clone());
                         if k == "title"
-                            && let PropertyValue::String(s) = v {
+                            && let PropertyValue::String(s) = v
+                        {
                             maps.title = Some(s.clone());
                         }
                         if k == "tags"
-                            && let PropertyValue::Array(arr) = v {
+                            && let PropertyValue::Array(arr) = v
+                        {
                             maps.tags = arr
                                 .iter()
                                 .filter_map(|pv| pv.as_str().map(|s| s.to_string()))

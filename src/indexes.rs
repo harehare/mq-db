@@ -180,7 +180,11 @@ impl HashIndex {
             }
         }
 
-        Self { by_content, by_lang, by_depth }
+        Self {
+            by_content,
+            by_lang,
+            by_depth,
+        }
     }
 
     /// Exact content match (case-insensitive). O(1).
@@ -231,8 +235,7 @@ impl DocumentIndex {
         let mut out = Vec::new();
 
         // BitmapIndex
-        let mut bitmap_entries: Vec<(&BlockType, &Vec<u32>)> =
-            self.bitmap.map.iter().collect();
+        let mut bitmap_entries: Vec<(&BlockType, &Vec<u32>)> = self.bitmap.map.iter().collect();
         bitmap_entries.sort_by_key(|(bt, _)| block_type_ord(bt));
         out.extend_from_slice(&(bitmap_entries.len() as u32).to_le_bytes());
         for (bt, indices) in &bitmap_entries {
@@ -258,8 +261,7 @@ impl DocumentIndex {
         }
 
         // HashIndex by_content
-        let mut content_entries: Vec<(&String, &Vec<u32>)> =
-            self.hash.by_content.iter().collect();
+        let mut content_entries: Vec<(&String, &Vec<u32>)> = self.hash.by_content.iter().collect();
         content_entries.sort_by_key(|(k, _)| k.as_str());
         out.extend_from_slice(&(content_entries.len() as u32).to_le_bytes());
         for (key, indices) in &content_entries {
@@ -273,8 +275,7 @@ impl DocumentIndex {
         }
 
         // HashIndex by_lang
-        let mut lang_entries: Vec<(&String, &Vec<u32>)> =
-            self.hash.by_lang.iter().collect();
+        let mut lang_entries: Vec<(&String, &Vec<u32>)> = self.hash.by_lang.iter().collect();
         lang_entries.sort_by_key(|(k, _)| k.as_str());
         out.extend_from_slice(&(lang_entries.len() as u32).to_le_bytes());
         for (key, indices) in &lang_entries {
@@ -288,11 +289,10 @@ impl DocumentIndex {
         }
 
         // HashIndex by_depth
-        let mut depth_entries: Vec<(&u8, &Vec<u32>)> =
-            self.hash.by_depth.iter().collect();
+        let mut depth_entries: Vec<(&u8, &Vec<u32>)> = self.hash.by_depth.iter().collect();
         depth_entries.sort_by_key(|&(&d, _)| d);
         out.extend_from_slice(&(depth_entries.len() as u32).to_le_bytes());
-        for &(&depth, ref indices) in &depth_entries {
+        for &(&depth, indices) in &depth_entries {
             out.push(depth);
             out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
             for &idx in indices.iter() {
@@ -427,7 +427,11 @@ impl DocumentIndex {
         Ok(DocumentIndex {
             bitmap: BitmapIndex { map: bitmap_map },
             btree: BTreeIndex { by_pre, by_post },
-            hash: HashIndex { by_content, by_lang, by_depth },
+            hash: HashIndex {
+                by_content,
+                by_lang,
+                by_depth,
+            },
         })
     }
 }
@@ -503,12 +507,8 @@ impl IndexHint {
     pub fn resolve(&self, idx: &DocumentIndex) -> Option<Vec<u32>> {
         match self {
             IndexHint::BlockType(types) => Some(idx.bitmap.get_any(types)),
-            IndexHint::PreExact(pre) => {
-                Some(idx.btree.get_by_pre(*pre).into_iter().collect())
-            }
-            IndexHint::PreRange(lo, hi) => {
-                Some(idx.btree.range_by_pre(*lo, *hi).collect())
-            }
+            IndexHint::PreExact(pre) => Some(idx.btree.get_by_pre(*pre).into_iter().collect()),
+            IndexHint::PreRange(lo, hi) => Some(idx.btree.range_by_pre(*lo, *hi).collect()),
             IndexHint::ContentExact(c) => Some(idx.hash.by_content(c).to_vec()),
             IndexHint::LangExact(l) => Some(idx.hash.by_lang(l).to_vec()),
             IndexHint::DepthExact(d) => Some(idx.hash.by_depth(*d).to_vec()),
@@ -566,7 +566,12 @@ mod tests {
         // Every block's pre must be findable
         for (i, block) in blocks.iter().enumerate() {
             let found = idx.btree.get_by_pre(block.pre);
-            assert_eq!(found, Some(i as u32), "pre={} not found in btree", block.pre);
+            assert_eq!(
+                found,
+                Some(i as u32),
+                "pre={} not found in btree",
+                block.pre
+            );
         }
     }
 
@@ -577,7 +582,11 @@ mod tests {
 
         let max_pre = blocks.iter().map(|b| b.pre).max().unwrap_or(0);
         let all: Vec<u32> = idx.btree.range_by_pre(0, max_pre).collect();
-        assert_eq!(all.len(), blocks.len(), "range scan should cover all blocks");
+        assert_eq!(
+            all.len(),
+            blocks.len(),
+            "range scan should cover all blocks"
+        );
     }
 
     #[test]
@@ -635,8 +644,7 @@ mod tests {
     #[case(BlockType::List, 1)]
     #[case(BlockType::Blockquote, 0)]
     fn test_bitmap_block_type_count_param(#[case] block_type: BlockType, #[case] expected: usize) {
-        let blocks =
-            blocks_from("# H1\n\n## H2\n\nParagraph\n\n```rust\ncode\n```\n\n- item\n");
+        let blocks = blocks_from("# H1\n\n## H2\n\nParagraph\n\n```rust\ncode\n```\n\n- item\n");
         let idx = DocumentIndex::build(&blocks);
         assert_eq!(idx.bitmap.get(&block_type).len(), expected);
     }

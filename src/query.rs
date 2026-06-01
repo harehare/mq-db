@@ -438,10 +438,12 @@ mod tests {
     #[case(BlockType::Code, 1)]
     #[case(BlockType::List, 1)]
     fn test_block_type_filter_count_param(#[case] block_type: BlockType, #[case] expected: usize) {
-        let store = store_with(&[
-            "# H1\n\n## H2\n\n### H3\n\nParagraph\n\n```rust\ncode\n```\n\n- item\n",
-        ]);
-        assert_eq!(store.query().block_type(block_type).blocks().len(), expected);
+        let store =
+            store_with(&["# H1\n\n## H2\n\n### H3\n\nParagraph\n\n```rust\ncode\n```\n\n- item\n"]);
+        assert_eq!(
+            store.query().block_type(block_type).blocks().len(),
+            expected
+        );
     }
 
     #[rstest]
@@ -466,7 +468,10 @@ mod tests {
     #[case("nonexistent_xyz", 0)]
     fn test_content_contains_count_param(#[case] needle: &str, #[case] expected: usize) {
         let store = store_with(&["# Hello World\n\n## Goodbye\n"]);
-        assert_eq!(store.query().content_contains(needle).blocks().len(), expected);
+        assert_eq!(
+            store.query().content_contains(needle).blocks().len(),
+            expected
+        );
     }
 
     #[rstest]

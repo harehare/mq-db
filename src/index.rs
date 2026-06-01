@@ -127,7 +127,9 @@ fn node_to_parts(node: &Node) -> Option<(BlockType, String, Properties)> {
 
         Node::Yaml(y) => {
             // Parse YAML frontmatter and promote key-value pairs as properties
-            if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(&y.value) {
+            if let Ok(serde_yaml::Value::Mapping(map)) =
+                serde_yaml::from_str::<serde_yaml::Value>(&y.value)
+            {
                 for (k, v) in map {
                     if let serde_yaml::Value::String(key) = k {
                         props.set(key, yaml_value_to_property(v));

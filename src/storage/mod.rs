@@ -172,7 +172,11 @@ impl Storage {
         for (i, chunk) in chunks.iter().enumerate() {
             let page_id = page_ids[i];
             let next_page = page_ids.get(i + 1).copied().unwrap_or(0);
-            let page_type = if i == 0 { PAGE_TYPE_INDEX } else { PAGE_TYPE_OVERFLOW };
+            let page_type = if i == 0 {
+                PAGE_TYPE_INDEX
+            } else {
+                PAGE_TYPE_OVERFLOW
+            };
             let page = make_page(page_type, page_id, next_page, chunk);
             self.page_file.write_page(page_id, &page)?;
         }
@@ -198,7 +202,11 @@ impl Storage {
             let page = self.page_file.read_page(page_id)?;
             let (page_type, _, stored_page_id, next_page) = parse_page_header(&page);
 
-            let expected = if first { PAGE_TYPE_INDEX } else { PAGE_TYPE_OVERFLOW };
+            let expected = if first {
+                PAGE_TYPE_INDEX
+            } else {
+                PAGE_TYPE_OVERFLOW
+            };
             if page_type != expected {
                 return Err(invalid_data(format!(
                     "unexpected page type {page_type} in index chain; expected {expected}"
@@ -440,13 +448,18 @@ mod tests {
         cleanup(&path);
 
         let mut store = DocumentStore::new();
-        store.add_str("# Hello\n\n## Arch\n\nDetails\n\n```rust\ncode\n```\n").unwrap();
+        store
+            .add_str("# Hello\n\n## Arch\n\nDetails\n\n```rust\ncode\n```\n")
+            .unwrap();
         store.add_str("## Usage\n\n- item\n").unwrap();
         store.save(&path).unwrap();
 
         // Open lazily: catalog + indexes only
         let mut opened = DocumentStore::open(&path).unwrap();
-        assert!(opened.documents()[0].blocks.is_empty(), "blocks not loaded yet");
+        assert!(
+            opened.documents()[0].blocks.is_empty(),
+            "blocks not loaded yet"
+        );
 
         // Load blocks and indexes from file
         opened.load_all_blocks().unwrap();
@@ -459,7 +472,11 @@ mod tests {
         for (i, doc) in opened.documents().iter().enumerate() {
             let from_file = opened.get_doc_index(i).unwrap().clone();
             let from_blocks = DocumentIndex::build(&doc.blocks);
-            assert_eq!(from_file.to_bytes(), from_blocks.to_bytes(), "index mismatch for doc {i}");
+            assert_eq!(
+                from_file.to_bytes(),
+                from_blocks.to_bytes(),
+                "index mismatch for doc {i}"
+            );
         }
 
         // SqlEngine should use cached indexes (no rebuild cost)

@@ -187,12 +187,11 @@ impl DocumentStore {
     fn build_or_load_index_at(&mut self, i: usize) -> Result<DocumentIndex, MqdbError> {
         let index_start_page = self.documents[i].index_start_page;
 
-        if index_start_page > 0 {
-            if let Some(storage) = self.storage.as_mut() {
+        if index_start_page > 0
+            && let Some(storage) = self.storage.as_mut() {
                 let bytes = storage.read_index_bytes(index_start_page)?;
                 return DocumentIndex::from_bytes(&bytes);
             }
-        }
 
         Ok(DocumentIndex::build(&self.documents[i].blocks))
     }
@@ -281,9 +280,8 @@ impl DocumentStore {
                 entry.first_block_page,
                 entry.index_start_page,
             ));
-            max_doc_id = Some(
-                max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)),
-            );
+            max_doc_id =
+                Some(max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)));
         }
 
         Ok(Self {
@@ -314,9 +312,8 @@ impl DocumentStore {
             let mut doc = Document::from_parts(document_id, path, blocks, zone_maps);
             doc.index_start_page = entry.index_start_page;
             documents.push(doc);
-            max_doc_id = Some(
-                max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)),
-            );
+            max_doc_id =
+                Some(max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)));
         }
 
         Ok(Self {
@@ -350,9 +347,8 @@ impl DocumentStore {
                 entry.num_blocks,
                 zone_maps,
             ));
-            max_doc_id = Some(
-                max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)),
-            );
+            max_doc_id =
+                Some(max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)));
         }
 
         Ok(Self {

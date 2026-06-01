@@ -16,7 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::{DocumentStore, MqdbError, MqEngine, SqlEngine, block::BlockType};
+use crate::{DocumentStore, MqEngine, MqdbError, SqlEngine, block::BlockType};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State
@@ -53,11 +53,17 @@ struct ResultLine {
 
 impl ResultLine {
     fn plain(text: impl Into<String>) -> Self {
-        Self { text: text.into(), style: Style::default() }
+        Self {
+            text: text.into(),
+            style: Style::default(),
+        }
     }
 
     fn styled(text: impl Into<String>, style: Style) -> Self {
-        Self { text: text.into(), style }
+        Self {
+            text: text.into(),
+            style,
+        }
     }
 }
 
@@ -104,10 +110,16 @@ impl App {
             QueryMode::Sql => match SqlEngine::new(&self.store) {
                 Ok(engine) => match engine.execute(&code) {
                     Ok(out) => {
-                        self.result_lines =
-                            out.to_table().lines().map(|l| ResultLine::plain(l)).collect();
-                        self.status_msg =
-                            Some(format!("{} row{}", out.rows.len(), if out.rows.len() == 1 { "" } else { "s" }));
+                        self.result_lines = out
+                            .to_table()
+                            .lines()
+                            .map(ResultLine::plain)
+                            .collect();
+                        self.status_msg = Some(format!(
+                            "{} row{}",
+                            out.rows.len(),
+                            if out.rows.len() == 1 { "" } else { "s" }
+                        ));
                     }
                     Err(e) => {
                         self.result_lines = vec![ResultLine::styled(
@@ -131,8 +143,12 @@ impl App {
                             Style::default().fg(Color::DarkGray),
                         )];
                     } else {
-                        self.result_lines = lines.iter().map(|l| ResultLine::plain(l)).collect();
-                        self.status_msg = Some(format!("{} result{}", lines.len(), if lines.len() == 1 { "" } else { "s" }));
+                        self.result_lines = lines.iter().map(ResultLine::plain).collect();
+                        self.status_msg = Some(format!(
+                            "{} result{}",
+                            lines.len(),
+                            if lines.len() == 1 { "" } else { "s" }
+                        ));
                     }
                 }
                 Err(e) => {
@@ -146,8 +162,12 @@ impl App {
     }
 
     fn show_selected_document(&mut self) {
-        let Some(idx) = self.doc_list_state.selected() else { return };
-        let Some(doc) = self.store.documents().get(idx) else { return };
+        let Some(idx) = self.doc_list_state.selected() else {
+            return;
+        };
+        let Some(doc) = self.store.documents().get(idx) else {
+            return;
+        };
 
         let mut lines: Vec<ResultLine> = Vec::new();
 
@@ -159,7 +179,9 @@ impl App {
 
         lines.push(ResultLine::styled(
             path,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
         if let Some(title) = &doc.zone_maps.title {
             lines.push(ResultLine::styled(
@@ -185,7 +207,13 @@ impl App {
             Style::default().fg(Color::DarkGray),
         ));
         lines.push(ResultLine::styled(
-            format!("  {}  {}  {}  {}", "────", "────", "──────────────", "─".repeat(40)),
+            format!(
+                "  {}  {}  {}  {}",
+                "────",
+                "────",
+                "──────────────",
+                "─".repeat(40)
+            ),
             Style::default().fg(Color::DarkGray),
         ));
 
@@ -221,30 +249,51 @@ impl App {
 
     fn select_next(&mut self) {
         let count = self.doc_count();
-        if count == 0 { return; }
-        let i = self.doc_list_state.selected().map_or(0, |i| (i + 1).min(count - 1));
+        if count == 0 {
+            return;
+        }
+        let i = self
+            .doc_list_state
+            .selected()
+            .map_or(0, |i| (i + 1).min(count - 1));
         self.doc_list_state.select(Some(i));
         self.show_selected_document();
     }
 
     fn select_prev(&mut self) {
         let count = self.doc_count();
-        if count == 0 { return; }
-        let i = self.doc_list_state.selected().map_or(0, |i| i.saturating_sub(1));
+        if count == 0 {
+            return;
+        }
+        let i = self
+            .doc_list_state
+            .selected()
+            .map_or(0, |i| i.saturating_sub(1));
         self.doc_list_state.select(Some(i));
         self.show_selected_document();
     }
 
     fn insert_char(&mut self, c: char) {
-        let byte_pos = self.input.char_indices().nth(self.cursor_pos).map_or(self.input.len(), |(i, _)| i);
+        let byte_pos = self
+            .input
+            .char_indices()
+            .nth(self.cursor_pos)
+            .map_or(self.input.len(), |(i, _)| i);
         self.input.insert(byte_pos, c);
         self.cursor_pos += 1;
     }
 
     fn delete_char_before(&mut self) {
-        if self.cursor_pos == 0 { return; }
+        if self.cursor_pos == 0 {
+            return;
+        }
         self.cursor_pos -= 1;
-        let byte_pos = self.input.char_indices().nth(self.cursor_pos).map(|(i, _)| i).unwrap_or(self.input.len());
+        let byte_pos = self
+            .input
+            .char_indices()
+            .nth(self.cursor_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len());
         self.input.remove(byte_pos);
     }
 
@@ -424,8 +473,23 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         " {} doc{}  {} block{}  {}",
         app.store.len(),
         if app.store.len() == 1 { "" } else { "s" },
-        app.store.documents().iter().map(|d| d.blocks.len()).sum::<usize>(),
-        if app.store.documents().iter().map(|d| d.blocks.len()).sum::<usize>() == 1 { "" } else { "s" },
+        app.store
+            .documents()
+            .iter()
+            .map(|d| d.blocks.len())
+            .sum::<usize>(),
+        if app
+            .store
+            .documents()
+            .iter()
+            .map(|d| d.blocks.len())
+            .sum::<usize>()
+            == 1
+        {
+            ""
+        } else {
+            "s"
+        },
         msg,
     );
     f.render_widget(
@@ -453,26 +517,34 @@ fn render_doc_list(f: &mut Frame, app: &mut App, area: Rect) {
             let title = doc.zone_maps.title.as_deref().unwrap_or("");
             let count = doc.blocks.len();
 
-            let name_line = Line::from(vec![
-                Span::styled(filename, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            ]);
-            let meta_line = Line::from(vec![
-                Span::styled(
-                    format!("  {} blocks{}", count, if title.is_empty() { String::new() } else { format!("  {}", &title[..title.len().min(18)]) }),
-                    Style::default().fg(Color::DarkGray),
+            let name_line = Line::from(vec![Span::styled(
+                filename,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )]);
+            let meta_line = Line::from(vec![Span::styled(
+                format!(
+                    "  {} blocks{}",
+                    count,
+                    if title.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {}", &title[..title.len().min(18)])
+                    }
                 ),
-            ]);
+                Style::default().fg(Color::DarkGray),
+            )]);
 
             ListItem::new(vec![name_line, meta_line])
         })
         .collect();
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(" Documents ", Style::default().fg(Color::Cyan))),
-        )
+        .block(Block::default().borders(Borders::ALL).title(Span::styled(
+            " Documents ",
+            Style::default().fg(Color::Cyan),
+        )))
         .highlight_style(
             Style::default()
                 .bg(Color::Rgb(50, 70, 90))
@@ -490,7 +562,9 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
     let title_style = if app.input_focused {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -498,17 +572,27 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
 
     // Build input content with cursor indicator
     let before_cursor: String = app.input.chars().take(app.cursor_pos).collect();
-    let at_cursor: String = app.input.chars().nth(app.cursor_pos).map_or(" ".to_string(), |c| c.to_string());
+    let at_cursor: String = app
+        .input
+        .chars()
+        .nth(app.cursor_pos)
+        .map_or(" ".to_string(), |c| c.to_string());
     let after_cursor: String = app.input.chars().skip(app.cursor_pos + 1).collect();
 
     let spans = if app.input_focused {
         vec![
             Span::raw(before_cursor),
-            Span::styled(at_cursor, Style::default().bg(Color::Yellow).fg(Color::Black)),
+            Span::styled(
+                at_cursor,
+                Style::default().bg(Color::Yellow).fg(Color::Black),
+            ),
             Span::raw(after_cursor),
         ]
     } else {
-        vec![Span::styled(app.input.clone(), Style::default().fg(Color::DarkGray))]
+        vec![Span::styled(
+            app.input.clone(),
+            Style::default().fg(Color::DarkGray),
+        )]
     };
 
     let widget = Paragraph::new(Line::from(spans))

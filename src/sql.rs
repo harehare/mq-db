@@ -186,7 +186,11 @@ fn csv_cell(s: &str) -> String {
 }
 
 fn csv_row(fields: &[String]) -> String {
-    let mut row = fields.iter().map(|f| csv_cell(f)).collect::<Vec<_>>().join(",");
+    let mut row = fields
+        .iter()
+        .map(|f| csv_cell(f))
+        .collect::<Vec<_>>()
+        .join(",");
     row.push('\n');
     row
 }
@@ -293,7 +297,10 @@ impl QueryOutput {
             out.push('|');
             for (i, &w) in widths.iter().enumerate() {
                 let cell = row.get(i).map(String::as_str).unwrap_or("");
-                let escaped = cell.replace('|', "\\|").replace('\n', " ").replace('\r', "");
+                let escaped = cell
+                    .replace('|', "\\|")
+                    .replace('\n', " ")
+                    .replace('\r', "");
                 out.push_str(&format!(" {:<w$} |", escaped, w = w));
             }
             out.push('\n');

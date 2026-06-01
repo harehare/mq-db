@@ -43,8 +43,7 @@ impl MqEngine {
         let mut results = Vec::new();
         for path in paths {
             let content = std::fs::read_to_string(path)?;
-            let input = parse_markdown_input(&content)
-                .map_err(|e| MqdbError::Mq(e.to_string()))?;
+            let input = parse_markdown_input(&content).map_err(|e| MqdbError::Mq(e.to_string()))?;
             let output = engine
                 .eval(code, input.into_iter())
                 .map_err(|e| MqdbError::Mq(e.to_string()))?;

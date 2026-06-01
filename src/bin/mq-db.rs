@@ -7,11 +7,11 @@ use std::{
 };
 
 use axum::{
+    Router,
     extract::State,
     http::StatusCode,
     response::Json,
     routing::{get, post},
-    Router,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use mq_db::{DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape};
@@ -22,7 +22,11 @@ use serde::Deserialize;
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "mq-db", about = "Markdown-specialised embedded database", version)]
+#[command(
+    name = "mq-db",
+    about = "Markdown-specialised embedded database",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -207,7 +211,9 @@ fn collect_md_files(paths: &[PathBuf], recursive: bool) -> Vec<PathBuf> {
 }
 
 fn collect_dir(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
         if path.is_file() && is_markdown(&path) {
@@ -243,8 +249,8 @@ fn open_store_for_sql(db: &Path) -> anyhow::Result<DocumentStore> {
             db.display()
         );
     }
-    let mut store = DocumentStore::open(db)
-        .map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?;
+    let mut store =
+        DocumentStore::open(db).map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?;
     store
         .load_all_blocks()
         .map_err(|e| anyhow::anyhow!("Failed to load blocks: {}", e))?;
@@ -263,8 +269,7 @@ fn load_catalog_store(db: &Path) -> anyhow::Result<DocumentStore> {
             db.display()
         );
     }
-    DocumentStore::load_catalog_only(db)
-        .map_err(|e| anyhow::anyhow!("Failed to load store: {}", e))
+    DocumentStore::load_catalog_only(db).map_err(|e| anyhow::anyhow!("Failed to load store: {}", e))
 }
 
 fn bar(count: usize, max: usize, width: usize) -> String {
@@ -303,7 +308,12 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         // ── index ────────────────────────────────────────────────────────────
-        Commands::Index { paths, output, recursive, no_spans } => {
+        Commands::Index {
+            paths,
+            output,
+            recursive,
+            no_spans,
+        } => {
             let files = collect_md_files(&paths, recursive);
             if files.is_empty() {
                 anyhow::bail!("No Markdown files found in the specified paths.");
@@ -333,7 +343,11 @@ async fn main() -> anyhow::Result<()> {
                 "\nIndexed {} file{}{} → {}",
                 indexed,
                 if indexed == 1 { "" } else { "s" },
-                if errors > 0 { format!("  ({} failed)", errors) } else { String::new() },
+                if errors > 0 {
+                    format!("  ({} failed)", errors)
+                } else {
+                    String::new()
+                },
                 output.display()
             );
         }
@@ -394,10 +408,7 @@ async fn main() -> anyhow::Result<()> {
                     let sep_blocks = "────────";
                     let sep_tags = "─".repeat(tag_width.max(4) + 2);
 
-                    println!(
-                        "┌{}┬{}┬{}┬{}┐",
-                        sep_id, sep_path, sep_blocks, sep_tags
-                    );
+                    println!("┌{}┬{}┬{}┬{}┐", sep_id, sep_path, sep_blocks, sep_tags);
                     println!(
                         "│ {:<4} │ {:<path_width$} │ {:>6} │ {:<tag_w$} │",
                         "ID",
@@ -407,10 +418,7 @@ async fn main() -> anyhow::Result<()> {
                         path_width = path_width,
                         tag_w = tag_width.max(4),
                     );
-                    println!(
-                        "├{}┼{}┼{}┼{}┤",
-                        sep_id, sep_path, sep_blocks, sep_tags
-                    );
+                    println!("├{}┼{}┼{}┼{}┤", sep_id, sep_path, sep_blocks, sep_tags);
 
                     for doc in store.documents() {
                         let path_str = doc
@@ -440,10 +448,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
 
-                    println!(
-                        "└{}┴{}┴{}┴{}┘",
-                        sep_id, sep_path, sep_blocks, sep_tags
-                    );
+                    println!("└{}┴{}┴{}┴{}┘", sep_id, sep_path, sep_blocks, sep_tags);
                     println!(
                         "{} document{}",
                         store.len(),
@@ -456,8 +461,8 @@ async fn main() -> anyhow::Result<()> {
         // ── mq ───────────────────────────────────────────────────────────────
         Commands::Mq { code, db, format } => {
             let store = load_store(&db)?;
-            let results = MqEngine::eval_store(&code, &store)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let results =
+                MqEngine::eval_store(&code, &store).map_err(|e| anyhow::anyhow!("{}", e))?;
             if results.is_empty() {
                 println!("(no results)");
             } else {
@@ -468,7 +473,9 @@ async fn main() -> anyhow::Result<()> {
                             .map(|s| {
                                 format!(
                                     "\"{}\"",
-                                    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+                                    s.replace('\\', "\\\\")
+                                        .replace('"', "\\\"")
+                                        .replace('\n', "\\n")
                                 )
                             })
                             .collect();
@@ -510,7 +517,12 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // ── sql ──────────────────────────────────────────────────────────────
-        Commands::Sql { query, db, file, format } => {
+        Commands::Sql {
+            query,
+            db,
+            file,
+            format,
+        } => {
             let sql = if let Some(f) = file {
                 std::fs::read_to_string(&f)
                     .map_err(|e| anyhow::anyhow!("Cannot read file {}: {}", f.display(), e))?
@@ -545,7 +557,10 @@ async fn main() -> anyhow::Result<()> {
             let q = store.query();
             let violations = q.lint_heading_followed_by(depth, &[BlockType::List]);
             if violations.is_empty() {
-                println!("✓  No violations  (H{} must not be immediately followed by a list)", depth);
+                println!(
+                    "✓  No violations  (H{} must not be immediately followed by a list)",
+                    depth
+                );
             } else {
                 let n = violations.len();
                 println!(
@@ -597,8 +612,7 @@ async fn main() -> anyhow::Result<()> {
             println!("  Documents  {}", store.len());
             println!("  Blocks     {}", total_blocks);
 
-            let mut types: Vec<(BlockType, usize)> =
-                type_counts.into_iter().collect();
+            let mut types: Vec<(BlockType, usize)> = type_counts.into_iter().collect();
             types.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
             let max_type = types.first().map(|(_, v)| *v).unwrap_or(1);
 
@@ -619,8 +633,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             if !lang_counts.is_empty() {
-                let mut langs: Vec<(String, usize)> =
-                    lang_counts.into_iter().collect();
+                let mut langs: Vec<(String, usize)> = lang_counts.into_iter().collect();
                 langs.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
                 let max_lang = langs.first().map(|(_, v)| *v).unwrap_or(1);
                 let total_code: usize = langs.iter().map(|(_, v)| v).sum();
@@ -630,10 +643,7 @@ async fn main() -> anyhow::Result<()> {
                 for (lang, count) in &langs {
                     let pct = count * 100 / total_code.max(1);
                     let b = bar(*count, max_lang, 20);
-                    println!(
-                        "  {{}}  {:<12}  {}  {:>5}  ({:>2}%)",
-                        lang, b, count, pct
-                    );
+                    println!("  {{}}  {:<12}  {}  {:>5}  ({:>2}%)", lang, b, count, pct);
                 }
             }
         }
@@ -662,13 +672,28 @@ async fn main() -> anyhow::Result<()> {
             println!();
 
             // Column widths
-            let pre_w = doc.blocks.iter().map(|b| digits(b.pre)).max().unwrap_or(3).max(3);
-            let post_w = doc.blocks.iter().map(|b| digits(b.post)).max().unwrap_or(4).max(4);
+            let pre_w = doc
+                .blocks
+                .iter()
+                .map(|b| digits(b.pre))
+                .max()
+                .unwrap_or(3)
+                .max(3);
+            let post_w = doc
+                .blocks
+                .iter()
+                .map(|b| digits(b.post))
+                .max()
+                .unwrap_or(4)
+                .max(4);
 
             println!(
                 "  {:<pre_w$}  {:<post_w$}  {:<16}  content",
-                "pre", "post", "type",
-                pre_w = pre_w, post_w = post_w,
+                "pre",
+                "post",
+                "type",
+                pre_w = pre_w,
+                post_w = post_w,
             );
             println!(
                 "  {}  {}  {}  {}",
@@ -681,15 +706,14 @@ async fn main() -> anyhow::Result<()> {
             for block in &doc.blocks {
                 let depth = block.heading_depth().unwrap_or(0) as usize;
                 let indent = if depth > 1 {
-                    format!("{}", "  ".repeat(depth - 1))
+                    "  ".repeat(depth - 1).to_string()
                 } else {
                     String::new()
                 };
                 let type_label = match block.block_type {
-                    BlockType::Heading => format!(
-                        "heading H{}",
-                        block.heading_depth().unwrap_or(0)
-                    ),
+                    BlockType::Heading => {
+                        format!("heading H{}", block.heading_depth().unwrap_or(0))
+                    }
                     ref bt => bt.as_str().to_string(),
                 };
                 let preview: String = block.content.chars().take(48).collect();
@@ -718,7 +742,10 @@ async fn main() -> anyhow::Result<()> {
             let store = if db.exists() {
                 DocumentStore::load(&db).map_err(|e| anyhow::anyhow!("{}", e))?
             } else {
-                eprintln!("No store found at {}. Starting with empty store.", db.display());
+                eprintln!(
+                    "No store found at {}. Starting with empty store.",
+                    db.display()
+                );
                 DocumentStore::new()
             };
             mq_db::tui::run(store).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -735,10 +762,12 @@ async fn main() -> anyhow::Result<()> {
                 .route("/health", get(serve_health))
                 .with_state(store);
 
-            let listener = tokio::net::TcpListener::bind(&addr).await
+            let listener = tokio::net::TcpListener::bind(&addr)
+                .await
                 .map_err(|e| anyhow::anyhow!("Cannot bind {}: {}", addr, e))?;
             println!("mq-db listening on http://{}", addr);
-            axum::serve(listener, app).await
+            axum::serve(listener, app)
+                .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
     }
@@ -765,18 +794,18 @@ struct MqRequest {
 type ApiResult = Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>;
 
 async fn serve_sql(State(store): State<SharedStore>, Json(req): Json<SqlRequest>) -> ApiResult {
-    let engine = SqlEngine::new(&store)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let engine = SqlEngine::new(&store).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let out = engine
         .execute(&req.query)
         .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
-    let v: serde_json::Value = serde_json::from_str(&out.to_json()).unwrap_or(serde_json::json!([]));
+    let v: serde_json::Value =
+        serde_json::from_str(&out.to_json()).unwrap_or(serde_json::json!([]));
     Ok(Json(v))
 }
 
 async fn serve_mq(State(store): State<SharedStore>, Json(req): Json<MqRequest>) -> ApiResult {
-    let results = MqEngine::eval_store(&req.code, &store)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let results =
+        MqEngine::eval_store(&req.code, &store).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(serde_json::json!({ "results": results })))
 }
 
@@ -799,8 +828,20 @@ fn mq_to_markdown(results: &[String]) -> String {
     for (i, block) in results.iter().enumerate() {
         if i > 0 {
             let prev = &results[i - 1];
-            let prev_is_list = prev.trim_start().starts_with("- ") || prev.trim_start().starts_with("* ") || prev.trim_start().chars().next().is_some_and(|c| c.is_ascii_digit());
-            let curr_is_list = block.trim_start().starts_with("- ") || block.trim_start().starts_with("* ") || block.trim_start().chars().next().is_some_and(|c| c.is_ascii_digit());
+            let prev_is_list = prev.trim_start().starts_with("- ")
+                || prev.trim_start().starts_with("* ")
+                || prev
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit());
+            let curr_is_list = block.trim_start().starts_with("- ")
+                || block.trim_start().starts_with("* ")
+                || block
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit());
             if prev_is_list && curr_is_list {
                 out.push('\n');
             } else {
@@ -828,12 +869,11 @@ fn md_block_to_html(s: &str) -> String {
     // Headings: # … ######
     for depth in (1u8..=6).rev() {
         let prefix = "#".repeat(depth as usize);
-        if let Some(rest) = trimmed.strip_prefix(&prefix) {
-            if rest.starts_with(' ') || rest.is_empty() {
+        if let Some(rest) = trimmed.strip_prefix(&prefix)
+            && (rest.starts_with(' ') || rest.is_empty()) {
                 let text = html_escape(rest.trim());
                 return format!("<h{depth}>{text}</h{depth}>");
             }
-        }
     }
 
     // Fenced code block
@@ -873,7 +913,10 @@ fn md_block_to_html(s: &str) -> String {
     if trimmed.lines().all(|l| {
         let l = l.trim();
         l.is_empty() || l.starts_with("- ") || l.starts_with("* ")
-    }) && trimmed.lines().any(|l| l.trim().starts_with("- ") || l.trim().starts_with("* ")) {
+    }) && trimmed
+        .lines()
+        .any(|l| l.trim().starts_with("- ") || l.trim().starts_with("* "))
+    {
         let items: String = trimmed
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -890,12 +933,15 @@ fn md_block_to_html(s: &str) -> String {
     if trimmed.lines().all(|l| {
         let l = l.trim();
         l.is_empty() || l.chars().next().is_some_and(|c| c.is_ascii_digit())
-    }) && trimmed.lines().any(|l| l.trim().chars().next().is_some_and(|c| c.is_ascii_digit())) {
+    }) && trimmed
+        .lines()
+        .any(|l| l.trim().chars().next().is_some_and(|c| c.is_ascii_digit()))
+    {
         let items: String = trimmed
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(|l| {
-                let text = l.trim().splitn(2, ". ").nth(1).unwrap_or(l.trim());
+                let text = l.trim().split_once(". ").map(|x| x.1).unwrap_or(l.trim());
                 format!("<li>{}</li>", html_escape(text))
             })
             .collect::<Vec<_>>()
