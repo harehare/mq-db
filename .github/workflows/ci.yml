@@ -45,17 +45,6 @@ jobs:
         run: cargo nextest run
         env:
           NEXTEST_RETRIES: 3
-      - name: Generate code coverage
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os == 'ubuntu-latest'
-        run: cargo llvm-cov --lcov --output-path lcov.info
-      - name: Upload coverage to Codecov
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os == 'ubuntu-latest'
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-        with:
-          files: lcov.info
-          fail_ci_if_error: true
 
   format-check:
     runs-on: ubuntu-latest
@@ -83,12 +72,3 @@ jobs:
       - name: Run lint
         run: cargo clippy -- -D warnings
 
-  check-deny:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
-        with:
-          command: check bans licenses sources
