@@ -13,7 +13,7 @@ use crate::{
         codec::{decode_block, encode_block},
         page::{
             PAGE_BODY_SIZE, PAGE_HEADER_SIZE, PAGE_TYPE_BLOCK_DATA, PAGE_TYPE_CATALOG,
-            PAGE_TYPE_OVERFLOW, PageFile, make_page, parse_page_header,
+            PAGE_TYPE_INDEX, PAGE_TYPE_OVERFLOW, PageFile, make_page, parse_page_header,
         },
     },
 };
@@ -154,6 +154,73 @@ impl Storage {
     pub fn load_catalog(&mut self) -> Result<Vec<CatalogEntry>, MqdbError> {
         read_catalog(&mut self.page_file)
     }
+
+    /// Write raw index bytes as a chained page sequence. Returns the first page id.
+    pub fn write_index(&mut self, bytes: &[u8]) -> Result<u32, MqdbError> {
+        let chunks: Vec<&[u8]> = if bytes.is_empty() {
+            vec![&[]]
+        } else {
+            bytes.chunks(PAGE_BODY_SIZE).collect()
+        };
+
+        let placeholder = make_page(PAGE_TYPE_INDEX, 0, 0, &[]);
+        let mut page_ids = Vec::with_capacity(chunks.len());
+        for _ in 0..chunks.len() {
+            page_ids.push(self.page_file.append_page(&placeholder)?);
+        }
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let page_id = page_ids[i];
+            let next_page = page_ids.get(i + 1).copied().unwrap_or(0);
+            let page_type = if i == 0 { PAGE_TYPE_INDEX } else { PAGE_TYPE_OVERFLOW };
+            let page = make_page(page_type, page_id, next_page, chunk);
+            self.page_file.write_page(page_id, &page)?;
+        }
+
+        page_ids
+            .first()
+            .copied()
+            .ok_or_else(|| invalid_data("empty index page chain"))
+    }
+
+    /// Read all bytes from an index page chain starting at `first_page`.
+    pub fn read_index_bytes(&mut self, first_page: u32) -> Result<Vec<u8>, MqdbError> {
+        let mut bytes = Vec::new();
+        let mut page_id = first_page;
+        let mut visited = HashSet::new();
+        let mut first = true;
+
+        loop {
+            if !visited.insert(page_id) {
+                return Err(invalid_data("index page chain contains a cycle"));
+            }
+
+            let page = self.page_file.read_page(page_id)?;
+            let (page_type, _, stored_page_id, next_page) = parse_page_header(&page);
+
+            let expected = if first { PAGE_TYPE_INDEX } else { PAGE_TYPE_OVERFLOW };
+            if page_type != expected {
+                return Err(invalid_data(format!(
+                    "unexpected page type {page_type} in index chain; expected {expected}"
+                )));
+            }
+            if stored_page_id != page_id {
+                return Err(invalid_data(format!(
+                    "index page header mismatch: expected {page_id}, found {stored_page_id}"
+                )));
+            }
+
+            bytes.extend_from_slice(&page[PAGE_HEADER_SIZE..]);
+
+            if next_page == 0 {
+                break;
+            }
+            page_id = next_page;
+            first = false;
+        }
+
+        Ok(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -187,9 +254,9 @@ mod tests {
             .as_nanos();
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join("mqdb-storage-tests");
+            .join("mq-db-storage-tests");
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("{name}-{timestamp}-{unique}.mqdb"))
+        dir.join(format!("{name}-{timestamp}-{unique}.mq-db"))
     }
 
     fn cleanup(path: &Path) {
@@ -315,6 +382,7 @@ mod tests {
             first_block_page: first_page,
             num_blocks: document.blocks.len() as u32,
             zone_map_bytes: encode_zone_map(&document.zone_maps),
+            index_start_page: 0,
         };
         storage.flush_catalog(&[catalog_entry]).unwrap();
         drop(storage);
@@ -353,7 +421,51 @@ mod tests {
         let loaded = DocumentStore::load(&path).unwrap();
 
         assert_eq!(loaded.len(), store.len());
-        assert_eq!(loaded.documents(), store.documents());
+        // Compare blocks and zone_maps only; first_block_page / index_start_page
+        // are storage-layer fields set after writing to disk.
+        for (l, s) in loaded.documents().iter().zip(store.documents().iter()) {
+            assert_eq!(l.id, s.id);
+            assert_eq!(l.blocks, s.blocks);
+            assert_eq!(l.zone_maps, s.zone_maps);
+        }
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn persisted_index_round_trip() {
+        use crate::{SqlEngine, indexes::DocumentIndex};
+
+        let path = test_file_path("index-round-trip");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store.add_str("# Hello\n\n## Arch\n\nDetails\n\n```rust\ncode\n```\n").unwrap();
+        store.add_str("## Usage\n\n- item\n").unwrap();
+        store.save(&path).unwrap();
+
+        // Open lazily: catalog + indexes only
+        let mut opened = DocumentStore::open(&path).unwrap();
+        assert!(opened.documents()[0].blocks.is_empty(), "blocks not loaded yet");
+
+        // Load blocks and indexes from file
+        opened.load_all_blocks().unwrap();
+        opened.load_all_indexes().unwrap();
+
+        assert!(!opened.documents()[0].blocks.is_empty(), "blocks loaded");
+        assert!(opened.get_doc_index(0).is_some(), "index cached");
+
+        // Index round-trip: verify the loaded index matches a freshly built one
+        for (i, doc) in opened.documents().iter().enumerate() {
+            let from_file = opened.get_doc_index(i).unwrap().clone();
+            let from_blocks = DocumentIndex::build(&doc.blocks);
+            assert_eq!(from_file.to_bytes(), from_blocks.to_bytes(), "index mismatch for doc {i}");
+        }
+
+        // SqlEngine should use cached indexes (no rebuild cost)
+        let engine = SqlEngine::new(&opened).unwrap();
+        let out = engine.execute("SELECT count(*) FROM blocks").unwrap();
+        assert!(!out.rows.is_empty());
 
         cleanup(&path);
     }

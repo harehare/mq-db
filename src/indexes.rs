@@ -13,7 +13,7 @@
 //! DuckDB uses an **ART (Adaptive Radix Tree)** for general indexes and
 //! **RoaringBitmap** for low-cardinality columns. Here we use simpler
 //! structures that achieve the same asymptotic complexity for the query
-//! patterns in mqdb:
+//! patterns in mq-db:
 //!
 //! - Bitmap lookup: `O(1)` key + `O(k)` iteration (k = matching blocks)
 //! - B-Tree range: `O(log n)` to find start + `O(k)` iteration
@@ -29,7 +29,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::block::{Block, BlockType};
+use crate::{
+    block::{Block, BlockType},
+    error::MqdbError,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BitmapIndex — block_type → sorted Vec of block positions
@@ -221,6 +224,252 @@ impl DocumentIndex {
             btree: BTreeIndex::build(blocks),
             hash: HashIndex::build(blocks),
         }
+    }
+
+    /// Serialize the index to bytes for persistent storage.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+
+        // BitmapIndex
+        let mut bitmap_entries: Vec<(&BlockType, &Vec<u32>)> =
+            self.bitmap.map.iter().collect();
+        bitmap_entries.sort_by_key(|(bt, _)| block_type_ord(bt));
+        out.extend_from_slice(&(bitmap_entries.len() as u32).to_le_bytes());
+        for (bt, indices) in &bitmap_entries {
+            out.push(block_type_ord(bt));
+            out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+            for &idx in indices.iter() {
+                out.extend_from_slice(&idx.to_le_bytes());
+            }
+        }
+
+        // BTreeIndex by_pre
+        out.extend_from_slice(&(self.btree.by_pre.len() as u32).to_le_bytes());
+        for (&pre, &idx) in &self.btree.by_pre {
+            out.extend_from_slice(&pre.to_le_bytes());
+            out.extend_from_slice(&idx.to_le_bytes());
+        }
+
+        // BTreeIndex by_post
+        out.extend_from_slice(&(self.btree.by_post.len() as u32).to_le_bytes());
+        for (&post, &idx) in &self.btree.by_post {
+            out.extend_from_slice(&post.to_le_bytes());
+            out.extend_from_slice(&idx.to_le_bytes());
+        }
+
+        // HashIndex by_content
+        let mut content_entries: Vec<(&String, &Vec<u32>)> =
+            self.hash.by_content.iter().collect();
+        content_entries.sort_by_key(|(k, _)| k.as_str());
+        out.extend_from_slice(&(content_entries.len() as u32).to_le_bytes());
+        for (key, indices) in &content_entries {
+            let kb = key.as_bytes();
+            out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+            out.extend_from_slice(kb);
+            out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+            for &idx in indices.iter() {
+                out.extend_from_slice(&idx.to_le_bytes());
+            }
+        }
+
+        // HashIndex by_lang
+        let mut lang_entries: Vec<(&String, &Vec<u32>)> =
+            self.hash.by_lang.iter().collect();
+        lang_entries.sort_by_key(|(k, _)| k.as_str());
+        out.extend_from_slice(&(lang_entries.len() as u32).to_le_bytes());
+        for (key, indices) in &lang_entries {
+            let kb = key.as_bytes();
+            out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+            out.extend_from_slice(kb);
+            out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+            for &idx in indices.iter() {
+                out.extend_from_slice(&idx.to_le_bytes());
+            }
+        }
+
+        // HashIndex by_depth
+        let mut depth_entries: Vec<(&u8, &Vec<u32>)> =
+            self.hash.by_depth.iter().collect();
+        depth_entries.sort_by_key(|&(&d, _)| d);
+        out.extend_from_slice(&(depth_entries.len() as u32).to_le_bytes());
+        for &(&depth, ref indices) in &depth_entries {
+            out.push(depth);
+            out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+            for &idx in indices.iter() {
+                out.extend_from_slice(&idx.to_le_bytes());
+            }
+        }
+
+        out
+    }
+
+    /// Deserialize an index from bytes previously produced by [`to_bytes`].
+    pub fn from_bytes(data: &[u8]) -> Result<Self, MqdbError> {
+        let mut pos = 0usize;
+
+        macro_rules! read_u8 {
+            () => {{
+                if pos >= data.len() {
+                    return Err(MqdbError::Storage("unexpected end of index data".into()));
+                }
+                let v = data[pos];
+                pos += 1;
+                v
+            }};
+        }
+        macro_rules! read_u16 {
+            () => {{
+                let end = pos + 2;
+                if end > data.len() {
+                    return Err(MqdbError::Storage("unexpected end of index data".into()));
+                }
+                let v = u16::from_le_bytes(data[pos..end].try_into().unwrap());
+                pos = end;
+                v
+            }};
+        }
+        macro_rules! read_u32 {
+            () => {{
+                let end = pos + 4;
+                if end > data.len() {
+                    return Err(MqdbError::Storage("unexpected end of index data".into()));
+                }
+                let v = u32::from_le_bytes(data[pos..end].try_into().unwrap());
+                pos = end;
+                v
+            }};
+        }
+        macro_rules! read_str {
+            ($len:expr) => {{
+                let end = pos + $len;
+                if end > data.len() {
+                    return Err(MqdbError::Storage("unexpected end of index data".into()));
+                }
+                let s = String::from_utf8(data[pos..end].to_vec())
+                    .map_err(|_| MqdbError::Storage("invalid UTF-8 in index".into()))?;
+                pos = end;
+                s
+            }};
+        }
+
+        // BitmapIndex
+        let num_bitmap = read_u32!() as usize;
+        let mut bitmap_map: HashMap<BlockType, Vec<u32>> = HashMap::new();
+        for _ in 0..num_bitmap {
+            let bt = block_type_from_ord(read_u8!())?;
+            let count = read_u32!() as usize;
+            let mut indices = Vec::with_capacity(count);
+            for _ in 0..count {
+                indices.push(read_u32!());
+            }
+            bitmap_map.insert(bt, indices);
+        }
+
+        // BTreeIndex by_pre
+        let num_pre = read_u32!() as usize;
+        let mut by_pre = BTreeMap::new();
+        for _ in 0..num_pre {
+            let pre = read_u32!();
+            let idx = read_u32!();
+            by_pre.insert(pre, idx);
+        }
+
+        // BTreeIndex by_post
+        let num_post = read_u32!() as usize;
+        let mut by_post = BTreeMap::new();
+        for _ in 0..num_post {
+            let post = read_u32!();
+            let idx = read_u32!();
+            by_post.insert(post, idx);
+        }
+
+        // HashIndex by_content
+        let num_content = read_u32!() as usize;
+        let mut by_content: HashMap<String, Vec<u32>> = HashMap::new();
+        for _ in 0..num_content {
+            let key_len = read_u16!() as usize;
+            let key = read_str!(key_len);
+            let count = read_u32!() as usize;
+            let mut indices = Vec::with_capacity(count);
+            for _ in 0..count {
+                indices.push(read_u32!());
+            }
+            by_content.insert(key, indices);
+        }
+
+        // HashIndex by_lang
+        let num_lang = read_u32!() as usize;
+        let mut by_lang: HashMap<String, Vec<u32>> = HashMap::new();
+        for _ in 0..num_lang {
+            let key_len = read_u16!() as usize;
+            let key = read_str!(key_len);
+            let count = read_u32!() as usize;
+            let mut indices = Vec::with_capacity(count);
+            for _ in 0..count {
+                indices.push(read_u32!());
+            }
+            by_lang.insert(key, indices);
+        }
+
+        // HashIndex by_depth
+        let num_depth = read_u32!() as usize;
+        let mut by_depth: HashMap<u8, Vec<u32>> = HashMap::new();
+        for _ in 0..num_depth {
+            let depth = read_u8!();
+            let count = read_u32!() as usize;
+            let mut indices = Vec::with_capacity(count);
+            for _ in 0..count {
+                indices.push(read_u32!());
+            }
+            by_depth.insert(depth, indices);
+        }
+
+        Ok(DocumentIndex {
+            bitmap: BitmapIndex { map: bitmap_map },
+            btree: BTreeIndex { by_pre, by_post },
+            hash: HashIndex { by_content, by_lang, by_depth },
+        })
+    }
+}
+
+fn block_type_ord(bt: &BlockType) -> u8 {
+    match bt {
+        BlockType::Heading => 0,
+        BlockType::Paragraph => 1,
+        BlockType::Code => 2,
+        BlockType::List => 3,
+        BlockType::TableCell => 4,
+        BlockType::TableRow => 5,
+        BlockType::TableAlign => 6,
+        BlockType::Blockquote => 7,
+        BlockType::HorizontalRule => 8,
+        BlockType::Html => 9,
+        BlockType::Yaml => 10,
+        BlockType::Toml => 11,
+        BlockType::Math => 12,
+        BlockType::Definition => 13,
+        BlockType::Footnote => 14,
+    }
+}
+
+fn block_type_from_ord(v: u8) -> Result<BlockType, MqdbError> {
+    match v {
+        0 => Ok(BlockType::Heading),
+        1 => Ok(BlockType::Paragraph),
+        2 => Ok(BlockType::Code),
+        3 => Ok(BlockType::List),
+        4 => Ok(BlockType::TableCell),
+        5 => Ok(BlockType::TableRow),
+        6 => Ok(BlockType::TableAlign),
+        7 => Ok(BlockType::Blockquote),
+        8 => Ok(BlockType::HorizontalRule),
+        9 => Ok(BlockType::Html),
+        10 => Ok(BlockType::Yaml),
+        11 => Ok(BlockType::Toml),
+        12 => Ok(BlockType::Math),
+        13 => Ok(BlockType::Definition),
+        14 => Ok(BlockType::Footnote),
+        _ => Err(MqdbError::Storage(format!("unknown block type ord: {v}"))),
     }
 }
 

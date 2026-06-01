@@ -33,10 +33,14 @@ pub struct Document {
     pub path: Option<PathBuf>,
     /// Flattened, interval-indexed block list.
     pub blocks: Vec<Block>,
-    /// Authoritative block count — valid even when `blocks` is empty (catalog-only mode).
+    /// Authoritative block count — valid even when `blocks` is empty (lazy mode).
     pub block_count: u32,
     /// Per-document statistics for query pruning.
     pub zone_maps: ZoneMaps,
+    /// First page of this document's block chain. Used for on-demand block loading.
+    pub(crate) first_block_page: u32,
+    /// First page of the persisted secondary index. 0 = not stored.
+    pub(crate) index_start_page: u32,
 }
 
 impl Document {
@@ -58,6 +62,8 @@ impl Document {
             blocks,
             block_count,
             zone_maps,
+            first_block_page: 0,
+            index_start_page: 0,
         }
     }
 
@@ -74,6 +80,28 @@ impl Document {
             blocks: Vec::new(),
             block_count,
             zone_maps,
+            first_block_page: 0,
+            index_start_page: 0,
+        }
+    }
+
+    /// Construct from catalog metadata for lazy block loading.
+    pub(crate) fn from_catalog_lazy(
+        id: DocumentId,
+        path: Option<PathBuf>,
+        block_count: u32,
+        zone_maps: ZoneMaps,
+        first_block_page: u32,
+        index_start_page: u32,
+    ) -> Self {
+        Self {
+            id,
+            path,
+            blocks: Vec::new(),
+            block_count,
+            zone_maps,
+            first_block_page,
+            index_start_page,
         }
     }
 

@@ -7,6 +7,7 @@ use crate::{
     document::Document,
     error::MqdbError,
     index,
+    indexes::DocumentIndex,
     query::Query,
     storage::{
         Storage,
@@ -21,14 +22,21 @@ use crate::{
 /// the query interface. Documents are stored in memory with their flattened
 /// block lists and interval indexes.
 ///
-/// Secondary indexes (`DocumentIndex`) are no longer kept here — they are
-/// built on demand inside [`crate::SqlEngine`] so that commands that don't
-/// use SQL (mq, list, show, stats …) pay no index-construction cost.
+/// ## Load modes
+///
+/// - [`DocumentStore::new`] / [`DocumentStore::add_str`] — in-memory, blocks immediately available
+/// - [`DocumentStore::load`] — reads all blocks from a `.mq-db` file into memory
+/// - [`DocumentStore::open`] — reads catalog only; blocks loaded on demand via
+///   [`load_all_blocks`](DocumentStore::load_all_blocks)
+///
+/// Secondary indexes ([`DocumentIndex`]) are built once via
+/// [`load_all_indexes`](DocumentStore::load_all_indexes) and cached, so
+/// subsequent [`crate::SqlEngine`] construction is O(1).
 ///
 /// # Example
 ///
 /// ```rust
-/// use mqdb::DocumentStore;
+/// use mq_db::DocumentStore;
 ///
 /// let mut store = DocumentStore::new();
 /// store.add_str("# Hello\n\nWorld").unwrap();
@@ -42,6 +50,12 @@ pub struct DocumentStore {
     next_doc_id: DocumentId,
     /// When `false`, source line/column spans are discarded after parsing.
     store_spans: bool,
+    /// Open storage file kept for lazy block / index loading. `None` when the
+    /// store was built entirely in memory or fully loaded via `load()`.
+    pub(crate) storage: Option<Storage>,
+    /// Per-document secondary index cache (same order as `documents`).
+    /// `None` means the index has not been built/loaded for that document yet.
+    pub(crate) doc_indexes: Vec<Option<DocumentIndex>>,
 }
 
 impl Default for DocumentStore {
@@ -50,6 +64,8 @@ impl Default for DocumentStore {
             documents: Vec::new(),
             next_doc_id: 0,
             store_spans: true,
+            storage: None,
+            doc_indexes: Vec::new(),
         }
     }
 }
@@ -62,7 +78,6 @@ impl DocumentStore {
 
     /// When set to `false`, source line/column spans are stripped from every
     /// block added after this call. Reduces memory by ~21 bytes per block.
-    /// Has no effect on blocks already in the store.
     pub fn set_store_spans(&mut self, val: bool) {
         self.store_spans = val;
     }
@@ -102,6 +117,7 @@ impl DocumentStore {
         }
         let doc = Document::new(doc_id, path, blocks);
         self.documents.push(doc);
+        self.doc_indexes.push(None);
 
         Ok(doc_id)
     }
@@ -131,8 +147,67 @@ impl DocumentStore {
         Query::new(self)
     }
 
-    /// Persist all in-memory documents to a `.mqdb` file.
-    /// Writes atomically: writes to `path.tmp` then renames to `path`.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Lazy loading
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Load blocks for every document that has not yet been loaded.
+    ///
+    /// No-op when the store was built in memory or fully loaded via `load()`.
+    pub fn load_all_blocks(&mut self) -> Result<(), MqdbError> {
+        let storage = match self.storage.as_mut() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        for doc in &mut self.documents {
+            if doc.blocks.is_empty() && doc.block_count > 0 {
+                doc.blocks = storage.read_blocks(doc.first_block_page, doc.block_count)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Build or load persisted secondary indexes for every document and cache them.
+    ///
+    /// Must be called after [`load_all_blocks`](DocumentStore::load_all_blocks).
+    /// Subsequent [`crate::SqlEngine`] construction reuses the cache and pays no
+    /// per-block index rebuild cost.
+    pub fn load_all_indexes(&mut self) -> Result<(), MqdbError> {
+        for i in 0..self.documents.len() {
+            if self.doc_indexes[i].is_some() {
+                continue;
+            }
+
+            let idx = self.build_or_load_index_at(i)?;
+            self.doc_indexes[i] = Some(idx);
+        }
+        Ok(())
+    }
+
+    fn build_or_load_index_at(&mut self, i: usize) -> Result<DocumentIndex, MqdbError> {
+        let index_start_page = self.documents[i].index_start_page;
+
+        if index_start_page > 0 {
+            if let Some(storage) = self.storage.as_mut() {
+                let bytes = storage.read_index_bytes(index_start_page)?;
+                return DocumentIndex::from_bytes(&bytes);
+            }
+        }
+
+        Ok(DocumentIndex::build(&self.documents[i].blocks))
+    }
+
+    /// Returns the cached `DocumentIndex` for the document at position `i`.
+    pub(crate) fn get_doc_index(&self, i: usize) -> Option<&DocumentIndex> {
+        self.doc_indexes.get(i).and_then(|o| o.as_ref())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Persistence
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Persist all in-memory documents to a `.mq-db` file, including secondary
+    /// indexes. Writes atomically: writes to `path.tmp` then renames to `path`.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), MqdbError> {
         let path = path.as_ref();
         let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
@@ -144,6 +219,7 @@ impl DocumentStore {
             let mut storage = Storage::create(&tmp_path)?;
             let mut entries = Vec::with_capacity(self.documents.len());
 
+            // Phase 1: write block data
             for doc in &self.documents {
                 let first_block_page = storage.write_document(doc)?;
                 entries.push(CatalogEntry {
@@ -152,7 +228,19 @@ impl DocumentStore {
                     first_block_page,
                     num_blocks: doc.block_count,
                     zone_map_bytes: encode_zone_map(&doc.zone_maps),
+                    index_start_page: 0,
                 });
+            }
+
+            // Phase 2: write secondary indexes
+            for (i, doc) in self.documents.iter().enumerate() {
+                let idx = if let Some(cached) = self.doc_indexes.get(i).and_then(|o| o.as_ref()) {
+                    std::borrow::Cow::Borrowed(cached)
+                } else {
+                    std::borrow::Cow::Owned(DocumentIndex::build(&doc.blocks))
+                };
+                let bytes = idx.to_bytes();
+                entries[i].index_start_page = storage.write_index(&bytes)?;
             }
 
             storage.flush_catalog(&entries)?;
@@ -168,24 +256,33 @@ impl DocumentStore {
         Ok(())
     }
 
-    /// Load a `.mqdb` file and reconstruct the in-memory `DocumentStore`.
+    /// Open a `.mq-db` file in lazy mode: reads only catalog and zone maps.
     ///
-    /// All block data is read from disk. Secondary indexes are **not** built
-    /// here — [`crate::SqlEngine`] builds them lazily on construction.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
+    /// Block data is not loaded until you call
+    /// [`load_all_blocks`](DocumentStore::load_all_blocks).  Secondary indexes
+    /// are not built until you call
+    /// [`load_all_indexes`](DocumentStore::load_all_indexes).
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open(path.as_ref())?;
         let entries = storage.load_catalog()?;
-        let mut documents = Vec::with_capacity(entries.len());
+        let cap = entries.len();
+        let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
 
         for entry in entries {
-            let blocks = storage.read_blocks(entry.first_block_page, entry.num_blocks)?;
             let zone_maps = decode_zone_map(&entry.zone_map_bytes)?;
             let document_id = entry.document_id;
             let path = entry.path.map(PathBuf::from);
-            documents.push(Document::from_parts(document_id, path, blocks, zone_maps));
+            documents.push(Document::from_catalog_lazy(
+                document_id,
+                path,
+                entry.num_blocks,
+                zone_maps,
+                entry.first_block_page,
+                entry.index_start_page,
+            ));
             max_doc_id = Some(
-                max_doc_id.map_or(document_id, |current: DocumentId| current.max(document_id)),
+                max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)),
             );
         }
 
@@ -193,10 +290,45 @@ impl DocumentStore {
             documents,
             next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
             store_spans: true,
+            storage: Some(storage),
+            doc_indexes: vec![None; cap],
         })
     }
 
-    /// Load only the catalog metadata from a `.mqdb` file — no block data.
+    /// Load a `.mq-db` file and reconstruct the in-memory `DocumentStore`.
+    ///
+    /// All block data is read from disk. Secondary indexes are **not** built
+    /// here — [`crate::SqlEngine`] builds them lazily on construction.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
+        let mut storage = Storage::open(path.as_ref())?;
+        let entries = storage.load_catalog()?;
+        let cap = entries.len();
+        let mut documents = Vec::with_capacity(cap);
+        let mut max_doc_id = None;
+
+        for entry in entries {
+            let blocks = storage.read_blocks(entry.first_block_page, entry.num_blocks)?;
+            let zone_maps = decode_zone_map(&entry.zone_map_bytes)?;
+            let document_id = entry.document_id;
+            let path = entry.path.map(PathBuf::from);
+            let mut doc = Document::from_parts(document_id, path, blocks, zone_maps);
+            doc.index_start_page = entry.index_start_page;
+            documents.push(doc);
+            max_doc_id = Some(
+                max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)),
+            );
+        }
+
+        Ok(Self {
+            documents,
+            next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
+            store_spans: true,
+            storage: None,
+            doc_indexes: vec![None; cap],
+        })
+    }
+
+    /// Load only the catalog metadata from a `.mq-db` file — no block data.
     ///
     /// Documents have `block_count` populated from the catalog but `blocks`
     /// is empty. Useful for commands that only need zone-map metadata (e.g.
@@ -204,7 +336,8 @@ impl DocumentStore {
     pub fn load_catalog_only(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open(path.as_ref())?;
         let entries = storage.load_catalog()?;
-        let mut documents = Vec::with_capacity(entries.len());
+        let cap = entries.len();
+        let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
 
         for entry in entries {
@@ -218,7 +351,7 @@ impl DocumentStore {
                 zone_maps,
             ));
             max_doc_id = Some(
-                max_doc_id.map_or(document_id, |current: DocumentId| current.max(document_id)),
+                max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)),
             );
         }
 
@@ -226,6 +359,8 @@ impl DocumentStore {
             documents,
             next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
             store_spans: true,
+            storage: None,
+            doc_indexes: vec![None; cap],
         })
     }
 }

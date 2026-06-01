@@ -1,17 +1,17 @@
 <div align="center">
   <img src="assets/logo.svg" width="96" height="96" />
 
-<h1>mqdb</h1>
+<h1>mq-db</h1>
 
 **Markdown-specialized embedded database with interval-indexed block storage and hierarchical query support.**
 
-[![ci](https://img.shields.io/github/actions/workflow/status/harehare/mqdb/ci.yml?logo=github-actions&label=ci)](https://github.com/harehare/mqdb/actions)
-[![crates.io](https://img.shields.io/crates/v/mqdb?logo=rust)](https://crates.io/crates/mqdb)
-[![license](https://img.shields.io/crates/l/mqdb)](LICENSE)
+[![ci](https://img.shields.io/github/actions/workflow/status/harehare/mq-db/ci.yml?logo=github-actions&label=ci)](https://github.com/harehare/mq-db/actions)
+[![crates.io](https://img.shields.io/crates/v/mq-db?logo=rust)](https://crates.io/crates/mq-db)
+[![license](https://img.shields.io/crates/l/mq-db)](LICENSE)
 
 </div>
 
-`mqdb` treats Markdown documents as **structured, hierarchical databases** rather than plain text. It parses Markdown into a flat block list with an **interval index** (Nested Set / Pre-Post Order), enabling O(1) section hierarchy queries. Documents can be queried with **SQL** or **[mq](https://github.com/harehare/mq)** and persisted to a compact custom page-file format.
+`mq-db` treats Markdown documents as **structured, hierarchical databases** rather than plain text. It parses Markdown into a flat block list with an **interval index** (Nested Set / Pre-Post Order), enabling O(1) section hierarchy queries. Documents can be queried with **SQL** or **[mq](https://github.com/harehare/mq)** and persisted to a compact custom page-file format.
 
 ```
 [Markdown File]
@@ -42,10 +42,10 @@
 ## Installation
 
 ```bash
-git clone https://github.com/harehare/mqdb
-cd mqdb
+git clone https://github.com/harehare/mq-db
+cd mq-db
 cargo build --release
-# binary: target/release/mqdb
+# binary: target/release/mq-db
 ```
 
 > **Requires:** the [`mq`](https://github.com/harehare/mq) repository checked out as a sibling directory (`../mq`).
@@ -55,21 +55,21 @@ cargo build --release
 ### Index Markdown files
 
 ```bash
-mqdb index docs/ --recursive --output store.mqdb
-mqdb index README.md DESIGN.md
+mq-db index docs/ --recursive --output store.mq-db
+mq-db index README.md DESIGN.md
 ```
 
 ```
   ✓ docs/DESIGN.md
   ✓ docs/API.md
 
-Indexed 2 files → store.mqdb
+Indexed 2 files → store.mq-db
 ```
 
 ### List indexed documents
 
 ```bash
-mqdb list --db store.mqdb
+mq-db list --db store.mq-db
 ```
 
 ```
@@ -85,7 +85,7 @@ mqdb list --db store.mqdb
 ### SQL queries
 
 ```bash
-mqdb sql "SELECT block_type, count(*) FROM blocks GROUP BY block_type" --db store.mqdb
+mq-db sql "SELECT block_type, count(*) FROM blocks GROUP BY block_type" --db store.mq-db
 ```
 
 ```
@@ -102,31 +102,31 @@ mqdb sql "SELECT block_type, count(*) FROM blocks GROUP BY block_type" --db stor
 **Hierarchy query with `under()`** — find all content inside a specific section:
 
 ```bash
-mqdb sql "
+mq-db sql "
   SELECT b.block_type, b.content
   FROM blocks b
   WHERE under(b.pre, b.post,
     (SELECT pre FROM blocks WHERE block_type = 'heading' AND content = 'Architecture'),
     (SELECT post FROM blocks WHERE block_type = 'heading' AND content = 'Architecture'))
   ORDER BY b.pre
-" --db store.mqdb
+" --db store.mq-db
 ```
 
 ### mq queries
 
 ```bash
-mqdb mq ".h1" --db store.mqdb
-mqdb mq 'select(.code_lang == "rust")' --db store.mqdb
+mq-db mq ".h1" --db store.mq-db
+mq-db mq 'select(.code_lang == "rust")' --db store.mq-db
 ```
 
 ### Interactive REPL
 
 ```bash
-mqdb repl --db store.mqdb --mode sql
+mq-db repl --db store.mq-db --mode sql
 ```
 
 ```
-mqdb  (.help for commands  .quit to exit)
+mq-db  (.help for commands  .quit to exit)
 mode: sql  (.mode mq | .mode sql)
 
 sql> SELECT content FROM blocks WHERE block_type = 'heading' LIMIT 3;
@@ -149,7 +149,7 @@ mq> .h2
 ### Structural linting
 
 ```bash
-mqdb lint --db store.mqdb --depth 2
+mq-db lint --db store.mq-db --depth 2
 ```
 
 ```
@@ -163,7 +163,7 @@ mqdb lint --db store.mqdb --depth 2
 ### Statistics
 
 ```bash
-mqdb stats --db store.mqdb
+mq-db stats --db store.mq-db
 ```
 
 ```
@@ -187,7 +187,7 @@ mqdb stats --db store.mqdb
 ### Show document structure
 
 ```bash
-mqdb show 0 --db store.mqdb
+mq-db show 0 --db store.mq-db
 ```
 
 ```
@@ -207,11 +207,11 @@ mqdb show 0 --db store.mqdb
 ### TUI
 
 ```bash
-mqdb tui --db store.mqdb
+mq-db tui --db store.mq-db
 ```
 
 ```
- mqdb  SQL  Tab:switch  i:input  j/k:nav  d/u:scroll  q:quit
+ mq-db  SQL  Tab:switch  i:input  j/k:nav  d/u:scroll  q:quit
 ┌─ Documents ──────────┬─ SQL ────────────────────────────────────────────────┐
 │ DESIGN.md            │ SELECT block_type, count(*) FROM blocks GROUP BY b_  │
 │   142 blocks         ├─ Results ────────────────────────────────────────────┤
@@ -239,7 +239,7 @@ mqdb tui --db store.mqdb
 ## Library API
 
 ```rust
-use mqdb::{DocumentStore, SqlEngine, MqEngine, block::BlockType};
+use mq_db::{DocumentStore, SqlEngine, MqEngine, block::BlockType};
 
 let mut store = DocumentStore::new();
 store.add_file("docs/DESIGN.md")?;
@@ -267,8 +267,8 @@ let results = MqEngine::eval_store(".h1", &store)?;
 let violations = store.query().lint_heading_followed_by(2, &[BlockType::List]);
 
 // Persist / load
-store.save("store.mqdb")?;
-let store = DocumentStore::load("store.mqdb")?;
+store.save("store.mq-db")?;
+let store = DocumentStore::load("store.mq-db")?;
 ```
 
 ## SQL Reference
@@ -344,11 +344,11 @@ struct Block {
 
 ### Index layers
 
-mqdb applies three complementary index layers, cheapest-first.
+mq-db applies three complementary index layers, cheapest-first.
 
 #### Layer 1 — Zone Maps (document-level skip)
 
-Built once per document and stored in the `.mqdb` file. Checked before any block is read:
+Built once per document and stored in the `.mq-db` file. Checked before any block is read:
 
 | Field | Skips documents where… |
 |---|---|

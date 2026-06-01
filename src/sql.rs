@@ -1,4 +1,4 @@
-//! Custom SQL execution engine for mqdb.
+//! Custom SQL execution engine for mq-db.
 //!
 //! Executes SQL queries directly against the in-memory [`DocumentStore`]
 //! without copying data into an external database. Uses [`sqlparser`] to parse
@@ -28,7 +28,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use mqdb::{DocumentStore, SqlEngine};
+//! use mq_db::{DocumentStore, SqlEngine};
 //!
 //! let mut store = DocumentStore::new();
 //! store.add_str("# Hello\n\n## Architecture\n\nDetails\n\n```rust\ncode\n```\n").unwrap();
@@ -838,12 +838,22 @@ pub struct SqlEngine<'a> {
 }
 
 impl<'a> SqlEngine<'a> {
-    /// Build the engine and its secondary indexes. O(n) in total block count.
+    /// Build the engine and its secondary indexes.
+    ///
+    /// Uses cached indexes from [`DocumentStore::load_all_indexes`] when
+    /// available (O(1) per document); otherwise rebuilds from blocks (O(n)).
     pub fn new(store: &'a DocumentStore) -> Result<Self, MqdbError> {
         let indexes = store
             .documents()
             .iter()
-            .map(|doc| DocumentIndex::build(&doc.blocks))
+            .enumerate()
+            .map(|(i, doc)| {
+                if let Some(idx) = store.get_doc_index(i) {
+                    idx.clone()
+                } else {
+                    DocumentIndex::build(&doc.blocks)
+                }
+            })
             .collect();
         Ok(Self { store, indexes })
     }

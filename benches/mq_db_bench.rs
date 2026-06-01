@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use mqdb::{DocumentStore, SqlEngine, block::BlockType};
+use mq_db::{DocumentStore, SqlEngine, block::BlockType};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -231,7 +231,7 @@ fn bench_storage(c: &mut Criterion) {
             |b, s| {
                 b.iter(|| {
                     let dir = tempfile::tempdir().unwrap();
-                    let path = dir.path().join("bench.mqdb");
+                    let path = dir.path().join("bench.mq-db");
                     s.save(&path).unwrap();
                 });
             },
@@ -239,7 +239,7 @@ fn bench_storage(c: &mut Criterion) {
 
         // save once, then bench repeated loads
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bench.mqdb");
+        let path = dir.path().join("bench.mq-db");
         store.save(&path).unwrap();
 
         group.bench_with_input(

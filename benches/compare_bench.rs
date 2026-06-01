@@ -1,4 +1,4 @@
-/// Comparison benchmarks: mqdb custom SQL engine vs DuckDB
+/// Comparison benchmarks: mq-db custom SQL engine vs DuckDB
 ///
 /// Both engines receive identical pre-parsed block data loaded into their
 /// respective in-memory databases.  Parse time (Markdown → blocks) is
@@ -7,7 +7,7 @@
 /// Run:  cargo bench --bench compare_bench
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use duckdb::Connection as DuckConn;
-use mqdb::{DocumentStore, SqlEngine, block::BlockType};
+use mq_db::{DocumentStore, SqlEngine, block::BlockType};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared fixture
@@ -96,7 +96,7 @@ fn bench_load(c: &mut Criterion) {
         let store = make_store(n_docs, 20);
 
         group.bench_with_input(
-            BenchmarkId::new("mqdb_custom", n_docs),
+            BenchmarkId::new("mq-db_custom", n_docs),
             &store,
             |b, s| b.iter(|| SqlEngine::new(s).unwrap()),
         );
@@ -123,15 +123,15 @@ fn bench_select_filter(c: &mut Criterion) {
 
     let sql = "SELECT content FROM blocks WHERE block_type = 'heading' ORDER BY pre";
 
-    group.bench_function("mqdb_custom", |b| {
+    group.bench_function("mq-db_custom", |b| {
         b.iter(|| engine.execute(sql).unwrap())
     });
     group.bench_function("duckdb", |b| {
         b.iter(|| duckdb_exec(&duck_conn, sql))
     });
 
-    // Also compare against native mqdb query API (no SQL overhead)
-    group.bench_function("mqdb_query_api", |b| {
+    // Also compare against native mq-db query API (no SQL overhead)
+    group.bench_function("mq-db_query_api", |b| {
         b.iter(|| store.query().heading_depth(2).blocks())
     });
 
@@ -151,7 +151,7 @@ fn bench_aggregate(c: &mut Criterion) {
 
     let sql = "SELECT block_type, count(*) AS n FROM blocks GROUP BY block_type ORDER BY n DESC";
 
-    group.bench_function("mqdb_custom", |b| {
+    group.bench_function("mq-db_custom", |b| {
         b.iter(|| engine.execute(sql).unwrap())
     });
     group.bench_function("duckdb", |b| {
@@ -162,7 +162,7 @@ fn bench_aggregate(c: &mut Criterion) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. Hierarchy query: UNDER() (mqdb) vs subquery correlated scan (DuckDB)
+// 4. Hierarchy query: UNDER() (mq-db) vs subquery correlated scan (DuckDB)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn bench_hierarchy(c: &mut Criterion) {
@@ -172,8 +172,8 @@ fn bench_hierarchy(c: &mut Criterion) {
     let engine = SqlEngine::new(&store).unwrap();
     let duck_conn = duckdb_load(&store);
 
-    // mqdb uses the native UNDER() interval-index predicate
-    let sql_mqdb = "SELECT b.content FROM blocks b \
+    // mq-db uses the native UNDER() interval-index predicate
+    let sql_mq-db = "SELECT b.content FROM blocks b \
                     WHERE under(b.pre, b.post, \
                       (SELECT pre FROM blocks WHERE block_type='heading' AND content='Section 10'), \
                       (SELECT post FROM blocks WHERE block_type='heading' AND content='Section 10'))";
@@ -188,14 +188,14 @@ fn bench_hierarchy(c: &mut Criterion) {
                     SELECT b.content FROM blocks b, anc
                     WHERE b.pre > anc.pre AND b.post < anc.post";
 
-    group.bench_function("mqdb_custom_under", |b| {
-        b.iter(|| engine.execute(sql_mqdb).unwrap())
+    group.bench_function("mq-db_custom_under", |b| {
+        b.iter(|| engine.execute(sql_mq-db).unwrap())
     });
     group.bench_function("duckdb_cte_range", |b| {
         b.iter(|| duckdb_exec(&duck_conn, sql_duck))
     });
-    // native mqdb API for fairest comparison
-    group.bench_function("mqdb_query_api_under_heading", |b| {
+    // native mq-db API for fairest comparison
+    group.bench_function("mq-db_query_api_under_heading", |b| {
         b.iter(|| {
             store
                 .query()
@@ -225,7 +225,7 @@ fn bench_linter_join(c: &mut Criterion) {
                  AND CAST(json_extract_string(h.properties, '$.depth') AS INTEGER) = 2 \
                  AND nxt.block_type = 'list'";
 
-    // mqdb uses json_extract(); DuckDB uses json_extract_string()
+    // mq-db uses json_extract(); DuckDB uses json_extract_string()
     let sql_sqlite = "SELECT h.content, nxt.block_type \
                       FROM blocks h \
                       JOIN blocks nxt ON nxt.document_id = h.document_id AND nxt.pre = h.pre + 1 \
@@ -233,13 +233,13 @@ fn bench_linter_join(c: &mut Criterion) {
                         AND json_extract(h.properties, '$.depth') = 2 \
                         AND nxt.block_type = 'list'";
 
-    group.bench_function("mqdb_custom", |b| {
+    group.bench_function("mq-db_custom", |b| {
         b.iter(|| engine.execute(sql_sqlite).unwrap())
     });
     group.bench_function("duckdb", |b| {
         b.iter(|| duckdb_exec(&duck_conn, sql))
     });
-    group.bench_function("mqdb_query_api_lint", |b| {
+    group.bench_function("mq-db_query_api_lint", |b| {
         b.iter(|| {
             let q = store.query();
             let v = q.lint_heading_followed_by(2, &[BlockType::List]);
@@ -266,7 +266,7 @@ fn bench_scale(c: &mut Criterion) {
         let duck_conn = duckdb_load(&store);
 
         group.bench_with_input(
-            BenchmarkId::new("mqdb_custom", n_docs),
+            BenchmarkId::new("mq-db_custom", n_docs),
             &engine,
             |b, e| b.iter(|| e.execute(sql).unwrap()),
         );
@@ -276,7 +276,7 @@ fn bench_scale(c: &mut Criterion) {
             |b, c| b.iter(|| duckdb_exec(c, sql)),
         );
         group.bench_with_input(
-            BenchmarkId::new("mqdb_query_api", n_docs),
+            BenchmarkId::new("mq-db_query_api", n_docs),
             &store,
             |b, s| b.iter(|| s.query().heading_depth(2).count()),
         );

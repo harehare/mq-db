@@ -39,7 +39,7 @@ pub struct QueryResult<'a> {
 /// # Example – RAG chunk extraction
 ///
 /// ```rust
-/// use mqdb::{DocumentStore, block::BlockType};
+/// use mq_db::{DocumentStore, block::BlockType};
 ///
 /// let mut store = DocumentStore::new();
 /// store.add_str("# Doc\n\n## Architecture\n\nExplanation\n\n```rust\ncode\n```\n").unwrap();
@@ -79,7 +79,7 @@ impl<'store> Query<'store> {
     ///
     /// Use this to leverage zone-map statistics before scanning blocks:
     /// ```rust
-    /// # use mqdb::DocumentStore;
+    /// # use mq_db::DocumentStore;
     /// # let store = DocumentStore::new();
     /// store.query()
     ///     .documents(|doc| doc.zone_maps.code_languages.contains("python"));
@@ -225,7 +225,7 @@ impl<'store> Query<'store> {
     ///
     /// Returns owned `Vec<Block>` so it can be used on temporaries:
     /// ```rust
-    /// # use mqdb::{DocumentStore, block::BlockType};
+    /// # use mq_db::{DocumentStore, block::BlockType};
     /// # let mut store = DocumentStore::new();
     /// # store.add_str("# Hello\n").unwrap();
     /// let blocks = store.query().heading_depth(1).blocks();
@@ -255,7 +255,7 @@ impl<'store> Query<'store> {
     /// # Example
     ///
     /// ```rust
-    /// use mqdb::{DocumentStore, block::BlockType};
+    /// use mq_db::{DocumentStore, block::BlockType};
     ///
     /// let mut store = DocumentStore::new();
     /// store.add_str("## Section\n\n- item\n").unwrap();

@@ -2,7 +2,7 @@
 
 ## Overview
 
-`mqdb` persists documents in a fixed-size page file. Every file is split into 8192-byte pages. Page 0 is the file header, page 1 is the catalog root, and all remaining pages are used for document block data or overflow chains.
+`mq-db` persists documents in a fixed-size page file. Every file is split into 8192-byte pages. Page 0 is the file header, page 1 is the catalog root, and all remaining pages are used for document block data or overflow chains.
 
 ```text
 +-----------+-----------+-----------+-----------+-----------+

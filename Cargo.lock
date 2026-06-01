@@ -2005,6 +2005,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "mq-db"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "criterion",
+ "crossterm",
+ "duckdb",
+ "mq-lang",
+ "mq-markdown",
+ "ratatui",
+ "rstest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sqlparser",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "mq-lang"
 version = "0.5.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2066,30 +2090,6 @@ dependencies = [
  "scraper",
  "serde_yaml",
  "smol_str",
-]
-
-[[package]]
-name = "mqdb"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "criterion",
- "crossterm",
- "duckdb",
- "mq-lang",
- "mq-markdown",
- "ratatui",
- "rstest",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "sqlparser",
- "tempfile",
- "thiserror",
- "tokio",
 ]
 
 [[package]]

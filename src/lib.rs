@@ -1,6 +1,6 @@
-//! # mqdb – Markdown-specialised Embedded Database
+//! # mq-db – Markdown-specialised Embedded Database
 //!
-//! `mqdb` treats Markdown documents as **structured, hierarchical databases**
+//! `mq-db` treats Markdown documents as **structured, hierarchical databases**
 //! rather than plain text. It builds on [`mq-markdown`]'s AST parser and
 //! adds:
 //!
@@ -22,7 +22,7 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use mqdb::{DocumentStore, block::BlockType};
+//! use mq_db::{DocumentStore, block::BlockType};
 //!
 //! let mut store = DocumentStore::new();
 //! store.add_str("# Hello\n\n## Architecture\n\nDetails\n\n```rust\ncode\n```\n").unwrap();
@@ -39,7 +39,7 @@
 //! ## Structural Linting
 //!
 //! ```rust
-//! use mqdb::{DocumentStore, block::BlockType};
+//! use mq_db::{DocumentStore, block::BlockType};
 //!
 //! let mut store = DocumentStore::new();
 //! store.add_str("## Section\n\n- item without intro paragraph\n").unwrap();

@@ -15,9 +15,10 @@ pub(crate) const PAGE_TYPE_FILE_HEADER: u32 = 1;
 pub(crate) const PAGE_TYPE_CATALOG: u32 = 2;
 pub(crate) const PAGE_TYPE_BLOCK_DATA: u32 = 3;
 pub(crate) const PAGE_TYPE_OVERFLOW: u32 = 4;
+pub(crate) const PAGE_TYPE_INDEX: u32 = 5;
 
 const FILE_MAGIC: u32 = 0x4D51_4442;
-const FILE_VERSION: u32 = 1;
+const FILE_VERSION: u32 = 2;
 const CATALOG_START_PAGE: u32 = 1;
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {
@@ -116,7 +117,9 @@ impl PageFile {
             return Err(invalid_data("invalid MQDB magic number"));
         }
         if version != FILE_VERSION {
-            return Err(invalid_data(format!("unsupported MQDB version: {version}")));
+            return Err(invalid_data(format!(
+                "unsupported file version {version} (expected {FILE_VERSION}); run `mq-db index` to recreate the store"
+            )));
         }
         if page_size != PAGE_SIZE as u32 {
             return Err(invalid_data(format!("unsupported page size: {page_size}")));

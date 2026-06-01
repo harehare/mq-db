@@ -1,4 +1,4 @@
-//! mqdb CLI – Markdown-specialised embedded database command-line tool.
+//! mq-db CLI – Markdown-specialised embedded database command-line tool.
 
 use std::{
     io::{BufRead, Write},
@@ -14,7 +14,7 @@ use axum::{
     Router,
 };
 use clap::{Parser, Subcommand, ValueEnum};
-use mqdb::{DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape};
+use mq_db::{DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape};
 use serde::Deserialize;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -22,7 +22,7 @@ use serde::Deserialize;
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "mqdb", about = "Markdown-specialised embedded database", version)]
+#[command(name = "mq-db", about = "Markdown-specialised embedded database", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -30,14 +30,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Index Markdown files and save to a .mqdb store file
+    /// Index Markdown files and save to a .mq-db store file
     Index {
         /// Markdown files or directories to index
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
-        /// Output store file (default: store.mqdb)
-        #[arg(short, long, default_value = "store.mqdb")]
+        /// Output store file (default: store.mq-db)
+        #[arg(short, long, default_value = "store.mq-db")]
         output: PathBuf,
 
         /// Recursively walk directories
@@ -51,8 +51,8 @@ enum Commands {
 
     /// List all indexed documents
     List {
-        /// Path to .mqdb store file
-        #[arg(short, long, default_value = "store.mqdb")]
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
 
         /// Output format
@@ -65,8 +65,8 @@ enum Commands {
         /// mq program code (e.g. ".h1", "select(.code_lang == \"rust\")")
         code: String,
 
-        /// Path to .mqdb store file
-        #[arg(short, long, default_value = "store.mqdb")]
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
 
         /// Output format
@@ -79,8 +79,8 @@ enum Commands {
         /// SQL query string
         query: Option<String>,
 
-        /// Path to .mqdb store file
-        #[arg(short, long, default_value = "store.mqdb")]
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
 
         /// Read SQL from a file
@@ -94,8 +94,8 @@ enum Commands {
 
     /// Interactive REPL (supports both mq and SQL)
     Repl {
-        /// Path to .mqdb store file
-        #[arg(short, long, default_value = "store.mqdb")]
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
 
         /// Initial query mode
@@ -105,8 +105,8 @@ enum Commands {
 
     /// Run structural lint checks
     Lint {
-        /// Path to .mqdb store file
-        #[arg(short, long, default_value = "store.mqdb")]
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
 
         /// Heading depth to check (H1=1 .. H6=6)
@@ -116,8 +116,8 @@ enum Commands {
 
     /// Show store statistics
     Stats {
-        /// Path to .mqdb store file
-        #[arg(short, long, default_value = "store.mqdb")]
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
     },
 
@@ -126,22 +126,22 @@ enum Commands {
         /// Document ID to show
         doc_id: u32,
 
-        /// Path to .mqdb store file
-        #[arg(short, long, default_value = "store.mqdb")]
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
     },
 
     /// Launch the interactive TUI
     Tui {
-        /// Path to .mqdb store file
-        #[arg(short, long, default_value = "store.mqdb")]
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
     },
 
     /// Start an HTTP server that accepts SQL and mq queries
     Serve {
-        /// Path to .mqdb store file
-        #[arg(short, long, default_value = "store.mqdb")]
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
 
         /// Host to listen on
@@ -228,11 +228,30 @@ fn is_markdown(path: &Path) -> bool {
 fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
     if !db.exists() {
         anyhow::bail!(
-            "Store file not found: {}\nRun `mqdb index <files...>` to create it.",
+            "Store file not found: {}\nRun `mq-db index <files...>` to create it.",
             db.display()
         );
     }
     DocumentStore::load(db).map_err(|e| anyhow::anyhow!("Failed to load store: {}", e))
+}
+
+/// Open the store in lazy mode and load blocks + indexes ready for SQL execution.
+fn open_store_for_sql(db: &Path) -> anyhow::Result<DocumentStore> {
+    if !db.exists() {
+        anyhow::bail!(
+            "Store file not found: {}\nRun `mq-db index <files...>` to create it.",
+            db.display()
+        );
+    }
+    let mut store = DocumentStore::open(db)
+        .map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?;
+    store
+        .load_all_blocks()
+        .map_err(|e| anyhow::anyhow!("Failed to load blocks: {}", e))?;
+    store
+        .load_all_indexes()
+        .map_err(|e| anyhow::anyhow!("Failed to load indexes: {}", e))?;
+    Ok(store)
 }
 
 /// Load only catalog metadata (zone maps, paths, block counts) — no block data.
@@ -240,7 +259,7 @@ fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
 fn load_catalog_store(db: &Path) -> anyhow::Result<DocumentStore> {
     if !db.exists() {
         anyhow::bail!(
-            "Store file not found: {}\nRun `mqdb index <files...>` to create it.",
+            "Store file not found: {}\nRun `mq-db index <files...>` to create it.",
             db.display()
         );
     }
@@ -501,7 +520,7 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("Provide a query argument or --file <path>");
             };
 
-            let store = load_store(&db)?;
+            let store = open_store_for_sql(&db)?;
             let engine = SqlEngine::new(&store).map_err(|e| anyhow::anyhow!("{}", e))?;
             let out = engine.execute(&sql).map_err(|e| anyhow::anyhow!("{}", e))?;
             match format {
@@ -516,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
 
         // ── repl ─────────────────────────────────────────────────────────────
         Commands::Repl { db, mode } => {
-            let store = load_store(&db)?;
+            let store = open_store_for_sql(&db)?;
             run_repl(store, mode)?;
         }
 
@@ -702,7 +721,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("No store found at {}. Starting with empty store.", db.display());
                 DocumentStore::new()
             };
-            mqdb::tui::run(store).map_err(|e| anyhow::anyhow!("{}", e))?;
+            mq_db::tui::run(store).map_err(|e| anyhow::anyhow!("{}", e))?;
         }
 
         // ── serve ─────────────────────────────────────────────────────────────
@@ -718,7 +737,7 @@ async fn main() -> anyhow::Result<()> {
 
             let listener = tokio::net::TcpListener::bind(&addr).await
                 .map_err(|e| anyhow::anyhow!("Cannot bind {}: {}", addr, e))?;
-            println!("mqdb listening on http://{}", addr);
+            println!("mq-db listening on http://{}", addr);
             axum::serve(listener, app).await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
@@ -896,7 +915,10 @@ fn run_repl(store: DocumentStore, initial_mode: ReplMode) -> anyhow::Result<()> 
     let stdin = std::io::stdin();
     let mut mode = initial_mode;
 
-    println!("mqdb  (.help for commands  .quit to exit)");
+    // Build the SQL engine once — blocks and indexes are already loaded.
+    let sql_engine = SqlEngine::new(&store).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    println!("mq-db  (.help for commands  .quit to exit)");
     println!("mode: {}  (.mode mq | .mode sql)\n", mode);
 
     loop {
@@ -927,11 +949,8 @@ fn run_repl(store: DocumentStore, initial_mode: ReplMode) -> anyhow::Result<()> 
                 println!("→ sql mode");
             }
             _ => match mode {
-                ReplMode::Sql => match SqlEngine::new(&store) {
-                    Ok(engine) => match engine.execute(input) {
-                        Ok(out) => print!("{}", out.to_table()),
-                        Err(e) => eprintln!("error: {}", e),
-                    },
+                ReplMode::Sql => match sql_engine.execute(input) {
+                    Ok(out) => print!("{}", out.to_table()),
                     Err(e) => eprintln!("error: {}", e),
                 },
                 ReplMode::Mq => match MqEngine::eval_store(input, &store) {

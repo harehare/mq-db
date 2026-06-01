@@ -1,4 +1,4 @@
-//! Terminal User Interface for mqdb using ratatui + crossterm.
+//! Terminal User Interface for mq-db using ratatui + crossterm.
 
 use std::io;
 
@@ -399,7 +399,7 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
         QueryMode::Mq => " mq",
     };
     let text = format!(
-        " mqdb  {}  {}",
+        " mq-db  {}  {}",
         mode_indicator,
         if app.input_focused {
             "Tab:switch  Enter:run  Esc:blur  Ctrl+C:quit"

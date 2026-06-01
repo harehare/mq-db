@@ -1,5 +1,5 @@
 [package]
-name = "mqdb"
+name = "mq-db"
 version = "0.1.0"
 edition = "2024"
 description = "Markdown-specialized embedded database with interval-indexed block storage and hierarchical query support"
@@ -28,11 +28,11 @@ duckdb = "1.10503"
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 
 [[bin]]
-name = "mqdb"
-path = "src/bin/mqdb.rs"
+name = "mq-db"
+path = "src/bin/mq-db.rs"
 
 [[bench]]
-name = "mqdb_bench"
+name = "mq_db_bench"
 harness = false
 
 [[bench]]

@@ -14,6 +14,8 @@ pub struct CatalogEntry {
     pub first_block_page: u32,
     pub num_blocks: u32,
     pub zone_map_bytes: Vec<u8>,
+    /// First page of the persisted secondary index chain. 0 = not stored.
+    pub index_start_page: u32,
 }
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {
@@ -97,6 +99,7 @@ fn serialize_catalog(entries: &[CatalogEntry]) -> Vec<u8> {
         out.extend_from_slice(&entry.num_blocks.to_le_bytes());
         out.extend_from_slice(&as_u32(entry.zone_map_bytes.len(), "zone map length").to_le_bytes());
         out.extend_from_slice(&entry.zone_map_bytes);
+        out.extend_from_slice(&entry.index_start_page.to_le_bytes());
     }
 
     out
@@ -186,12 +189,14 @@ pub fn read_catalog(pf: &mut PageFile) -> Result<Vec<CatalogEntry>, MqdbError> {
             .map_err(|_| invalid_data("zone map length exceeds usize range"))?;
         let zone_map_bytes = decoder.read_exact(zone_map_len)?.to_vec();
 
+        let index_start_page = decoder.read_u32()?;
         entries.push(CatalogEntry {
             document_id,
             path,
             first_block_page,
             num_blocks,
             zone_map_bytes,
+            index_start_page,
         });
     }
 

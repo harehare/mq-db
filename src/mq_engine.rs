@@ -1,4 +1,4 @@
-//! mq query engine integration for mqdb.
+//! mq query engine integration for mq-db.
 //!
 //! Provides [`MqEngine`] which runs [`mq-lang`] programs against Markdown
 //! files on disk or against file-backed documents in a [`DocumentStore`].
@@ -6,7 +6,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use mqdb::mq_engine::MqEngine;
+//! use mq_db::mq_engine::MqEngine;
 //! use std::path::Path;
 //!
 //! // Run an mq program against a file
