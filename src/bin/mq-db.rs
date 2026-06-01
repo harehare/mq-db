@@ -870,10 +870,11 @@ fn md_block_to_html(s: &str) -> String {
     for depth in (1u8..=6).rev() {
         let prefix = "#".repeat(depth as usize);
         if let Some(rest) = trimmed.strip_prefix(&prefix)
-            && (rest.starts_with(' ') || rest.is_empty()) {
-                let text = html_escape(rest.trim());
-                return format!("<h{depth}>{text}</h{depth}>");
-            }
+            && (rest.starts_with(' ') || rest.is_empty())
+        {
+            let text = html_escape(rest.trim());
+            return format!("<h{depth}>{text}</h{depth}>");
+        }
     }
 
     // Fenced code block

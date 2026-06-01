@@ -188,10 +188,11 @@ impl DocumentStore {
         let index_start_page = self.documents[i].index_start_page;
 
         if index_start_page > 0
-            && let Some(storage) = self.storage.as_mut() {
-                let bytes = storage.read_index_bytes(index_start_page)?;
-                return DocumentIndex::from_bytes(&bytes);
-            }
+            && let Some(storage) = self.storage.as_mut()
+        {
+            let bytes = storage.read_index_bytes(index_start_page)?;
+            return DocumentIndex::from_bytes(&bytes);
+        }
 
         Ok(DocumentIndex::build(&self.documents[i].blocks))
     }

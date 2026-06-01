@@ -110,11 +110,7 @@ impl App {
             QueryMode::Sql => match SqlEngine::new(&self.store) {
                 Ok(engine) => match engine.execute(&code) {
                     Ok(out) => {
-                        self.result_lines = out
-                            .to_table()
-                            .lines()
-                            .map(ResultLine::plain)
-                            .collect();
+                        self.result_lines = out.to_table().lines().map(ResultLine::plain).collect();
                         self.status_msg = Some(format!(
                             "{} row{}",
                             out.rows.len(),
