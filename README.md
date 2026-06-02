@@ -5,9 +5,9 @@
 
 **Markdown-specialized embedded database with interval-indexed block storage and hierarchical query support.**
 
-[![ci](https://img.shields.io/github/actions/workflow/status/harehare/mq-db/ci.yml?logo=github-actions&label=ci)](https://github.com/harehare/mq-db/actions)
-[![crates.io](https://img.shields.io/crates/v/mq-db?logo=rust)](https://crates.io/crates/mq-db)
-[![license](https://img.shields.io/crates/l/mq-db)](LICENSE)
+[![ci](https://img.shields.io/github/actions/workflow/status/harehare/mq-db/ci.yml?logo=github-actions&label=ci)](https://github.com/harehare/mq-db/actions/workflows/ci.yml)
+[![audit](https://img.shields.io/github/actions/workflow/status/harehare/mq-db/audit.yml?logo=shield&label=audit)](https://github.com/harehare/mq-db/actions/workflows/audit.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 </div>
 
