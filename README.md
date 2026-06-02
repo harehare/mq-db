@@ -48,8 +48,6 @@ cargo build --release
 # binary: target/release/mq-db
 ```
 
-> **Requires:** the [`mq`](https://github.com/harehare/mq) repository checked out as a sibling directory (`../mq`).
-
 ## CLI Usage
 
 ### Index Markdown files
@@ -57,6 +55,7 @@ cargo build --release
 ```bash
 mq-db index docs/ --recursive --output store.mq-db
 mq-db index README.md DESIGN.md
+mq-db index docs/ --no-spans   # omit source spans (~21 bytes/block saved)
 ```
 
 ```
@@ -70,6 +69,7 @@ Indexed 2 files → store.mq-db
 
 ```bash
 mq-db list --db store.mq-db
+mq-db list --db store.mq-db --format json   # also: csv, tsv, markdown, html
 ```
 
 ```
@@ -86,6 +86,8 @@ mq-db list --db store.mq-db
 
 ```bash
 mq-db sql "SELECT block_type, count(*) FROM blocks GROUP BY block_type" --db store.mq-db
+mq-db sql --file query.sql --db store.mq-db           # read SQL from a file
+mq-db sql "SELECT ..." --db store.mq-db --format json  # also: csv, tsv, markdown, html
 ```
 
 ```
@@ -117,6 +119,7 @@ mq-db sql "
 ```bash
 mq-db mq ".h1" --db store.mq-db
 mq-db mq 'select(.code_lang == "rust")' --db store.mq-db
+mq-db mq ".h1" --db store.mq-db --format markdown  # also: json, csv, tsv, html
 ```
 
 ### Interactive REPL
@@ -144,6 +147,37 @@ sql> .mode mq
 mq> .h2
 ## Architecture
 ## Query Engine
+```
+
+### HTTP server
+
+```bash
+mq-db serve --db store.mq-db              # listens on 127.0.0.1:7878
+mq-db serve --db store.mq-db --port 8080  # custom port
+mq-db serve --db store.mq-db --host 0.0.0.0 --port 8080
+```
+
+Three endpoints are available:
+
+| Method | Path | Body | Description |
+|---|---|---|---|
+| `GET` | `/health` | — | `{"status":"ok","documents":<n>}` |
+| `POST` | `/sql` | `{"query":"SELECT …"}` | Execute a SQL query, returns JSON rows |
+| `POST` | `/mq` | `{"code":".h1"}` | Evaluate an mq expression, returns `{"results":[…]}` |
+
+```bash
+# Health check
+curl http://127.0.0.1:7878/health
+
+# SQL via HTTP
+curl -s -X POST http://127.0.0.1:7878/sql \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"SELECT block_type, count(*) FROM blocks GROUP BY block_type"}'
+
+# mq via HTTP
+curl -s -X POST http://127.0.0.1:7878/mq \
+  -H 'Content-Type: application/json' \
+  -d '{"code":".h1"}'
 ```
 
 ### Structural linting
@@ -241,6 +275,7 @@ mq-db tui --db store.mq-db
 ```rust
 use mq_db::{DocumentStore, SqlEngine, MqEngine, block::BlockType};
 
+// ── Build in memory ──────────────────────────────────────────────────────────
 let mut store = DocumentStore::new();
 store.add_file("docs/DESIGN.md")?;
 store.add_str("# Hello\n\n## Architecture\n\nDetails\n")?;
@@ -260,15 +295,24 @@ let out = engine.execute(
 print!("{}", out.to_table());
 
 // mq engine
-store.add_file("README.md")?;
 let results = MqEngine::eval_store(".h1", &store)?;
 
 // Structural lint
 let violations = store.query().lint_heading_followed_by(2, &[BlockType::List]);
 
-// Persist / load
+// ── Persist / load ───────────────────────────────────────────────────────────
 store.save("store.mq-db")?;
+
+// Full load — all blocks read into memory, indexes built on first SqlEngine use
 let store = DocumentStore::load("store.mq-db")?;
+
+// Lazy open — catalog only; call load_all_blocks() + load_all_indexes() before SQL
+let mut store = DocumentStore::open("store.mq-db")?;
+store.load_all_blocks()?;
+store.load_all_indexes()?;
+
+// Catalog-only — for metadata commands (list, stats) that don't need block data
+let store = DocumentStore::load_catalog_only("store.mq-db")?;
 ```
 
 ## SQL Reference
