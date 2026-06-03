@@ -3,6 +3,10 @@ name = "mq-db"
 version = "0.1.0"
 edition = "2024"
 description = "Markdown-specialized embedded database with interval-indexed block storage and hierarchical query support"
+keywords = ["markdown", "jq", "query", "database"]
+readme = "README.md"
+categories = ["command-line-utilities", "text-processing", "database-implementations"]
+repository = "https://github.com/harehare/mq-db"
 license = "MIT"
 
 [dependencies]
@@ -29,4 +33,10 @@ rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 name = "mq-db"
 path = "src/bin/mq-db.rs"
 
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = 'abort'
+strip = true
 
