@@ -70,10 +70,8 @@ cargo install mq-db
 ### From Source
 
 ```bash
-git clone https://github.com/harehare/mq-db
-cd mq-db
-cargo build --release
-# binary: target/release/mq-db
+# Latest Development Version
+cargo install --git https://github.com/harehare/mq-db.git
 ```
 
 ### Supported Platforms
@@ -217,11 +215,11 @@ mq-db serve --db store.mq-db --host 0.0.0.0 --port 8080
 
 Three endpoints are available:
 
-| Method | Path | Body | Description |
-|---|---|---|---|
-| `GET` | `/health` | — | `{"status":"ok","documents":<n>}` |
-| `POST` | `/sql` | `{"query":"SELECT …"}` | Execute a SQL query, returns JSON rows |
-| `POST` | `/mq` | `{"code":".h1"}` | Evaluate an mq expression, returns `{"results":[…]}` |
+| Method | Path      | Body                   | Description                                          |
+| ------ | --------- | ---------------------- | ---------------------------------------------------- |
+| `GET`  | `/health` | —                      | `{"status":"ok","documents":<n>}`                    |
+| `POST` | `/sql`    | `{"query":"SELECT …"}` | Execute a SQL query, returns JSON rows               |
+| `POST` | `/mq`     | `{"code":".h1"}`       | Evaluate an mq expression, returns `{"results":[…]}` |
 
 ```bash
 # Health check
@@ -317,16 +315,16 @@ mq-db tui --db store.mq-db
 
 **Keys:**
 
-| Key | Action |
-|---|---|
-| `i` | Focus query input |
-| `Esc` | Blur input |
-| `Enter` | Run query |
-| `Tab` | Toggle mq / SQL mode |
-| `j` / `k` | Navigate document list |
-| `d` / `u` | Scroll results down / up |
-| `g` / `G` | Jump to top / bottom |
-| `q` / `Ctrl+C` | Quit |
+| Key            | Action                   |
+| -------------- | ------------------------ |
+| `i`            | Focus query input        |
+| `Esc`          | Blur input               |
+| `Enter`        | Run query                |
+| `Tab`          | Toggle mq / SQL mode     |
+| `j` / `k`      | Navigate document list   |
+| `d` / `u`      | Scroll results down / up |
+| `g` / `G`      | Jump to top / bottom     |
+| `q` / `Ctrl+C` | Quit                     |
 
 ## Library API
 
@@ -386,24 +384,24 @@ SELECT id, document_id, block_type, content, pre, post,
 
 ### Built-in functions
 
-| Function | Description |
-|---|---|
-| `under(pre, post, anc_pre, anc_post)` | O(1) interval ancestor check |
-| `mq(program, content)` | Run an mq program against Markdown content |
-| `json_extract(json, path)` | Extract a value from a JSON string |
-| `count(*) / min / max / sum / avg` | Aggregate functions |
-| `lower / upper / length / coalesce` | Scalar utilities |
+| Function                              | Description                                |
+| ------------------------------------- | ------------------------------------------ |
+| `under(pre, post, anc_pre, anc_post)` | O(1) interval ancestor check               |
+| `mq(program, content)`                | Run an mq program against Markdown content |
+| `json_extract(json, path)`            | Extract a value from a JSON string         |
+| `count(*) / min / max / sum / avg`    | Aggregate functions                        |
+| `lower / upper / length / coalesce`   | Scalar utilities                           |
 
 ### DDL statements
 
-| Statement | Description |
-|---|---|
-| `CREATE TABLE name AS SELECT …` | Create a custom table from a query result |
+| Statement                         | Description                                       |
+| --------------------------------- | ------------------------------------------------- |
+| `CREATE TABLE name AS SELECT …`   | Create a custom table from a query result         |
 | `CREATE TABLE name (col TYPE, …)` | Create an empty custom table with explicit schema |
-| `INSERT INTO name VALUES (…)` | Insert a row into a custom table |
-| `DROP TABLE name` | Drop a custom table |
-| `SHOW TABLES` | List all custom tables |
-| `DESC name` | Show schema of a custom table |
+| `INSERT INTO name VALUES (…)`     | Insert a row into a custom table                  |
+| `DROP TABLE name`                 | Drop a custom table                               |
+| `SHOW TABLES`                     | List all custom tables                            |
+| `DESC name`                       | Show schema of a custom table                     |
 
 ### Example queries
 
@@ -454,12 +452,12 @@ struct Block {
 }
 ```
 
-| Block type | Properties |
-|---|---|
-| `Heading` | `{ "depth": 2, "slug": "architecture" }` |
-| `Code` | `{ "lang": "rust", "meta": "no_run" }` |
-| `List` | `{ "ordered": false, "level": 1, "checked": null }` |
-| `Yaml` / `Toml` | parsed front-matter keys (`"title"`, `"tags"`, …) |
+| Block type      | Properties                                          |
+| --------------- | --------------------------------------------------- |
+| `Heading`       | `{ "depth": 2, "slug": "architecture" }`            |
+| `Code`          | `{ "lang": "rust", "meta": "no_run" }`              |
+| `List`          | `{ "ordered": false, "level": 1, "checked": null }` |
+| `Yaml` / `Toml` | parsed front-matter keys (`"title"`, `"tags"`, …)   |
 
 ### Index layers
 
@@ -479,12 +477,12 @@ flowchart LR
 
 Built once per document and stored in the `.mq-db` file. Checked before any block is read:
 
-| Field | Skips documents where… |
-|---|---|
-| `heading_contents` | The requested heading text is absent |
-| `code_languages` | The requested language tag is absent |
-| `max_heading_depth` | The requested depth cannot exist |
-| `tags` | The tag filter cannot match |
+| Field               | Skips documents where…               |
+| ------------------- | ------------------------------------ |
+| `heading_contents`  | The requested heading text is absent |
+| `code_languages`    | The requested language tag is absent |
+| `max_heading_depth` | The requested depth cannot exist     |
+| `tags`              | The tag filter cannot match          |
 
 #### Layer 2 — Interval Index (section hierarchy)
 
@@ -510,11 +508,11 @@ graph TD
 
 #### Layer 3 — Secondary Indexes (block-level fast lookup)
 
-| Index | Column(s) | Structure | Complexity |
-|---|---|---|---|
-| `BitmapIndex` | `block_type` | Inverted list per type | O(1) key + O(k) iterate |
-| `BTreeIndex` | `pre`, `post` | `BTreeMap` | O(log n) point, O(log n + k) range |
-| `HashIndex` | `content`, `lang`, `depth` | `HashMap` | O(1) average |
+| Index         | Column(s)                  | Structure              | Complexity                         |
+| ------------- | -------------------------- | ---------------------- | ---------------------------------- |
+| `BitmapIndex` | `block_type`               | Inverted list per type | O(1) key + O(k) iterate            |
+| `BTreeIndex`  | `pre`, `post`              | `BTreeMap`             | O(log n) point, O(log n + k) range |
+| `HashIndex`   | `content`, `lang`, `depth` | `HashMap`              | O(1) average                       |
 
 SQL predicate pushdown picks an `IndexHint`:
 
