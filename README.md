@@ -13,17 +13,16 @@
 
 `mq-db` treats Markdown documents as **structured, hierarchical databases** rather than plain text. It parses Markdown into a flat block list with an **interval index** (Nested Set / Pre-Post Order), enabling O(1) section hierarchy queries. Documents can be queried with **SQL** or **[mq](https://github.com/harehare/mq)** and persisted to a compact custom page-file format.
 
-```
-[Markdown File]
-      │
-      ▼  CST Parser (mq-markdown)
-[Block Tree]  ─── (heading, paragraph, code, list, …)
-      │
-      ▼  Interval Index + Secondary Indexes
-[Flat Block Vector]  pre/post integers + BitmapIndex / BTreeIndex / HashIndex
-      │
-      ├── SQL Engine  (sqlparser — custom native evaluator, no SQLite)
-      └── mq Engine   (mq-lang evaluator)
+```mermaid
+flowchart TD
+    A["Markdown File(s)"] -->|"CST Parser (mq-markdown)"| B["Block Tree\n(heading · paragraph · code · list …)"]
+    B -->|"Interval Index + Secondary Indexes"| C["Flat Block Vector\n(pre/post integers)"]
+    C --> D["BitmapIndex\n(block_type)"]
+    C --> E["BTreeIndex\n(pre / post)"]
+    C --> F["HashIndex\n(content / lang / depth)"]
+    C --> G["Zone Maps\n(per-document stats)"]
+    C --> H["SQL Engine\n(sqlparser — custom native evaluator)"]
+    C --> I["mq Engine\n(mq-lang evaluator)"]
 ```
 
 > [!IMPORTANT]
@@ -36,6 +35,8 @@
 - **Three-layer secondary indexes** — `BitmapIndex` (block type), `BTreeIndex` (pre/post), `HashIndex` (content/lang/depth) for fast SQL predicate pushdown
 - **Zone Maps** — per-document statistics skip irrelevant files before scanning any blocks
 - **Dual query engines** — SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
+- **DDL support** — `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
+- **`mq()` scalar function** — run an mq program against Markdown content inline in SQL
 - **Custom page-file persistence** — 8 KB fixed pages, checksums, atomic writes
 - **CLI + interactive REPL + TUI** — full terminal experience
 
@@ -112,6 +113,30 @@ mq-db sql "
     (SELECT post FROM blocks WHERE block_type = 'heading' AND content = 'Architecture'))
   ORDER BY b.pre
 " --db store.mq-db
+```
+
+**`mq()` scalar function** — run an mq program against Markdown content inline:
+
+```bash
+mq-db sql "SELECT mq('.h1 | to_text', content) AS title FROM blocks WHERE block_type = 'code'" --db store.mq-db
+```
+
+### DDL — custom in-memory tables
+
+```bash
+# Create from a SELECT result
+mq-db sql "CREATE TABLE headings AS SELECT content, depth FROM blocks WHERE block_type = 'heading'" --db store.mq-db
+
+# Create with explicit schema, then insert
+mq-db sql "CREATE TABLE notes (id TEXT, body TEXT)" --db store.mq-db
+mq-db sql "INSERT INTO notes VALUES ('1', 'Hello world')" --db store.mq-db
+
+# Inspect
+mq-db sql "SHOW TABLES" --db store.mq-db
+mq-db sql "DESC notes"  --db store.mq-db
+
+# Drop
+mq-db sql "DROP TABLE notes" --db store.mq-db
 ```
 
 ### mq queries
@@ -331,9 +356,21 @@ SELECT id, document_id, block_type, content, pre, post,
 | Function | Description |
 |---|---|
 | `under(pre, post, anc_pre, anc_post)` | O(1) interval ancestor check |
+| `mq(program, content)` | Run an mq program against Markdown content |
 | `json_extract(json, path)` | Extract a value from a JSON string |
 | `count(*) / min / max / sum / avg` | Aggregate functions |
 | `lower / upper / length / coalesce` | Scalar utilities |
+
+### DDL statements
+
+| Statement | Description |
+|---|---|
+| `CREATE TABLE name AS SELECT …` | Create a custom table from a query result |
+| `CREATE TABLE name (col TYPE, …)` | Create an empty custom table with explicit schema |
+| `INSERT INTO name VALUES (…)` | Insert a row into a custom table |
+| `DROP TABLE name` | Drop a custom table |
+| `SHOW TABLES` | List all custom tables |
+| `DESC name` | Show schema of a custom table |
 
 ### Example queries
 
@@ -346,6 +383,11 @@ WHERE under(b.pre, b.post,
   (SELECT post FROM blocks WHERE block_type = 'heading' AND content = 'Architecture'))
   AND b.block_type IN ('paragraph', 'code')
 ORDER BY b.pre;
+
+-- Extract H1 title from code block content via the mq() scalar function
+SELECT mq('.h1 | to_text', content) AS title
+FROM blocks
+WHERE block_type = 'code' AND lang = 'markdown';
 
 -- H2 headings immediately followed by a list (structural lint)
 SELECT d.path, h.content AS heading
@@ -390,6 +432,16 @@ struct Block {
 
 mq-db applies three complementary index layers, cheapest-first.
 
+```mermaid
+flowchart LR
+    Q["SQL Query"] --> ZM["Layer 1\nZone Maps\n(document skip)"]
+    ZM -->|"relevant docs"| II["Layer 2\nInterval Index\n(section scope)"]
+    II -->|"candidate blocks"| SI["Layer 3\nSecondary Indexes\n(block lookup)"]
+    SI -->|"BitmapIndex\nBTreeIndex\nHashIndex"| R["Result Rows"]
+    ZM -->|"skip"| X1["✗ irrelevant docs"]
+    SI -->|"no hint"| FS["Full Scan"]
+```
+
 #### Layer 1 — Zone Maps (document-level skip)
 
 Built once per document and stored in the `.mq-db` file. Checked before any block is read:
@@ -405,13 +457,20 @@ Built once per document and stored in the `.mq-db` file. Checked before any bloc
 
 Heading hierarchy encoded as `(pre, post)` pairs via Pre-Post Order (Nested Set) traversal:
 
-```
-# Doc          pre=0, post=11
-## Section A   pre=2, post=7
-  Paragraph    pre=3, post=4
-  Code         pre=5, post=6
-## Section B   pre=8, post=11
-  Paragraph    pre=9, post=10
+```mermaid
+graph TD
+    doc["# Doc\npre=0 · post=11"]
+    secA["## Section A\npre=2 · post=7"]
+    para1["Paragraph\npre=3 · post=4"]
+    code1["Code\npre=5 · post=6"]
+    secB["## Section B\npre=8 · post=11"]
+    para2["Paragraph\npre=9 · post=10"]
+
+    doc --> secA
+    doc --> secB
+    secA --> para1
+    secA --> code1
+    secB --> para2
 ```
 
 `A is_under B` ↔ `B.pre < A.pre AND A.post < B.post` — O(1), no tree traversal.
@@ -426,24 +485,28 @@ Heading hierarchy encoded as `(pre, post)` pairs via Pre-Post Order (Nested Set)
 
 SQL predicate pushdown picks an `IndexHint`:
 
-```
-WHERE block_type = 'heading'    → BitmapIndex
-WHERE pre = 42                  → BTreeIndex  (point)
-WHERE pre BETWEEN 10 AND 50     → BTreeIndex  (range)
-WHERE content = 'Architecture'  → HashIndex
-WHERE lang = 'rust'             → HashIndex
-WHERE depth = 2                 → HashIndex
-(other)                         → FullScan
+```mermaid
+flowchart TD
+    P["SQL WHERE predicate"]
+    P -->|"block_type = '...'"| B["BitmapIndex"]
+    P -->|"pre = N"| BT1["BTreeIndex (point)"]
+    P -->|"pre BETWEEN N AND M"| BT2["BTreeIndex (range)"]
+    P -->|"content = '...'"| H1["HashIndex"]
+    P -->|"lang = '...'"| H2["HashIndex"]
+    P -->|"depth = N"| H3["HashIndex"]
+    P -->|"other"| FS["Full Scan"]
 ```
 
 ### Storage format
 
 Custom 8 KB page file:
 
-```
-Page 0  │ File header  (magic 0x4D514442, version, page count)
-Page 1  │ Catalog      (doc_id → first_block_page, num_blocks, ZoneMaps)
-Page 2+ │ Block data   (linked page chains, overflow pages)
+```mermaid
+block-beta
+    columns 1
+    block:header["Page 0 — File Header\nmagic 0x4D514442 · version · page count"]
+    block:catalog["Page 1 — Catalog\ndoc_id → first_block_page · num_blocks · ZoneMaps"]
+    block:blocks["Page 2+ — Block Data\nlinked page chains · overflow pages"]
 ```
 
 Writes are atomic: data goes to `<path>.tmp` then renamed to `<path>` on success.
