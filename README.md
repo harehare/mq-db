@@ -9,6 +9,8 @@
 [![audit](https://img.shields.io/github/actions/workflow/status/harehare/mq-db/audit.yml?logo=shield&label=audit)](https://github.com/harehare/mq-db/actions/workflows/audit.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
+![demo](./assets/demo.gif)
+
 </div>
 
 `mq-db` treats Markdown documents as **structured, hierarchical databases** rather than plain text. It parses Markdown into a flat block list with an **interval index** (Nested Set / Pre-Post Order), enabling O(1) section hierarchy queries. Documents can be queried with **SQL** or **[mq](https://github.com/harehare/mq)** and persisted to a compact custom page-file format.
@@ -42,12 +44,43 @@ flowchart TD
 
 ## Installation
 
+### Using the Installation Script (Recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/harehare/mq-db/main/bin/install.sh | bash
+```
+
+The installer will:
+- Download the latest release for your platform
+- Verify the binary with SHA256 checksum
+- Install to `~/.local/bin/`
+- Update your shell profile (bash, zsh, or fish)
+
+After installation, restart your terminal or run:
+```bash
+source ~/.bashrc  # or ~/.zshrc, or ~/.config/fish/config.fish
+```
+
+### Using Cargo
+
+```bash
+cargo install mq-db
+```
+
+### From Source
+
 ```bash
 git clone https://github.com/harehare/mq-db
 cd mq-db
 cargo build --release
 # binary: target/release/mq-db
 ```
+
+### Supported Platforms
+
+- **Linux**: x86_64, aarch64
+- **macOS**: x86_64 (Intel), aarch64 (Apple Silicon)
+- **Windows**: x86_64
 
 ## CLI Usage
 
@@ -502,11 +535,12 @@ flowchart TD
 Custom 8 KB page file:
 
 ```mermaid
-block-beta
-    columns 1
-    block:header["Page 0 — File Header\nmagic 0x4D514442 · version · page count"]
-    block:catalog["Page 1 — Catalog\ndoc_id → first_block_page · num_blocks · ZoneMaps"]
-    block:blocks["Page 2+ — Block Data\nlinked page chains · overflow pages"]
+graph TD
+    P0["Page 0 — File Header\nmagic 0x4D514442 · version · page count"]
+    P1["Page 1 — Catalog\ndoc_id → first_block_page · num_blocks · ZoneMaps"]
+    P2["Page 2+ — Block Data\nlinked page chains · overflow pages"]
+
+    P0 --> P1 --> P2
 ```
 
 Writes are atomic: data goes to `<path>.tmp` then renamed to `<path>` on success.
