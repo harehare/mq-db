@@ -766,7 +766,11 @@ fn eval_mq_scalar(program: &str, content: &str) -> Value {
     };
     match engine.eval(program, input.into_iter()) {
         Ok(output) => {
-            let parts: Vec<String> = output.compact().into_iter().map(|v| v.to_string()).collect();
+            let parts: Vec<String> = output
+                .compact()
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect();
             if parts.is_empty() {
                 Value::Null
             } else {
