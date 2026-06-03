@@ -4,6 +4,8 @@ use std::{
     sync::RwLock,
 };
 
+type CustomTable = (Vec<String>, Vec<Vec<String>>);
+
 use mq_markdown::Markdown;
 
 use crate::{
@@ -63,7 +65,7 @@ pub struct DocumentStore {
     /// User-registered virtual tables: name → (columns, rows).
     /// Uses `RwLock` for interior mutability so `SqlEngine` can execute DDL
     /// (`CREATE TABLE`, `INSERT INTO`, `DROP TABLE`) with only `&DocumentStore`.
-    pub(crate) custom_tables: RwLock<HashMap<String, (Vec<String>, Vec<Vec<String>>)>>,
+    pub(crate) custom_tables: RwLock<HashMap<String, CustomTable>>,
 }
 
 impl Default for DocumentStore {

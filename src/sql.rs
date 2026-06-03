@@ -956,9 +956,7 @@ impl<'a> SqlEngine<'a> {
                 rows,
             });
         }
-        Err(MqdbError::SqlExec(format!(
-            "unknown table: {table_name}"
-        )))
+        Err(MqdbError::SqlExec(format!("unknown table: {table_name}")))
     }
 
     fn exec_show_tables(&self) -> Result<QueryOutput, MqdbError> {
@@ -978,7 +976,13 @@ impl<'a> SqlEngine<'a> {
     }
 
     fn exec_create_table(&self, ct: &CreateTable) -> Result<QueryOutput, MqdbError> {
-        let table_name = ct.name.0.last().map(ident_value).unwrap_or("").to_lowercase();
+        let table_name = ct
+            .name
+            .0
+            .last()
+            .map(ident_value)
+            .unwrap_or("")
+            .to_lowercase();
         if matches!(table_name.as_str(), "blocks" | "documents") {
             return Err(MqdbError::SqlExec(format!(
                 "cannot override built-in table '{table_name}'"
@@ -1007,7 +1011,12 @@ impl<'a> SqlEngine<'a> {
                 "CREATE TABLE requires at least one column or AS SELECT".into(),
             ));
         }
-        let already_exists = self.store.custom_tables.read().unwrap().contains_key(&table_name);
+        let already_exists = self
+            .store
+            .custom_tables
+            .read()
+            .unwrap()
+            .contains_key(&table_name);
         if already_exists {
             if ct.if_not_exists {
                 return Ok(QueryOutput {
@@ -1035,11 +1044,7 @@ impl<'a> SqlEngine<'a> {
             TableObject::TableName(name) => {
                 name.0.last().map(ident_value).unwrap_or("").to_lowercase()
             }
-            _ => {
-                return Err(MqdbError::SqlExec(
-                    "unsupported INSERT target".into(),
-                ))
-            }
+            _ => return Err(MqdbError::SqlExec("unsupported INSERT target".into())),
         };
 
         let source = ins
@@ -1056,9 +1061,7 @@ impl<'a> SqlEngine<'a> {
             let table_cols = guard
                 .get(&table_name)
                 .map(|(c, _)| c.clone())
-                .ok_or_else(|| {
-                    MqdbError::SqlExec(format!("unknown table: {table_name}"))
-                })?;
+                .ok_or_else(|| MqdbError::SqlExec(format!("unknown table: {table_name}")))?;
             drop(guard);
             let indices: Result<Vec<usize>, _> = ins
                 .columns
@@ -1068,9 +1071,7 @@ impl<'a> SqlEngine<'a> {
                     table_cols
                         .iter()
                         .position(|c| c.eq_ignore_ascii_case(name))
-                        .ok_or_else(|| {
-                            MqdbError::SqlExec(format!("unknown column '{name}'"))
-                        })
+                        .ok_or_else(|| MqdbError::SqlExec(format!("unknown column '{name}'")))
                 })
                 .collect();
             Some(indices?)
@@ -1748,10 +1749,10 @@ fn analyze_where_for_index(expr: &Expr) -> IndexHint {
                     IndexHint::FullScan
                 }
                 Some("lang") => {
-                    if let Some(s) = val {
-                        if !s.is_empty() {
-                            return IndexHint::LangExact(s);
-                        }
+                    if let Some(s) = val
+                        && !s.is_empty()
+                    {
+                        return IndexHint::LangExact(s);
                     }
                     IndexHint::FullScan
                 }
@@ -2095,7 +2096,11 @@ mod tests {
         let table = out.to_table();
         // Lines that start with '│' = header + 2 data rows = 3 (no extra split)
         let bar_lines: Vec<&str> = table.lines().filter(|l| l.starts_with('│')).collect();
-        assert_eq!(bar_lines.len(), 3, "newline in cell must not produce extra table rows");
+        assert_eq!(
+            bar_lines.len(),
+            3,
+            "newline in cell must not produce extra table rows"
+        );
         // The first data row (index 1, after the header) must contain the normalised content
         assert!(bar_lines[1].contains("line one line two"));
     }
@@ -2163,9 +2168,7 @@ mod tests {
                  SELECT block_type, content FROM blocks WHERE block_type = 'heading'",
             )
             .unwrap();
-        let out = engine
-            .execute("SELECT content FROM headings")
-            .unwrap();
+        let out = engine.execute("SELECT content FROM headings").unwrap();
         assert_eq!(out.rows.len(), 2);
     }
 
@@ -2174,9 +2177,7 @@ mod tests {
     fn test_ddl_drop_table() {
         let store = DocumentStore::new();
         let engine = SqlEngine::new(&store).unwrap();
-        engine
-            .execute("CREATE TABLE tmp (x TEXT)")
-            .unwrap();
+        engine.execute("CREATE TABLE tmp (x TEXT)").unwrap();
         engine.execute("DROP TABLE tmp").unwrap();
         let err = engine.execute("SELECT * FROM tmp").unwrap_err();
         assert!(err.to_string().contains("unknown table"));
@@ -2187,7 +2188,9 @@ mod tests {
     fn test_ddl_drop_if_exists() {
         let store = DocumentStore::new();
         let engine = SqlEngine::new(&store).unwrap();
-        engine.execute("DROP TABLE IF EXISTS no_such_table").unwrap();
+        engine
+            .execute("DROP TABLE IF EXISTS no_such_table")
+            .unwrap();
     }
 
     // DESC blocks (built-in)
