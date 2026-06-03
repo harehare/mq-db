@@ -4,10 +4,6 @@ use crate::{
     store::DocumentStore,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Section anchor: how to locate the enclosing heading section
-// ─────────────────────────────────────────────────────────────────────────────
-
 enum SectionAnchor {
     /// Directly supply a known (pre, post) interval.
     Interval { pre: u32, post: u32 },
@@ -15,19 +11,11 @@ enum SectionAnchor {
     Heading { content: String, depth: Option<u8> },
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// QueryResult: a matched block with its owning document
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// A query result pairing a matched [`Block`] with its parent [`Document`].
 pub struct QueryResult<'a> {
     pub block: &'a Block,
     pub document: &'a Document,
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Query builder
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Chainable, lazy query builder over a [`DocumentStore`].
 ///
@@ -73,8 +61,6 @@ impl<'store> Query<'store> {
         }
     }
 
-    // ── Document-level filters ───────────────────────────────────────────────
-
     /// Skip documents for which `predicate` returns `false`.
     ///
     /// Use this to leverage zone-map statistics before scanning blocks:
@@ -91,8 +77,6 @@ impl<'store> Query<'store> {
         self.doc_predicate = Some(Box::new(f));
         self
     }
-
-    // ── Section scope (UNDER) ────────────────────────────────────────────────
 
     /// Restrict results to blocks that fall within the heading section
     /// identified by `content` and optional `depth`.
@@ -116,8 +100,6 @@ impl<'store> Query<'store> {
         self.anchor = Some(SectionAnchor::Interval { pre, post });
         self
     }
-
-    // ── Block-level filters ──────────────────────────────────────────────────
 
     /// Keep only blocks for which `predicate` returns `true`.
     pub fn filter<F>(mut self, f: F) -> Self
@@ -156,15 +138,11 @@ impl<'store> Query<'store> {
         self.filter(move |b| b.content.to_lowercase().contains(pat.as_str()))
     }
 
-    // ── Limiting ─────────────────────────────────────────────────────────────
-
     /// Stop collecting after `n` results.
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
         self
     }
-
-    // ── Execution ────────────────────────────────────────────────────────────
 
     /// Execute the query, returning matched (block, document) pairs in
     /// document order.
@@ -243,8 +221,6 @@ impl<'store> Query<'store> {
         self.collect().len()
     }
 
-    // ── Linter helpers ───────────────────────────────────────────────────────
-
     /// Find all (heading, next_sibling) pairs where the heading matches the
     /// given depth and the immediately following sibling has one of the
     /// `forbidden_types`.
@@ -309,10 +285,6 @@ pub struct LintViolation<'a> {
     pub offending: &'a Block,
     pub document: &'a Document,
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

@@ -22,6 +22,7 @@
 //! |---|---|
 //! | `under(pre, post, anc_pre, anc_post)` | O(1) interval ancestor check |
 //! | `json_extract(json, path)` | Extract value from JSON string |
+//! | `mq(program, content)` | Run an mq program against Markdown content |
 //! | `count(*)`/`min`/`max`/`sum`/`avg` | Aggregates |
 //! | `lower`/`upper`/`length`/`coalesce` | Scalar utilities |
 //!
@@ -54,16 +55,14 @@ use sqlparser::{
     parser::Parser,
 };
 
+use mq_lang::{DefaultEngine, parse_markdown_input};
+
 use crate::{
     DocumentStore, MqdbError,
     block::{Block, BlockType, Properties, PropertyValue},
     document::Document,
     indexes::{DocumentIndex, IndexHint},
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Value — runtime value type
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -127,10 +126,6 @@ impl Value {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Row — named tuple
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 struct Row {
     columns: Vec<String>,
@@ -159,10 +154,6 @@ impl Row {
             .and_then(|i| self.values.get(i))
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Output format helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn json_value_str(s: &str) -> String {
     if let Ok(n) = s.parse::<i64>() {
@@ -202,10 +193,6 @@ pub fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// QueryOutput
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// The tabular output of a SQL query.
 #[derive(Debug)]
@@ -409,10 +396,6 @@ impl QueryOutput {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Serialisation helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn pv_to_json(pv: &PropertyValue) -> String {
     match pv {
         PropertyValue::String(s) => {
@@ -444,10 +427,6 @@ fn properties_to_json(props: &Properties) -> String {
         .collect();
     format!("{{{}}}", pairs.join(","))
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Virtual table materialisation
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn block_to_row(doc_id: u32, block: &Block, block_idx: u32) -> Row {
     Row {
@@ -530,10 +509,6 @@ fn cross_join(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
     }
     out
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Expression evaluation
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn eval_sql_value(v: &SqlValue) -> Value {
     match v {
@@ -764,7 +739,45 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             .find(|v| !matches!(v, Value::Null))
             .cloned()
             .unwrap_or(Value::Null),
+        "mq" => {
+            if args.len() < 2 {
+                return Value::Null;
+            }
+            let program = match args[0].as_str() {
+                Some(s) => s.to_string(),
+                None => return Value::Null,
+            };
+            let content = match args[1].as_str() {
+                Some(s) => s.to_string(),
+                None => return Value::Null,
+            };
+            eval_mq_scalar(&program, &content)
+        }
         _ => Value::Null,
+    }
+}
+
+fn eval_mq_scalar(program: &str, content: &str) -> Value {
+    let mut engine = DefaultEngine::default();
+    engine.load_builtin_module();
+    let input = match parse_markdown_input(content) {
+        Ok(i) => i,
+        Err(_) => return Value::Null,
+    };
+    match engine.eval(program, input.into_iter()) {
+        Ok(output) => {
+            let parts: Vec<String> = output
+                .compact()
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect();
+            if parts.is_empty() {
+                Value::Null
+            } else {
+                Value::Str(parts.join("\n"))
+            }
+        }
+        Err(_) => Value::Null,
     }
 }
 
@@ -832,10 +845,6 @@ fn like_dp(s: &[char], p: &[char], si: usize, pi: usize) -> bool {
     let matches = p[pi] == '_' || p[pi] == s[si];
     matches && like_dp(s, p, si + 1, pi + 1)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SqlEngine
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Custom SQL execution engine backed by a [`DocumentStore`] reference.
 ///
@@ -1469,10 +1478,6 @@ impl<'a> SqlEngine<'a> {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Projection helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn projection_columns(projection: &[SelectItem], first_row: Option<&Row>) -> Vec<String> {
     if projection.len() == 1 && matches!(projection[0], SelectItem::Wildcard(_)) {
         return first_row
@@ -1686,10 +1691,6 @@ fn apply_limit(mut rows: Vec<Vec<String>>, limit: Option<&Expr>) -> Vec<Vec<Stri
     rows
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Predicate pushdown analyser — extract IndexHint from WHERE clause
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Inspect the WHERE expression and return the best [`IndexHint`].
 ///
 /// Only analyses the *outermost* conjunct that can be served by an index.
@@ -1855,10 +1856,6 @@ fn pick_better_hint(a: IndexHint, b: IndexHint) -> IndexHint {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// BlockType::from_str helper
-// ─────────────────────────────────────────────────────────────────────────────
-
 impl BlockType {
     fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -1881,10 +1878,6 @@ impl BlockType {
         }
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -2229,5 +2222,31 @@ mod tests {
         assert!(names.contains(&"blocks"));
         assert!(names.contains(&"documents"));
         assert!(names.contains(&"extra"));
+    }
+
+    // mq() scalar function applied to a literal markdown string
+    #[test]
+    fn test_mq_scalar_function() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT mq('.h1 | to_text', '# Hello\n\nWorld\n') AS title FROM blocks LIMIT 1",
+            )
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0], "Hello");
+    }
+
+    // mq() returns NULL when program produces no output
+    #[test]
+    fn test_mq_scalar_null_on_no_match() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT mq('.h1', '## No h1 here\n') FROM blocks LIMIT 1")
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0], "NULL");
     }
 }
