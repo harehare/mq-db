@@ -44,10 +44,11 @@ use std::collections::HashMap;
 
 use sqlparser::{
     ast::{
-        BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-        GroupByExpr, JoinConstraint, JoinOperator, LimitClause, ObjectNamePart, OrderByExpr,
-        OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator,
-        Value as SqlValue, Values,
+        BinaryOperator, CreateTable, Expr, Function, FunctionArg, FunctionArgExpr,
+        FunctionArguments, GroupByExpr, Insert, JoinConstraint, JoinOperator, LimitClause,
+        ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select,
+        SelectItem, SetExpr, Statement, TableFactor, TableObject, UnaryOperator, Value as SqlValue,
+        Values,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -207,6 +208,7 @@ pub fn html_escape(s: &str) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The tabular output of a SQL query.
+#[derive(Debug)]
 pub struct QueryOutput {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
@@ -346,7 +348,8 @@ impl QueryOutput {
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate() {
                 if i < widths.len() {
-                    widths[i] = widths[i].max(cell.chars().count().min(MAX_CELL));
+                    let display_len = cell.replace('\r', "").replace('\n', " ").chars().count();
+                    widths[i] = widths[i].max(display_len.min(MAX_CELL));
                 }
             }
         }
@@ -378,12 +381,13 @@ impl QueryOutput {
             out.push('│');
             for (i, &w) in widths.iter().enumerate() {
                 let cell = row.get(i).map(String::as_str).unwrap_or("");
+                let cell = cell.replace('\r', "").replace('\n', " ");
                 let truncated: String = if cell.chars().count() > MAX_CELL {
                     let mut s: String = cell.chars().take(MAX_CELL - 1).collect();
                     s.push('…');
                     s
                 } else {
-                    cell.to_string()
+                    cell
                 };
                 out.push_str(&format!(" {:<width$} │", truncated, width = w));
             }
@@ -869,8 +873,26 @@ impl<'a> SqlEngine<'a> {
         self.store.documents().iter().zip(self.indexes.iter())
     }
 
-    /// Execute a SQL SELECT query against the store.
+    /// Execute a SQL statement against the store.
+    ///
+    /// Supports `SELECT`, `CREATE TABLE`, `INSERT INTO`, `DROP TABLE`,
+    /// `DESC`/`DESCRIBE`, and `SHOW TABLES`.
     pub fn execute(&self, sql: &str) -> Result<QueryOutput, MqdbError> {
+        // Pre-process non-standard commands (DESC / SHOW TABLES).
+        let trimmed = sql.trim().trim_end_matches(';');
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("DESC ") || upper.starts_with("DESCRIBE ") {
+            let name = trimmed
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_lowercase();
+            return self.exec_desc(&name);
+        }
+        if upper == "SHOW TABLES" {
+            return self.exec_show_tables();
+        }
+
         let stmts = Parser::parse_sql(&GenericDialect {}, sql)
             .map_err(|e| MqdbError::SqlParse(e.to_string()))?;
         let stmt = stmts
@@ -879,10 +901,244 @@ impl<'a> SqlEngine<'a> {
             .ok_or_else(|| MqdbError::SqlParse("empty query".into()))?;
         match stmt {
             Statement::Query(q) => self.exec_query(&q),
+            Statement::CreateTable(ct) => self.exec_create_table(&ct),
+            Statement::Insert(ins) => self.exec_insert(&ins),
+            Statement::Drop {
+                object_type: ObjectType::Table,
+                names,
+                if_exists,
+                ..
+            } => self.exec_drop_tables(&names, if_exists),
             _ => Err(MqdbError::SqlExec(
-                "only SELECT queries are supported".into(),
+                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, DROP TABLE, DESC, SHOW TABLES".into(),
             )),
         }
+    }
+
+    fn exec_desc(&self, table_name: &str) -> Result<QueryOutput, MqdbError> {
+        let schema: Option<Vec<(&str, &str)>> = match table_name {
+            "blocks" => Some(vec![
+                ("id", "integer"),
+                ("document_id", "integer"),
+                ("block_type", "text"),
+                ("content", "text"),
+                ("pre", "integer"),
+                ("post", "integer"),
+                ("depth", "integer"),
+                ("lang", "text"),
+                ("properties", "text"),
+            ]),
+            "documents" => Some(vec![
+                ("id", "integer"),
+                ("path", "text"),
+                ("title", "text"),
+                ("tags", "text"),
+            ]),
+            _ => None,
+        };
+        if let Some(rows) = schema {
+            return Ok(QueryOutput {
+                columns: vec!["column".to_string(), "type".to_string()],
+                rows: rows
+                    .iter()
+                    .map(|(c, t)| vec![c.to_string(), t.to_string()])
+                    .collect(),
+            });
+        }
+        let guard = self.store.custom_tables.read().unwrap();
+        if let Some((columns, _)) = guard.get(table_name) {
+            let rows = columns
+                .iter()
+                .map(|c| vec![c.clone(), "text".to_string()])
+                .collect();
+            return Ok(QueryOutput {
+                columns: vec!["column".to_string(), "type".to_string()],
+                rows,
+            });
+        }
+        Err(MqdbError::SqlExec(format!("unknown table: {table_name}")))
+    }
+
+    fn exec_show_tables(&self) -> Result<QueryOutput, MqdbError> {
+        let mut rows = vec![
+            vec!["blocks".to_string(), "built-in".to_string()],
+            vec!["documents".to_string(), "built-in".to_string()],
+        ];
+        let guard = self.store.custom_tables.read().unwrap();
+        let mut custom: Vec<String> = guard.keys().cloned().collect();
+        drop(guard);
+        custom.sort();
+        rows.extend(custom.into_iter().map(|n| vec![n, "custom".to_string()]));
+        Ok(QueryOutput {
+            columns: vec!["table".to_string(), "kind".to_string()],
+            rows,
+        })
+    }
+
+    fn exec_create_table(&self, ct: &CreateTable) -> Result<QueryOutput, MqdbError> {
+        let table_name = ct
+            .name
+            .0
+            .last()
+            .map(ident_value)
+            .unwrap_or("")
+            .to_lowercase();
+        if matches!(table_name.as_str(), "blocks" | "documents") {
+            return Err(MqdbError::SqlExec(format!(
+                "cannot override built-in table '{table_name}'"
+            )));
+        }
+
+        if let Some(query) = &ct.query {
+            // CREATE TABLE name AS SELECT ...
+            let result = self.exec_query(query)?;
+            let n = result.rows.len();
+            self.store
+                .custom_tables
+                .write()
+                .unwrap()
+                .insert(table_name, (result.columns, result.rows));
+            return Ok(QueryOutput {
+                columns: vec!["rows".to_string()],
+                rows: vec![vec![n.to_string()]],
+            });
+        }
+
+        // CREATE TABLE name (col1 TYPE, ...)
+        let columns: Vec<String> = ct.columns.iter().map(|c| c.name.value.clone()).collect();
+        if columns.is_empty() {
+            return Err(MqdbError::SqlExec(
+                "CREATE TABLE requires at least one column or AS SELECT".into(),
+            ));
+        }
+        let already_exists = self
+            .store
+            .custom_tables
+            .read()
+            .unwrap()
+            .contains_key(&table_name);
+        if already_exists {
+            if ct.if_not_exists {
+                return Ok(QueryOutput {
+                    columns: vec!["result".to_string()],
+                    rows: vec![vec!["already exists".to_string()]],
+                });
+            }
+            return Err(MqdbError::SqlExec(format!(
+                "table '{table_name}' already exists"
+            )));
+        }
+        self.store
+            .custom_tables
+            .write()
+            .unwrap()
+            .insert(table_name, (columns, vec![]));
+        Ok(QueryOutput {
+            columns: vec!["result".to_string()],
+            rows: vec![vec!["ok".to_string()]],
+        })
+    }
+
+    fn exec_insert(&self, ins: &Insert) -> Result<QueryOutput, MqdbError> {
+        let table_name = match &ins.table {
+            TableObject::TableName(name) => {
+                name.0.last().map(ident_value).unwrap_or("").to_lowercase()
+            }
+            _ => return Err(MqdbError::SqlExec("unsupported INSERT target".into())),
+        };
+
+        let source = ins
+            .source
+            .as_ref()
+            .ok_or_else(|| MqdbError::SqlExec("INSERT requires VALUES or SELECT".into()))?;
+        let values_out = self.exec_query(source)?;
+
+        // Determine column mapping
+        let col_indices: Option<Vec<usize>> = if ins.columns.is_empty() {
+            None // positional
+        } else {
+            let guard = self.store.custom_tables.read().unwrap();
+            let table_cols = guard
+                .get(&table_name)
+                .map(|(c, _)| c.clone())
+                .ok_or_else(|| MqdbError::SqlExec(format!("unknown table: {table_name}")))?;
+            drop(guard);
+            let indices: Result<Vec<usize>, _> = ins
+                .columns
+                .iter()
+                .map(|col_name| {
+                    let name = col_name.0.last().map(ident_value).unwrap_or("");
+                    table_cols
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| MqdbError::SqlExec(format!("unknown column '{name}'")))
+                })
+                .collect();
+            Some(indices?)
+        };
+
+        let mut guard = self.store.custom_tables.write().unwrap();
+        let (table_cols, table_rows) = guard
+            .get_mut(&table_name)
+            .ok_or_else(|| MqdbError::SqlExec(format!("unknown table: {table_name}")))?;
+        let ncols = table_cols.len();
+
+        let mut inserted = 0usize;
+        for src_row in &values_out.rows {
+            let mut row = vec![String::new(); ncols];
+            match &col_indices {
+                None => {
+                    if src_row.len() != ncols {
+                        return Err(MqdbError::SqlExec(format!(
+                            "expected {ncols} columns, got {}",
+                            src_row.len()
+                        )));
+                    }
+                    row = src_row.clone();
+                }
+                Some(idx_map) => {
+                    for (dst_idx, &src_idx) in idx_map.iter().enumerate() {
+                        if let Some(v) = src_row.get(dst_idx) {
+                            row[src_idx] = v.clone();
+                        }
+                    }
+                }
+            }
+            table_rows.push(row);
+            inserted += 1;
+        }
+        Ok(QueryOutput {
+            columns: vec!["rows_affected".to_string()],
+            rows: vec![vec![inserted.to_string()]],
+        })
+    }
+
+    fn exec_drop_tables(
+        &self,
+        names: &[ObjectName],
+        if_exists: bool,
+    ) -> Result<QueryOutput, MqdbError> {
+        let mut guard = self.store.custom_tables.write().unwrap();
+        let mut dropped = 0usize;
+        for name in names {
+            let table_name = name.0.last().map(ident_value).unwrap_or("").to_lowercase();
+            if matches!(table_name.as_str(), "blocks" | "documents") {
+                return Err(MqdbError::SqlExec(format!(
+                    "cannot drop built-in table '{table_name}'"
+                )));
+            }
+            if guard.remove(&table_name).is_some() {
+                dropped += 1;
+            } else if !if_exists {
+                return Err(MqdbError::SqlExec(format!(
+                    "table '{table_name}' does not exist"
+                )));
+            }
+        }
+        Ok(QueryOutput {
+            columns: vec!["result".to_string()],
+            rows: vec![vec![format!("{dropped} table(s) dropped")]],
+        })
     }
 
     fn exec_query(&self, query: &Query) -> Result<QueryOutput, MqdbError> {
@@ -1076,7 +1332,30 @@ impl<'a> SqlEngine<'a> {
                     .map(|doc| qualify_row(doc_to_row(doc), prefix))
                     .collect())
             }
-            other => Err(MqdbError::SqlExec(format!("unknown table: {other}"))),
+            other => {
+                let guard = self.store.custom_tables.read().unwrap();
+                if let Some((columns, custom_rows)) = guard.get(other) {
+                    let prefix = alias.as_deref().unwrap_or(other);
+                    let rows = custom_rows
+                        .iter()
+                        .map(|row_vals| {
+                            qualify_row(
+                                Row {
+                                    columns: columns.clone(),
+                                    values: row_vals
+                                        .iter()
+                                        .map(|v| Value::Str(v.clone()))
+                                        .collect(),
+                                },
+                                prefix,
+                            )
+                        })
+                        .collect();
+                    return Ok(rows);
+                }
+                drop(guard);
+                Err(MqdbError::SqlExec(format!("unknown table: {other}")))
+            }
         }
     }
 
@@ -1470,14 +1749,19 @@ fn analyze_where_for_index(expr: &Expr) -> IndexHint {
                     IndexHint::FullScan
                 }
                 Some("lang") => {
-                    if let Some(s) = val {
+                    if let Some(s) = val
+                        && !s.is_empty()
+                    {
                         return IndexHint::LangExact(s);
                     }
                     IndexHint::FullScan
                 }
                 Some("depth") => {
                     if let Some(n) = int_val {
-                        return IndexHint::DepthExact(n as u8);
+                        // depth 0 means "no heading depth" — not in the index
+                        if n > 0 {
+                            return IndexHint::DepthExact(n as u8);
+                        }
                     }
                     IndexHint::FullScan
                 }
@@ -1773,5 +2057,177 @@ mod tests {
         let out = engine.execute(sql).unwrap();
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0][0], expected);
+    }
+
+    // depth = 0 should return all non-heading blocks (paragraphs + code), not 0 rows
+    #[test]
+    fn test_sql_depth_zero_returns_non_headings() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT content FROM blocks WHERE depth = 0")
+            .unwrap();
+        // make_store has 2 paragraphs + 1 code block = 3 non-heading blocks
+        assert_eq!(out.rows.len(), 3, "depth=0 must return non-heading blocks");
+    }
+
+    // lang = '' should return non-code blocks (paragraph, heading blocks have empty lang)
+    #[test]
+    fn test_sql_empty_lang_returns_non_code_blocks() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT block_type FROM blocks WHERE lang = ''")
+            .unwrap();
+        // make_store: 3 headings + 2 paragraphs = 5 blocks with no lang
+        assert_eq!(out.rows.len(), 5, "lang='' must return non-code blocks");
+    }
+
+    // to_table() must not let newlines inside cells break the table row structure
+    #[test]
+    fn test_to_table_newline_in_cell() {
+        let out = QueryOutput {
+            columns: vec!["content".to_string()],
+            rows: vec![
+                vec!["line one\nline two".to_string()],
+                vec!["plain".to_string()],
+            ],
+        };
+        let table = out.to_table();
+        // Lines that start with '│' = header + 2 data rows = 3 (no extra split)
+        let bar_lines: Vec<&str> = table.lines().filter(|l| l.starts_with('│')).collect();
+        assert_eq!(
+            bar_lines.len(),
+            3,
+            "newline in cell must not produce extra table rows"
+        );
+        // The first data row (index 1, after the header) must contain the normalised content
+        assert!(bar_lines[1].contains("line one line two"));
+    }
+
+    // register_table / custom table query
+    #[test]
+    fn test_custom_table_query() {
+        let mut store = DocumentStore::new();
+        store.register_table(
+            "kv",
+            vec!["key".to_string(), "value".to_string()],
+            vec![
+                vec!["foo".to_string(), "bar".to_string()],
+                vec!["hello".to_string(), "world".to_string()],
+            ],
+        );
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT key, value FROM kv WHERE key = 'hello'")
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][1], "world");
+    }
+
+    // CREATE TABLE (empty) then INSERT then SELECT
+    #[test]
+    fn test_ddl_create_insert_select() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+
+        // create
+        engine
+            .execute("CREATE TABLE notes (id TEXT, body TEXT)")
+            .unwrap();
+        // insert two rows
+        engine
+            .execute("INSERT INTO notes VALUES ('1', 'hello')")
+            .unwrap();
+        engine
+            .execute("INSERT INTO notes VALUES ('2', 'world')")
+            .unwrap();
+        // select with filter
+        let out = engine
+            .execute("SELECT body FROM notes WHERE id = '1'")
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0], "hello");
+        // total rows
+        let all = engine.execute("SELECT * FROM notes").unwrap();
+        assert_eq!(all.rows.len(), 2);
+    }
+
+    // CREATE TABLE AS SELECT
+    #[test]
+    fn test_ddl_create_as_select() {
+        let store = {
+            let mut s = DocumentStore::new();
+            s.add_str("# H1\n\n## H2\n\nParagraph\n").unwrap();
+            s
+        };
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(
+                "CREATE TABLE headings AS \
+                 SELECT block_type, content FROM blocks WHERE block_type = 'heading'",
+            )
+            .unwrap();
+        let out = engine.execute("SELECT content FROM headings").unwrap();
+        assert_eq!(out.rows.len(), 2);
+    }
+
+    // DROP TABLE
+    #[test]
+    fn test_ddl_drop_table() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE tmp (x TEXT)").unwrap();
+        engine.execute("DROP TABLE tmp").unwrap();
+        let err = engine.execute("SELECT * FROM tmp").unwrap_err();
+        assert!(err.to_string().contains("unknown table"));
+    }
+
+    // DROP TABLE IF EXISTS (must not error on missing table)
+    #[test]
+    fn test_ddl_drop_if_exists() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute("DROP TABLE IF EXISTS no_such_table")
+            .unwrap();
+    }
+
+    // DESC blocks (built-in)
+    #[test]
+    fn test_desc_builtin() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine.execute("DESC blocks").unwrap();
+        assert_eq!(out.columns, vec!["column", "type"]);
+        assert!(out.rows.iter().any(|r| r[0] == "block_type"));
+        assert!(out.rows.iter().any(|r| r[0] == "content"));
+    }
+
+    // DESC custom table
+    #[test]
+    fn test_desc_custom() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute("CREATE TABLE meta (k TEXT, v TEXT)")
+            .unwrap();
+        let out = engine.execute("DESC meta").unwrap();
+        assert_eq!(out.rows.len(), 2);
+        assert_eq!(out.rows[0][0], "k");
+        assert_eq!(out.rows[1][0], "v");
+    }
+
+    // SHOW TABLES
+    #[test]
+    fn test_show_tables() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE extra (a TEXT)").unwrap();
+        let out = engine.execute("SHOW TABLES").unwrap();
+        let names: Vec<&str> = out.rows.iter().map(|r| r[0].as_str()).collect();
+        assert!(names.contains(&"blocks"));
+        assert!(names.contains(&"documents"));
+        assert!(names.contains(&"extra"));
     }
 }

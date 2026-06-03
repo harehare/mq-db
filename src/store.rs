@@ -1,4 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::RwLock,
+};
+
+type CustomTable = (Vec<String>, Vec<Vec<String>>);
 
 use mq_markdown::Markdown;
 
@@ -56,6 +62,10 @@ pub struct DocumentStore {
     /// Per-document secondary index cache (same order as `documents`).
     /// `None` means the index has not been built/loaded for that document yet.
     pub(crate) doc_indexes: Vec<Option<DocumentIndex>>,
+    /// User-registered virtual tables: name → (columns, rows).
+    /// Uses `RwLock` for interior mutability so `SqlEngine` can execute DDL
+    /// (`CREATE TABLE`, `INSERT INTO`, `DROP TABLE`) with only `&DocumentStore`.
+    pub(crate) custom_tables: RwLock<HashMap<String, CustomTable>>,
 }
 
 impl Default for DocumentStore {
@@ -66,6 +76,7 @@ impl Default for DocumentStore {
             store_spans: true,
             storage: None,
             doc_indexes: Vec::new(),
+            custom_tables: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -80,6 +91,29 @@ impl DocumentStore {
     /// block added after this call. Reduces memory by ~21 bytes per block.
     pub fn set_store_spans(&mut self, val: bool) {
         self.store_spans = val;
+    }
+
+    /// Register a custom virtual table that can be queried via SQL.
+    ///
+    /// The table is queryable with `SELECT … FROM <name>`. All column values
+    /// are treated as strings; cast them in SQL as needed.
+    ///
+    /// Calling this a second time with the same name replaces the previous table.
+    pub fn register_table(
+        &mut self,
+        name: impl Into<String>,
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+    ) {
+        self.custom_tables
+            .write()
+            .unwrap()
+            .insert(name.into(), (columns, rows));
+    }
+
+    /// Remove a previously registered custom table. Returns `true` if it existed.
+    pub fn unregister_table(&mut self, name: &str) -> bool {
+        self.custom_tables.write().unwrap().remove(name).is_some()
     }
 
     /// Parses and adds a Markdown file from disk.
@@ -291,6 +325,7 @@ impl DocumentStore {
             store_spans: true,
             storage: Some(storage),
             doc_indexes: vec![None; cap],
+            custom_tables: RwLock::new(HashMap::new()),
         })
     }
 
@@ -323,6 +358,7 @@ impl DocumentStore {
             store_spans: true,
             storage: None,
             doc_indexes: vec![None; cap],
+            custom_tables: RwLock::new(HashMap::new()),
         })
     }
 
@@ -358,6 +394,7 @@ impl DocumentStore {
             store_spans: true,
             storage: None,
             doc_indexes: vec![None; cap],
+            custom_tables: RwLock::new(HashMap::new()),
         })
     }
 }
