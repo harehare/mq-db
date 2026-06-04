@@ -319,24 +319,40 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("No Markdown files found in the specified paths.");
             }
 
-            let mut store = DocumentStore::new();
-            if no_spans {
-                store.set_store_spans(false);
-            }
             let mut errors = 0usize;
-            for path in &files {
-                match store.add_file(path) {
-                    Ok(_) => eprintln!("  ✓ {}", path.display()),
-                    Err(e) => {
-                        eprintln!("  ✗ {}: {}", path.display(), e);
-                        errors += 1;
+
+            if output.exists() {
+                // Append to the existing store file.
+                let mut store = DocumentStore::open(&output)
+                    .map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?;
+                for path in &files {
+                    match store.append_file(path) {
+                        Ok(_) => eprintln!("  ✓ {}", path.display()),
+                        Err(e) => {
+                            eprintln!("  ✗ {}: {}", path.display(), e);
+                            errors += 1;
+                        }
                     }
                 }
+            } else {
+                // Create a new store file.
+                let mut store = DocumentStore::new();
+                if no_spans {
+                    store.set_store_spans(false);
+                }
+                for path in &files {
+                    match store.add_file(path) {
+                        Ok(_) => eprintln!("  ✓ {}", path.display()),
+                        Err(e) => {
+                            eprintln!("  ✗ {}: {}", path.display(), e);
+                            errors += 1;
+                        }
+                    }
+                }
+                store
+                    .save(&output)
+                    .map_err(|e| anyhow::anyhow!("Failed to save store: {}", e))?;
             }
-
-            store
-                .save(&output)
-                .map_err(|e| anyhow::anyhow!("Failed to save store: {}", e))?;
 
             let indexed = files.len() - errors;
             println!(

@@ -156,6 +156,87 @@ impl DocumentStore {
         Ok(doc_id)
     }
 
+    /// Append a Markdown string to the existing `.mq-db` file (in-place).
+    ///
+    /// Works only when the store was opened via [`DocumentStore::open`] (i.e.
+    /// `self.storage` is `Some`).  New block pages and an index page chain are
+    /// appended to the file and the catalog is rewritten to include the new
+    /// entry.
+    ///
+    /// When called on an in-memory store (no backing file) this behaves
+    /// identically to [`add_str`](DocumentStore::add_str).
+    pub fn append_str(&mut self, content: &str) -> Result<DocumentId, MqdbError> {
+        self.do_append(content, None)
+    }
+
+    /// Append a Markdown file to the existing `.mq-db` file (in-place).
+    ///
+    /// See [`append_str`](DocumentStore::append_str) for full semantics.
+    pub fn append_file(&mut self, path: impl AsRef<Path>) -> Result<DocumentId, MqdbError> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path)?;
+        self.do_append(&content, Some(path.to_path_buf()))
+    }
+
+    fn do_append(
+        &mut self,
+        content: &str,
+        md_path: Option<PathBuf>,
+    ) -> Result<DocumentId, MqdbError> {
+        let md =
+            Markdown::from_markdown_str(content).map_err(|e| MqdbError::Parse(e.to_string()))?;
+        let doc_id = self.next_doc_id;
+        self.next_doc_id += 1;
+
+        let mut blocks = index::build_blocks(doc_id, &md.nodes);
+        if !self.store_spans {
+            for block in &mut blocks {
+                block.span = None;
+            }
+        }
+        let mut doc = Document::new(doc_id, md_path, blocks);
+
+        if let Some(storage) = self.storage.as_mut() {
+            // Reconstruct catalog entries from already-loaded document metadata.
+            let mut entries: Vec<CatalogEntry> = self
+                .documents
+                .iter()
+                .map(|d| CatalogEntry {
+                    document_id: d.id,
+                    path: d.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    first_block_page: d.first_block_page,
+                    num_blocks: d.block_count,
+                    zone_map_bytes: encode_zone_map(&d.zone_maps),
+                    index_start_page: d.index_start_page,
+                })
+                .collect();
+
+            let first_block_page = storage.write_document(&doc)?;
+            doc.first_block_page = first_block_page;
+
+            let idx = DocumentIndex::build(&doc.blocks);
+            let index_start_page = storage.write_index(&idx.to_bytes())?;
+            doc.index_start_page = index_start_page;
+
+            entries.push(CatalogEntry {
+                document_id: doc.id,
+                path: doc.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                first_block_page,
+                num_blocks: doc.block_count,
+                zone_map_bytes: encode_zone_map(&doc.zone_maps),
+                index_start_page,
+            });
+
+            storage.flush_catalog(&entries)?;
+            self.doc_indexes.push(Some(idx));
+        } else {
+            self.doc_indexes.push(None);
+        }
+
+        self.documents.push(doc);
+        Ok(doc_id)
+    }
+
     /// Returns a slice of all documents in the store.
     pub fn documents(&self) -> &[Document] {
         &self.documents
