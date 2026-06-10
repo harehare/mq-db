@@ -9,7 +9,7 @@ use crate::{
     document::Document,
     error::MqdbError,
     storage::{
-        catalog::{CatalogEntry, read_catalog, write_catalog},
+        catalog::{CatalogEntry, CustomTableEntry, read_catalog, write_catalog},
         codec::{decode_block, encode_block},
         page::{
             PAGE_BODY_SIZE, PAGE_HEADER_SIZE, PAGE_TYPE_BLOCK_DATA, PAGE_TYPE_CATALOG,
@@ -146,12 +146,18 @@ impl Storage {
     }
 
     /// Save catalog (call after all write_document calls).
-    pub fn flush_catalog(&mut self, entries: &[CatalogEntry]) -> Result<(), MqdbError> {
-        write_catalog(&mut self.page_file, entries)
+    pub fn flush_catalog(
+        &mut self,
+        entries: &[CatalogEntry],
+        custom_tables: &[CustomTableEntry],
+    ) -> Result<(), MqdbError> {
+        write_catalog(&mut self.page_file, entries, custom_tables)
     }
 
     /// Read the catalog.
-    pub fn load_catalog(&mut self) -> Result<Vec<CatalogEntry>, MqdbError> {
+    pub fn load_catalog(
+        &mut self,
+    ) -> Result<(Vec<CatalogEntry>, Vec<CustomTableEntry>), MqdbError> {
         read_catalog(&mut self.page_file)
     }
 
@@ -392,11 +398,11 @@ mod tests {
             zone_map_bytes: encode_zone_map(&document.zone_maps),
             index_start_page: 0,
         };
-        storage.flush_catalog(&[catalog_entry]).unwrap();
+        storage.flush_catalog(&[catalog_entry], &[]).unwrap();
         drop(storage);
 
         let mut reopened = Storage::open(&path).unwrap();
-        let catalog = reopened.load_catalog().unwrap();
+        let (catalog, _) = reopened.load_catalog().unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(
             decode_zone_map(&catalog[0].zone_map_bytes).unwrap(),
@@ -509,6 +515,48 @@ mod tests {
         let (decoded, consumed) = decode_block(&encoded).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn custom_table_round_trip() {
+        let path = test_file_path("custom-table-round-trip");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store.add_str("# Hello\n\nWorld\n").unwrap();
+        store.save(&path).unwrap();
+
+        // Open and CREATE TABLE + INSERT
+        let mut opened = DocumentStore::open(&path).unwrap();
+        opened.load_all_blocks().unwrap();
+        opened.load_all_indexes().unwrap();
+        let engine = crate::SqlEngine::new(&opened).unwrap();
+        engine
+            .execute("CREATE TABLE notes (id TEXT, body TEXT)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO notes VALUES ('1', 'hello')")
+            .unwrap();
+        engine
+            .execute("INSERT INTO notes VALUES ('2', 'world')")
+            .unwrap();
+        drop(engine);
+        drop(opened);
+
+        // Re-open and verify tables persisted
+        let mut reopened = DocumentStore::open(&path).unwrap();
+        reopened.load_all_blocks().unwrap();
+        reopened.load_all_indexes().unwrap();
+        let engine2 = crate::SqlEngine::new(&reopened).unwrap();
+        let out = engine2
+            .execute("SELECT body FROM notes WHERE id = '1'")
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0][0], "hello");
+        let all = engine2.execute("SELECT * FROM notes").unwrap();
+        assert_eq!(all.rows.len(), 2);
+
+        cleanup(&path);
     }
 
     #[rstest]
