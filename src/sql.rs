@@ -1007,6 +1007,7 @@ impl<'a> SqlEngine<'a> {
                 .write()
                 .unwrap()
                 .insert(table_name, (result.columns, result.rows));
+            self.store.try_flush_catalog_to_storage();
             return Ok(QueryOutput {
                 columns: vec!["rows".to_string()],
                 rows: vec![vec![n.to_string()]],
@@ -1042,6 +1043,7 @@ impl<'a> SqlEngine<'a> {
             .write()
             .unwrap()
             .insert(table_name, (columns, vec![]));
+        self.store.try_flush_catalog_to_storage();
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec!["ok".to_string()]],
@@ -1086,36 +1088,40 @@ impl<'a> SqlEngine<'a> {
             Some(indices?)
         };
 
-        let mut guard = self.store.custom_tables.write().unwrap();
-        let (table_cols, table_rows) = guard
-            .get_mut(&table_name)
-            .ok_or_else(|| MqdbError::SqlExec(format!("unknown table: {table_name}")))?;
-        let ncols = table_cols.len();
+        let inserted = {
+            let mut guard = self.store.custom_tables.write().unwrap();
+            let (table_cols, table_rows) = guard
+                .get_mut(&table_name)
+                .ok_or_else(|| MqdbError::SqlExec(format!("unknown table: {table_name}")))?;
+            let ncols = table_cols.len();
 
-        let mut inserted = 0usize;
-        for src_row in &values_out.rows {
-            let mut row = vec![String::new(); ncols];
-            match &col_indices {
-                None => {
-                    if src_row.len() != ncols {
-                        return Err(MqdbError::SqlExec(format!(
-                            "expected {ncols} columns, got {}",
-                            src_row.len()
-                        )));
+            let mut inserted = 0usize;
+            for src_row in &values_out.rows {
+                let mut row = vec![String::new(); ncols];
+                match &col_indices {
+                    None => {
+                        if src_row.len() != ncols {
+                            return Err(MqdbError::SqlExec(format!(
+                                "expected {ncols} columns, got {}",
+                                src_row.len()
+                            )));
+                        }
+                        row = src_row.clone();
                     }
-                    row = src_row.clone();
-                }
-                Some(idx_map) => {
-                    for (dst_idx, &src_idx) in idx_map.iter().enumerate() {
-                        if let Some(v) = src_row.get(dst_idx) {
-                            row[src_idx] = v.clone();
+                    Some(idx_map) => {
+                        for (dst_idx, &src_idx) in idx_map.iter().enumerate() {
+                            if let Some(v) = src_row.get(dst_idx) {
+                                row[src_idx] = v.clone();
+                            }
                         }
                     }
                 }
+                table_rows.push(row);
+                inserted += 1;
             }
-            table_rows.push(row);
-            inserted += 1;
-        }
+            inserted
+        }; // write lock released before flush
+        self.store.try_flush_catalog_to_storage();
         Ok(QueryOutput {
             columns: vec!["rows_affected".to_string()],
             rows: vec![vec![inserted.to_string()]],
@@ -1127,23 +1133,27 @@ impl<'a> SqlEngine<'a> {
         names: &[ObjectName],
         if_exists: bool,
     ) -> Result<QueryOutput, MqdbError> {
-        let mut guard = self.store.custom_tables.write().unwrap();
-        let mut dropped = 0usize;
-        for name in names {
-            let table_name = name.0.last().map(ident_value).unwrap_or("").to_lowercase();
-            if matches!(table_name.as_str(), "blocks" | "documents") {
-                return Err(MqdbError::SqlExec(format!(
-                    "cannot drop built-in table '{table_name}'"
-                )));
+        let dropped = {
+            let mut guard = self.store.custom_tables.write().unwrap();
+            let mut dropped = 0usize;
+            for name in names {
+                let table_name = name.0.last().map(ident_value).unwrap_or("").to_lowercase();
+                if matches!(table_name.as_str(), "blocks" | "documents") {
+                    return Err(MqdbError::SqlExec(format!(
+                        "cannot drop built-in table '{table_name}'"
+                    )));
+                }
+                if guard.remove(&table_name).is_some() {
+                    dropped += 1;
+                } else if !if_exists {
+                    return Err(MqdbError::SqlExec(format!(
+                        "table '{table_name}' does not exist"
+                    )));
+                }
             }
-            if guard.remove(&table_name).is_some() {
-                dropped += 1;
-            } else if !if_exists {
-                return Err(MqdbError::SqlExec(format!(
-                    "table '{table_name}' does not exist"
-                )));
-            }
-        }
+            dropped
+        }; // write lock released before flush
+        self.store.try_flush_catalog_to_storage();
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec![format!("{dropped} table(s) dropped")]],

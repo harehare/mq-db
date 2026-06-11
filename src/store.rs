@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{Mutex, RwLock},
 };
 
 type CustomTable = (Vec<String>, Vec<Vec<String>>);
@@ -17,7 +17,7 @@ use crate::{
     query::Query,
     storage::{
         Storage,
-        catalog::CatalogEntry,
+        catalog::{CatalogEntry, CustomTableEntry},
         codec::{decode_zone_map, encode_zone_map},
     },
 };
@@ -58,7 +58,9 @@ pub struct DocumentStore {
     store_spans: bool,
     /// Open storage file kept for lazy block / index loading. `None` when the
     /// store was built entirely in memory or fully loaded via `load()`.
-    pub(crate) storage: Option<Storage>,
+    /// Wrapped in `Mutex` so DDL operations (which hold only `&DocumentStore`)
+    /// can flush the updated catalog to disk.
+    pub(crate) storage: Mutex<Option<Storage>>,
     /// Per-document secondary index cache (same order as `documents`).
     /// `None` means the index has not been built/loaded for that document yet.
     pub(crate) doc_indexes: Vec<Option<DocumentIndex>>,
@@ -74,7 +76,7 @@ impl Default for DocumentStore {
             documents: Vec::new(),
             next_doc_id: 0,
             store_spans: true,
-            storage: None,
+            storage: Mutex::new(None),
             doc_indexes: Vec::new(),
             custom_tables: RwLock::new(HashMap::new()),
         }
@@ -196,42 +198,57 @@ impl DocumentStore {
         }
         let mut doc = Document::new(doc_id, md_path, blocks);
 
-        if let Some(storage) = self.storage.as_mut() {
-            // Reconstruct catalog entries from already-loaded document metadata.
-            let mut entries: Vec<CatalogEntry> = self
-                .documents
-                .iter()
-                .map(|d| CatalogEntry {
-                    document_id: d.id,
-                    path: d.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                    first_block_page: d.first_block_page,
-                    num_blocks: d.block_count,
-                    zone_map_bytes: encode_zone_map(&d.zone_maps),
-                    index_start_page: d.index_start_page,
-                })
-                .collect();
+        let idx_opt = {
+            let mut storage_guard = self.storage.lock().unwrap();
+            if let Some(storage) = storage_guard.as_mut() {
+                // Reconstruct catalog entries from already-loaded document metadata.
+                let mut entries: Vec<CatalogEntry> = self
+                    .documents
+                    .iter()
+                    .map(|d| CatalogEntry {
+                        document_id: d.id,
+                        path: d.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                        first_block_page: d.first_block_page,
+                        num_blocks: d.block_count,
+                        zone_map_bytes: encode_zone_map(&d.zone_maps),
+                        index_start_page: d.index_start_page,
+                    })
+                    .collect();
 
-            let first_block_page = storage.write_document(&doc)?;
-            doc.first_block_page = first_block_page;
+                let first_block_page = storage.write_document(&doc)?;
+                doc.first_block_page = first_block_page;
 
-            let idx = DocumentIndex::build(&doc.blocks);
-            let index_start_page = storage.write_index(&idx.to_bytes())?;
-            doc.index_start_page = index_start_page;
+                let idx = DocumentIndex::build(&doc.blocks);
+                let index_start_page = storage.write_index(&idx.to_bytes())?;
+                doc.index_start_page = index_start_page;
 
-            entries.push(CatalogEntry {
-                document_id: doc.id,
-                path: doc.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                first_block_page,
-                num_blocks: doc.block_count,
-                zone_map_bytes: encode_zone_map(&doc.zone_maps),
-                index_start_page,
-            });
+                entries.push(CatalogEntry {
+                    document_id: doc.id,
+                    path: doc.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    first_block_page,
+                    num_blocks: doc.block_count,
+                    zone_map_bytes: encode_zone_map(&doc.zone_maps),
+                    index_start_page,
+                });
 
-            storage.flush_catalog(&entries)?;
-            self.doc_indexes.push(Some(idx));
-        } else {
-            self.doc_indexes.push(None);
-        }
+                let ct_guard = self.custom_tables.read().unwrap();
+                let custom: Vec<CustomTableEntry> = ct_guard
+                    .iter()
+                    .map(|(name, (cols, rows))| CustomTableEntry {
+                        name: name.clone(),
+                        columns: cols.clone(),
+                        rows: rows.clone(),
+                    })
+                    .collect();
+                drop(ct_guard);
+
+                storage.flush_catalog(&entries, &custom)?;
+                Some(idx)
+            } else {
+                None
+            }
+        };
+        self.doc_indexes.push(idx_opt);
 
         self.documents.push(doc);
         Ok(doc_id)
@@ -270,7 +287,8 @@ impl DocumentStore {
     ///
     /// No-op when the store was built in memory or fully loaded via `load()`.
     pub fn load_all_blocks(&mut self) -> Result<(), MqdbError> {
-        let storage = match self.storage.as_mut() {
+        let mut guard = self.storage.lock().unwrap();
+        let storage = match guard.as_mut() {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -302,11 +320,12 @@ impl DocumentStore {
     fn build_or_load_index_at(&mut self, i: usize) -> Result<DocumentIndex, MqdbError> {
         let index_start_page = self.documents[i].index_start_page;
 
-        if index_start_page > 0
-            && let Some(storage) = self.storage.as_mut()
-        {
-            let bytes = storage.read_index_bytes(index_start_page)?;
-            return DocumentIndex::from_bytes(&bytes);
+        if index_start_page > 0 {
+            let mut guard = self.storage.lock().unwrap();
+            if let Some(storage) = guard.as_mut() {
+                let bytes = storage.read_index_bytes(index_start_page)?;
+                return DocumentIndex::from_bytes(&bytes);
+            }
         }
 
         Ok(DocumentIndex::build(&self.documents[i].blocks))
@@ -315,6 +334,38 @@ impl DocumentStore {
     /// Returns the cached `DocumentIndex` for the document at position `i`.
     pub(crate) fn get_doc_index(&self, i: usize) -> Option<&DocumentIndex> {
         self.doc_indexes.get(i).and_then(|o| o.as_ref())
+    }
+
+    /// Flush the catalog (including custom tables) to the backing storage file,
+    /// if one is open. Called automatically after DDL operations. No-op for
+    /// in-memory stores.
+    pub(crate) fn try_flush_catalog_to_storage(&self) {
+        let mut guard = self.storage.lock().unwrap();
+        if let Some(storage) = guard.as_mut() {
+            let entries: Vec<CatalogEntry> = self
+                .documents
+                .iter()
+                .map(|d| CatalogEntry {
+                    document_id: d.id,
+                    path: d.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    first_block_page: d.first_block_page,
+                    num_blocks: d.block_count,
+                    zone_map_bytes: encode_zone_map(&d.zone_maps),
+                    index_start_page: d.index_start_page,
+                })
+                .collect();
+            let ct_guard = self.custom_tables.read().unwrap();
+            let custom: Vec<CustomTableEntry> = ct_guard
+                .iter()
+                .map(|(name, (cols, rows))| CustomTableEntry {
+                    name: name.clone(),
+                    columns: cols.clone(),
+                    rows: rows.clone(),
+                })
+                .collect();
+            drop(ct_guard);
+            let _ = storage.flush_catalog(&entries, &custom);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -358,7 +409,18 @@ impl DocumentStore {
                 entries[i].index_start_page = storage.write_index(&bytes)?;
             }
 
-            storage.flush_catalog(&entries)?;
+            let ct_guard = self.custom_tables.read().unwrap();
+            let custom: Vec<CustomTableEntry> = ct_guard
+                .iter()
+                .map(|(name, (cols, rows))| CustomTableEntry {
+                    name: name.clone(),
+                    columns: cols.clone(),
+                    rows: rows.clone(),
+                })
+                .collect();
+            drop(ct_guard);
+
+            storage.flush_catalog(&entries, &custom)?;
             Ok(())
         })();
 
@@ -379,7 +441,7 @@ impl DocumentStore {
     /// [`load_all_indexes`](DocumentStore::load_all_indexes).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open(path.as_ref())?;
-        let entries = storage.load_catalog()?;
+        let (entries, custom_table_entries) = storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
@@ -400,13 +462,18 @@ impl DocumentStore {
                 Some(max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)));
         }
 
+        let mut custom_tables = HashMap::new();
+        for ct in custom_table_entries {
+            custom_tables.insert(ct.name, (ct.columns, ct.rows));
+        }
+
         Ok(Self {
             documents,
             next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
             store_spans: true,
-            storage: Some(storage),
+            storage: Mutex::new(Some(storage)),
             doc_indexes: vec![None; cap],
-            custom_tables: RwLock::new(HashMap::new()),
+            custom_tables: RwLock::new(custom_tables),
         })
     }
 
@@ -416,7 +483,7 @@ impl DocumentStore {
     /// here — [`crate::SqlEngine`] builds them lazily on construction.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open(path.as_ref())?;
-        let entries = storage.load_catalog()?;
+        let (entries, custom_table_entries) = storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
@@ -433,13 +500,18 @@ impl DocumentStore {
                 Some(max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)));
         }
 
+        let mut custom_tables = HashMap::new();
+        for ct in custom_table_entries {
+            custom_tables.insert(ct.name, (ct.columns, ct.rows));
+        }
+
         Ok(Self {
             documents,
             next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
             store_spans: true,
-            storage: None,
+            storage: Mutex::new(None),
             doc_indexes: vec![None; cap],
-            custom_tables: RwLock::new(HashMap::new()),
+            custom_tables: RwLock::new(custom_tables),
         })
     }
 
@@ -450,7 +522,7 @@ impl DocumentStore {
     /// `list`), avoiding the cost of deserialising all block data.
     pub fn load_catalog_only(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open(path.as_ref())?;
-        let entries = storage.load_catalog()?;
+        let (entries, _custom_table_entries) = storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
@@ -473,7 +545,7 @@ impl DocumentStore {
             documents,
             next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
             store_spans: true,
-            storage: None,
+            storage: Mutex::new(None),
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(HashMap::new()),
         })

@@ -18,6 +18,14 @@ pub struct CatalogEntry {
     pub index_start_page: u32,
 }
 
+/// A user-defined table entry stored in the catalog.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomTableEntry {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+
 fn invalid_data(message: impl Into<String>) -> MqdbError {
     MqdbError::Storage(message.into())
 }
@@ -79,9 +87,21 @@ impl<'a> Decoder<'a> {
         String::from_utf8(bytes.to_vec())
             .map_err(|e| invalid_data(format!("invalid catalog string UTF-8: {e}")))
     }
+
+    fn read_string_u32(&mut self) -> Result<String, MqdbError> {
+        let len = usize::try_from(self.read_u32()?)
+            .map_err(|_| invalid_data("string length exceeds usize range"))?;
+        let bytes = self.read_exact(len)?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| invalid_data(format!("invalid catalog string UTF-8: {e}")))
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
 }
 
-fn serialize_catalog(entries: &[CatalogEntry]) -> Vec<u8> {
+fn serialize_catalog(entries: &[CatalogEntry], custom_tables: &[CustomTableEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&as_u32(entries.len(), "catalog entry count").to_le_bytes());
 
@@ -102,15 +122,39 @@ fn serialize_catalog(entries: &[CatalogEntry]) -> Vec<u8> {
         out.extend_from_slice(&entry.index_start_page.to_le_bytes());
     }
 
+    // Custom tables section (appended for backward compatibility — old readers see trailing zeros
+    // and stop; new readers detect the count field).
+    out.extend_from_slice(&as_u32(custom_tables.len(), "custom table count").to_le_bytes());
+    for ct in custom_tables {
+        out.extend_from_slice(&as_u16(ct.name.len(), "table name length").to_le_bytes());
+        out.extend_from_slice(ct.name.as_bytes());
+        out.extend_from_slice(&as_u16(ct.columns.len(), "column count").to_le_bytes());
+        for col in &ct.columns {
+            out.extend_from_slice(&as_u16(col.len(), "column name length").to_le_bytes());
+            out.extend_from_slice(col.as_bytes());
+        }
+        out.extend_from_slice(&as_u32(ct.rows.len(), "row count").to_le_bytes());
+        for row in &ct.rows {
+            for cell in row {
+                out.extend_from_slice(&as_u32(cell.len(), "cell length").to_le_bytes());
+                out.extend_from_slice(cell.as_bytes());
+            }
+        }
+    }
+
     out
 }
 
-pub fn write_catalog(pf: &mut PageFile, entries: &[CatalogEntry]) -> Result<(), MqdbError> {
+pub fn write_catalog(
+    pf: &mut PageFile,
+    entries: &[CatalogEntry],
+    custom_tables: &[CustomTableEntry],
+) -> Result<(), MqdbError> {
     if pf.num_pages < 2 {
         return Err(invalid_data("catalog start page is missing"));
     }
 
-    let bytes = serialize_catalog(entries);
+    let bytes = serialize_catalog(entries, custom_tables);
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
         vec![&[]]
     } else {
@@ -136,7 +180,9 @@ pub fn write_catalog(pf: &mut PageFile, entries: &[CatalogEntry]) -> Result<(), 
     Ok(())
 }
 
-pub fn read_catalog(pf: &mut PageFile) -> Result<Vec<CatalogEntry>, MqdbError> {
+pub fn read_catalog(
+    pf: &mut PageFile,
+) -> Result<(Vec<CatalogEntry>, Vec<CustomTableEntry>), MqdbError> {
     if pf.num_pages < 2 {
         return Err(invalid_data("catalog start page is missing"));
     }
@@ -200,5 +246,39 @@ pub fn read_catalog(pf: &mut PageFile) -> Result<Vec<CatalogEntry>, MqdbError> {
         });
     }
 
-    Ok(entries)
+    // Custom tables section — present in new-format files; old files have trailing zeros here
+    // which decode as count=0 (backward compatible).
+    let custom_tables = if decoder.remaining() >= 4 {
+        let count = usize::try_from(decoder.read_u32()?)
+            .map_err(|_| invalid_data("custom table count exceeds usize range"))?;
+        let mut tables = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = decoder.read_string_u16()?;
+            let num_cols = usize::from(decoder.read_u16()?);
+            let mut columns = Vec::with_capacity(num_cols);
+            for _ in 0..num_cols {
+                columns.push(decoder.read_string_u16()?);
+            }
+            let num_rows = usize::try_from(decoder.read_u32()?)
+                .map_err(|_| invalid_data("row count exceeds usize range"))?;
+            let mut rows = Vec::with_capacity(num_rows);
+            for _ in 0..num_rows {
+                let mut row = Vec::with_capacity(num_cols);
+                for _ in 0..num_cols {
+                    row.push(decoder.read_string_u32()?);
+                }
+                rows.push(row);
+            }
+            tables.push(CustomTableEntry {
+                name,
+                columns,
+                rows,
+            });
+        }
+        tables
+    } else {
+        vec![]
+    };
+
+    Ok((entries, custom_tables))
 }
