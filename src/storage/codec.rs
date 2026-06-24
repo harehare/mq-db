@@ -286,6 +286,36 @@ pub fn decode_block(data: &[u8]) -> Result<(Block, usize), MqdbError> {
     ))
 }
 
+/// Encode custom-table rows as a flat stream of u32-length-prefixed cells.
+/// Decoding requires the column count since rows are not self-delimiting.
+pub fn encode_table_rows(rows: &[Vec<String>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for row in rows {
+        for cell in row {
+            out.extend_from_slice(&as_u32(cell.len(), "cell length").to_le_bytes());
+            out.extend_from_slice(cell.as_bytes());
+        }
+    }
+    out
+}
+
+pub fn decode_table_rows(
+    data: &[u8],
+    num_rows: usize,
+    num_cols: usize,
+) -> Result<Vec<Vec<String>>, MqdbError> {
+    let mut decoder = Decoder::new(data);
+    let mut rows = Vec::with_capacity(num_rows);
+    for _ in 0..num_rows {
+        let mut row = Vec::with_capacity(num_cols);
+        for _ in 0..num_cols {
+            row.push(decoder.read_string_u32()?);
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 pub fn encode_zone_map(zm: &ZoneMaps) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(zm.max_heading_depth);

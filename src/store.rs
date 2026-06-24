@@ -4,7 +4,18 @@ use std::{
     sync::{Mutex, RwLock},
 };
 
-type CustomTable = (Vec<String>, Vec<Vec<String>>);
+/// In-memory state for a user-defined table.
+///
+/// `first_row_page`/`last_row_page` track where this table's rows live in
+/// the backing storage file (0 = not persisted yet), so a SQL `INSERT`
+/// can append just the new rows to the chain instead of rewriting `rows`
+/// in full on every call. See [`Storage::write_table_rows`].
+pub(crate) struct CustomTableState {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub first_row_page: u32,
+    pub last_row_page: u32,
+}
 
 use mq_markdown::Markdown;
 
@@ -21,6 +32,36 @@ use crate::{
         codec::{decode_zone_map, encode_zone_map},
     },
 };
+
+/// Persists any table whose rows have never been written to `storage` (i.e.
+/// `first_row_page == 0`), then builds catalog entries for every table.
+///
+/// Tables that already have a row-page chain are left untouched here — their
+/// pages were already written by an earlier flush or incremental `INSERT`
+/// append (see [`DocumentStore::try_append_table_rows_to_storage`]).
+fn persist_unsaved_table_rows(
+    storage: &mut Storage,
+    custom_tables: &RwLock<HashMap<String, CustomTableState>>,
+) -> Result<Vec<CustomTableEntry>, MqdbError> {
+    let mut guard = custom_tables.write().unwrap();
+    for state in guard.values_mut() {
+        if state.first_row_page == 0 && !state.rows.is_empty() {
+            let (first, last) = storage.write_table_rows(&state.rows)?;
+            state.first_row_page = first;
+            state.last_row_page = last;
+        }
+    }
+    Ok(guard
+        .iter()
+        .map(|(name, state)| CustomTableEntry {
+            name: name.clone(),
+            columns: state.columns.clone(),
+            first_row_page: state.first_row_page,
+            last_row_page: state.last_row_page,
+            num_rows: state.rows.len() as u32,
+        })
+        .collect())
+}
 
 /// The top-level embedded document store.
 ///
@@ -67,7 +108,7 @@ pub struct DocumentStore {
     /// User-registered virtual tables: name → (columns, rows).
     /// Uses `RwLock` for interior mutability so `SqlEngine` can execute DDL
     /// (`CREATE TABLE`, `INSERT INTO`, `DROP TABLE`) with only `&DocumentStore`.
-    pub(crate) custom_tables: RwLock<HashMap<String, CustomTable>>,
+    pub(crate) custom_tables: RwLock<HashMap<String, CustomTableState>>,
 }
 
 impl Default for DocumentStore {
@@ -107,10 +148,15 @@ impl DocumentStore {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
     ) {
-        self.custom_tables
-            .write()
-            .unwrap()
-            .insert(name.into(), (columns, rows));
+        self.custom_tables.write().unwrap().insert(
+            name.into(),
+            CustomTableState {
+                columns,
+                rows,
+                first_row_page: 0,
+                last_row_page: 0,
+            },
+        );
     }
 
     /// Remove a previously registered custom table. Returns `true` if it existed.
@@ -202,18 +248,7 @@ impl DocumentStore {
             let mut storage_guard = self.storage.lock().unwrap();
             if let Some(storage) = storage_guard.as_mut() {
                 // Reconstruct catalog entries from already-loaded document metadata.
-                let mut entries: Vec<CatalogEntry> = self
-                    .documents
-                    .iter()
-                    .map(|d| CatalogEntry {
-                        document_id: d.id,
-                        path: d.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                        first_block_page: d.first_block_page,
-                        num_blocks: d.block_count,
-                        zone_map_bytes: encode_zone_map(&d.zone_maps),
-                        index_start_page: d.index_start_page,
-                    })
-                    .collect();
+                let mut entries = self.catalog_entries();
 
                 let first_block_page = storage.write_document(&doc)?;
                 doc.first_block_page = first_block_page;
@@ -231,17 +266,7 @@ impl DocumentStore {
                     index_start_page,
                 });
 
-                let ct_guard = self.custom_tables.read().unwrap();
-                let custom: Vec<CustomTableEntry> = ct_guard
-                    .iter()
-                    .map(|(name, (cols, rows))| CustomTableEntry {
-                        name: name.clone(),
-                        columns: cols.clone(),
-                        rows: rows.clone(),
-                    })
-                    .collect();
-                drop(ct_guard);
-
+                let custom = persist_unsaved_table_rows(storage, &self.custom_tables)?;
                 storage.flush_catalog(&entries, &custom)?;
                 Some(idx)
             } else {
@@ -336,36 +361,91 @@ impl DocumentStore {
         self.doc_indexes.get(i).and_then(|o| o.as_ref())
     }
 
+    /// Builds catalog entries for every in-memory document.
+    fn catalog_entries(&self) -> Vec<CatalogEntry> {
+        self.documents
+            .iter()
+            .map(|d| CatalogEntry {
+                document_id: d.id,
+                path: d.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                first_block_page: d.first_block_page,
+                num_blocks: d.block_count,
+                zone_map_bytes: encode_zone_map(&d.zone_maps),
+                index_start_page: d.index_start_page,
+            })
+            .collect()
+    }
+
     /// Flush the catalog (including custom tables) to the backing storage file,
-    /// if one is open. Called automatically after DDL operations. No-op for
-    /// in-memory stores.
+    /// if one is open. Called automatically after DDL operations such as
+    /// `CREATE TABLE` and `DROP TABLE`. No-op for in-memory stores.
+    ///
+    /// Any table whose rows have never been persisted is written out in full
+    /// here (a one-time cost). Tables already backed by a row-page chain keep
+    /// their existing pages untouched — see
+    /// [`try_append_table_rows_to_storage`](DocumentStore::try_append_table_rows_to_storage)
+    /// for the incremental `INSERT` path.
     pub(crate) fn try_flush_catalog_to_storage(&self) {
         let mut guard = self.storage.lock().unwrap();
         if let Some(storage) = guard.as_mut() {
-            let entries: Vec<CatalogEntry> = self
-                .documents
-                .iter()
-                .map(|d| CatalogEntry {
-                    document_id: d.id,
-                    path: d.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                    first_block_page: d.first_block_page,
-                    num_blocks: d.block_count,
-                    zone_map_bytes: encode_zone_map(&d.zone_maps),
-                    index_start_page: d.index_start_page,
-                })
-                .collect();
-            let ct_guard = self.custom_tables.read().unwrap();
-            let custom: Vec<CustomTableEntry> = ct_guard
-                .iter()
-                .map(|(name, (cols, rows))| CustomTableEntry {
-                    name: name.clone(),
-                    columns: cols.clone(),
-                    rows: rows.clone(),
-                })
-                .collect();
-            drop(ct_guard);
-            let _ = storage.flush_catalog(&entries, &custom);
+            let entries = self.catalog_entries();
+            if let Ok(custom) = persist_unsaved_table_rows(storage, &self.custom_tables) {
+                let _ = storage.flush_catalog(&entries, &custom);
+            }
         }
+    }
+
+    /// Append `new_rows` to `table_name`'s on-disk row chain and flush a
+    /// lightweight catalog update — no full row rewrite. No-op for in-memory
+    /// stores or unknown tables.
+    ///
+    /// This is what makes `INSERT INTO <table>` incremental: the cost is
+    /// proportional to the rows being inserted, not to the table's total size.
+    pub(crate) fn try_append_table_rows_to_storage(
+        &self,
+        table_name: &str,
+        new_rows: &[Vec<String>],
+    ) {
+        let mut guard = self.storage.lock().unwrap();
+        let storage = match guard.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        {
+            let mut ct_guard = self.custom_tables.write().unwrap();
+            if let Some(state) = ct_guard.get_mut(table_name) {
+                let persisted = if state.first_row_page == 0 {
+                    // Nothing persisted yet for this table — write everything
+                    // currently in memory (covers rows seeded via
+                    // `register_table` plus the ones just inserted).
+                    storage.write_table_rows(&state.rows)
+                } else {
+                    storage
+                        .append_table_rows(state.last_row_page, new_rows)
+                        .map(|last| (state.first_row_page, last))
+                };
+                if let Ok((first, last)) = persisted {
+                    state.first_row_page = first;
+                    state.last_row_page = last;
+                }
+            }
+        }
+
+        let entries = self.catalog_entries();
+        let ct_guard = self.custom_tables.read().unwrap();
+        let custom: Vec<CustomTableEntry> = ct_guard
+            .iter()
+            .map(|(name, state)| CustomTableEntry {
+                name: name.clone(),
+                columns: state.columns.clone(),
+                first_row_page: state.first_row_page,
+                last_row_page: state.last_row_page,
+                num_rows: state.rows.len() as u32,
+            })
+            .collect();
+        drop(ct_guard);
+        let _ = storage.flush_catalog(&entries, &custom);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -409,15 +489,22 @@ impl DocumentStore {
                 entries[i].index_start_page = storage.write_index(&bytes)?;
             }
 
+            // This writes into a brand-new file, so each table's rows are
+            // written fresh here rather than reusing `first_row_page` /
+            // `last_row_page` from `self`, which (if set) point into a
+            // *different*, already-open backing file.
             let ct_guard = self.custom_tables.read().unwrap();
-            let custom: Vec<CustomTableEntry> = ct_guard
-                .iter()
-                .map(|(name, (cols, rows))| CustomTableEntry {
+            let mut custom = Vec::with_capacity(ct_guard.len());
+            for (name, state) in ct_guard.iter() {
+                let (first_row_page, last_row_page) = storage.write_table_rows(&state.rows)?;
+                custom.push(CustomTableEntry {
                     name: name.clone(),
-                    columns: cols.clone(),
-                    rows: rows.clone(),
-                })
-                .collect();
+                    columns: state.columns.clone(),
+                    first_row_page,
+                    last_row_page,
+                    num_rows: state.rows.len() as u32,
+                });
+            }
             drop(ct_guard);
 
             storage.flush_catalog(&entries, &custom)?;
@@ -464,7 +551,16 @@ impl DocumentStore {
 
         let mut custom_tables = HashMap::new();
         for ct in custom_table_entries {
-            custom_tables.insert(ct.name, (ct.columns, ct.rows));
+            let rows = storage.read_table_rows(ct.first_row_page, ct.num_rows, ct.columns.len())?;
+            custom_tables.insert(
+                ct.name,
+                CustomTableState {
+                    columns: ct.columns,
+                    rows,
+                    first_row_page: ct.first_row_page,
+                    last_row_page: ct.last_row_page,
+                },
+            );
         }
 
         Ok(Self {
@@ -502,7 +598,16 @@ impl DocumentStore {
 
         let mut custom_tables = HashMap::new();
         for ct in custom_table_entries {
-            custom_tables.insert(ct.name, (ct.columns, ct.rows));
+            let rows = storage.read_table_rows(ct.first_row_page, ct.num_rows, ct.columns.len())?;
+            custom_tables.insert(
+                ct.name,
+                CustomTableState {
+                    columns: ct.columns,
+                    rows,
+                    first_row_page: ct.first_row_page,
+                    last_row_page: ct.last_row_page,
+                },
+            );
         }
 
         Ok(Self {
