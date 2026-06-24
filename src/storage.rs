@@ -365,9 +365,9 @@ impl Storage {
 
             let body = &page[PAGE_HEADER_SIZE..];
             let chunk_len = usize::from(u16::from_le_bytes([body[0], body[1]]));
-            let chunk_end = chunk_len.checked_add(2).ok_or_else(|| {
-                invalid_data("table row page chunk length overflow")
-            })?;
+            let chunk_end = chunk_len
+                .checked_add(2)
+                .ok_or_else(|| invalid_data("table row page chunk length overflow"))?;
             if chunk_end > body.len() {
                 return Err(invalid_data("table row page chunk length out of bounds"));
             }
@@ -694,11 +694,7 @@ mod tests {
         assert_ne!(last_page, 0);
 
         let all_rows = storage.read_table_rows(first_page, 5, 2).unwrap();
-        let expected: Vec<Vec<String>> = batch1
-            .into_iter()
-            .chain(batch2)
-            .chain(batch3)
-            .collect();
+        let expected: Vec<Vec<String>> = batch1.into_iter().chain(batch2).chain(batch3).collect();
         assert_eq!(all_rows, expected);
 
         // A batch large enough to span multiple pages, appended after the
