@@ -182,6 +182,11 @@ fn node_to_parts(node: &Node) -> Option<(BlockType, String, Properties)> {
         | Node::MdxJsEsm(_) => Some((BlockType::Paragraph, node.value(), props)),
 
         Node::Fragment(_) | Node::Empty => None,
+
+        // New node types added by a newer mq-markdown — not yet mapped to a
+        // dedicated BlockType. Skip for now, consistent with Fragment/Empty.
+        #[allow(unreachable_patterns)]
+        _ => None,
     }
 }
 
