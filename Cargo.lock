@@ -1207,9 +1207,9 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
 dependencies = [
  "either",
 ]
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "mq-db"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -1418,9 +1418,9 @@ dependencies = [
 
 [[package]]
 name = "mq-lang"
-version = "0.6.0"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "945450433662b786c8ce51f19ab70891dc442da43d39967c51537927e7f7305a"
+checksum = "1212fc83c06eef62bf76ccea314ae51cfa72304bd73445bae64960281835c229"
 dependencies = [
  "base64",
  "chrono",
@@ -1428,7 +1428,7 @@ dependencies = [
  "csv",
  "dirs",
  "hcl-rs",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "md5",
  "miette",
  "mq-macros",
@@ -1456,9 +1456,9 @@ dependencies = [
 
 [[package]]
 name = "mq-macros"
-version = "0.6.0"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18f40d74822fe55553384f385363530300ea41ceadd598baf68fe0373bbb1fae"
+checksum = "31e8b069c44f6802457aac42a52b2a44953b55b128ad1cfd7960d263bb3a318d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1467,12 +1467,12 @@ dependencies = [
 
 [[package]]
 name = "mq-markdown"
-version = "0.6.0"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "791c374af833381678f62652884282f70043110e35b8a4a9f76c72cefca2def2"
+checksum = "97cb203323d6225628fc2dfbd1c208e914b85aabf96250e217fc4e883cef16e9"
 dependencies = [
  "ego-tree",
- "itertools 0.14.0",
+ "itertools 0.15.0",
  "markdown",
  "miette",
  "rustc-hash",

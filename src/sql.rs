@@ -62,6 +62,7 @@ use crate::{
     block::{Block, BlockType, Properties, PropertyValue},
     document::Document,
     indexes::{DocumentIndex, IndexHint},
+    store::CustomTableState,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -955,8 +956,9 @@ impl<'a> SqlEngine<'a> {
             });
         }
         let guard = self.store.custom_tables.read().unwrap();
-        if let Some((columns, _)) = guard.get(table_name) {
-            let rows = columns
+        if let Some(state) = guard.get(table_name) {
+            let rows = state
+                .columns
                 .iter()
                 .map(|c| vec![c.clone(), "text".to_string()])
                 .collect();
@@ -1002,11 +1004,15 @@ impl<'a> SqlEngine<'a> {
             // CREATE TABLE name AS SELECT ...
             let result = self.exec_query(query)?;
             let n = result.rows.len();
-            self.store
-                .custom_tables
-                .write()
-                .unwrap()
-                .insert(table_name, (result.columns, result.rows));
+            self.store.custom_tables.write().unwrap().insert(
+                table_name,
+                CustomTableState {
+                    columns: result.columns,
+                    rows: result.rows,
+                    first_row_page: 0,
+                    last_row_page: 0,
+                },
+            );
             self.store.try_flush_catalog_to_storage();
             return Ok(QueryOutput {
                 columns: vec!["rows".to_string()],
@@ -1038,11 +1044,15 @@ impl<'a> SqlEngine<'a> {
                 "table '{table_name}' already exists"
             )));
         }
-        self.store
-            .custom_tables
-            .write()
-            .unwrap()
-            .insert(table_name, (columns, vec![]));
+        self.store.custom_tables.write().unwrap().insert(
+            table_name,
+            CustomTableState {
+                columns,
+                rows: vec![],
+                first_row_page: 0,
+                last_row_page: 0,
+            },
+        );
         self.store.try_flush_catalog_to_storage();
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
@@ -1071,7 +1081,7 @@ impl<'a> SqlEngine<'a> {
             let guard = self.store.custom_tables.read().unwrap();
             let table_cols = guard
                 .get(&table_name)
-                .map(|(c, _)| c.clone())
+                .map(|state| state.columns.clone())
                 .ok_or_else(|| MqdbError::SqlExec(format!("unknown table: {table_name}")))?;
             drop(guard);
             let indices: Result<Vec<usize>, _> = ins
@@ -1088,14 +1098,14 @@ impl<'a> SqlEngine<'a> {
             Some(indices?)
         };
 
-        let inserted = {
+        let new_rows = {
             let mut guard = self.store.custom_tables.write().unwrap();
-            let (table_cols, table_rows) = guard
+            let state = guard
                 .get_mut(&table_name)
                 .ok_or_else(|| MqdbError::SqlExec(format!("unknown table: {table_name}")))?;
-            let ncols = table_cols.len();
+            let ncols = state.columns.len();
 
-            let mut inserted = 0usize;
+            let mut new_rows = Vec::with_capacity(values_out.rows.len());
             for src_row in &values_out.rows {
                 let mut row = vec![String::new(); ncols];
                 match &col_indices {
@@ -1116,12 +1126,17 @@ impl<'a> SqlEngine<'a> {
                         }
                     }
                 }
-                table_rows.push(row);
-                inserted += 1;
+                state.rows.push(row.clone());
+                new_rows.push(row);
             }
-            inserted
+            new_rows
         }; // write lock released before flush
-        self.store.try_flush_catalog_to_storage();
+        let inserted = new_rows.len();
+        // Append only the new rows to the on-disk chain instead of rewriting
+        // the whole table, so INSERT cost stays proportional to the rows
+        // being added rather than the table's total size.
+        self.store
+            .try_append_table_rows_to_storage(&table_name, &new_rows);
         Ok(QueryOutput {
             columns: vec!["rows_affected".to_string()],
             rows: vec![vec![inserted.to_string()]],
@@ -1353,14 +1368,15 @@ impl<'a> SqlEngine<'a> {
             }
             other => {
                 let guard = self.store.custom_tables.read().unwrap();
-                if let Some((columns, custom_rows)) = guard.get(other) {
+                if let Some(state) = guard.get(other) {
                     let prefix = alias.as_deref().unwrap_or(other);
-                    let rows = custom_rows
+                    let rows = state
+                        .rows
                         .iter()
                         .map(|row_vals| {
                             qualify_row(
                                 Row {
-                                    columns: columns.clone(),
+                                    columns: state.columns.clone(),
                                     values: row_vals
                                         .iter()
                                         .map(|v| Value::Str(v.clone()))

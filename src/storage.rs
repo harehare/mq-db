@@ -10,13 +10,18 @@ use crate::{
     error::MqdbError,
     storage::{
         catalog::{CatalogEntry, CustomTableEntry, read_catalog, write_catalog},
-        codec::{decode_block, encode_block},
+        codec::{decode_block, decode_table_rows, encode_block, encode_table_rows},
         page::{
             PAGE_BODY_SIZE, PAGE_HEADER_SIZE, PAGE_TYPE_BLOCK_DATA, PAGE_TYPE_CATALOG,
-            PAGE_TYPE_INDEX, PAGE_TYPE_OVERFLOW, PageFile, make_page, parse_page_header,
+            PAGE_TYPE_INDEX, PAGE_TYPE_OVERFLOW, PAGE_TYPE_TABLE_DATA, PageFile, make_page,
+            parse_page_header,
         },
     },
 };
+
+/// Usable bytes per table-row page, reserving 2 bytes for the page's real
+/// (unpadded) chunk length. See [`Storage::write_table_row_chunks`].
+const TABLE_ROW_PAGE_CAPACITY: usize = PAGE_BODY_SIZE - 2;
 
 pub struct Storage {
     page_file: PageFile,
@@ -234,6 +239,148 @@ impl Storage {
         }
 
         Ok(bytes)
+    }
+
+    /// Write a fresh chain of table-row pages, starting a brand-new table.
+    /// Returns `(first_page, last_page)`, or `(0, 0)` if `rows` is empty
+    /// (nothing written — 0 is never a valid page id).
+    pub fn write_table_rows(&mut self, rows: &[Vec<String>]) -> Result<(u32, u32), MqdbError> {
+        self.write_table_row_chunks(rows, PAGE_TYPE_TABLE_DATA)
+    }
+
+    /// Append `rows` after an existing table-row chain by writing new pages
+    /// and relinking the current tail (`tail_page`) to point at them.
+    /// Returns the new tail page id (unchanged if `rows` is empty).
+    pub fn append_table_rows(
+        &mut self,
+        tail_page: u32,
+        rows: &[Vec<String>],
+    ) -> Result<u32, MqdbError> {
+        if rows.is_empty() {
+            return Ok(tail_page);
+        }
+
+        // The first page of an appended batch continues the existing chain,
+        // so it must be tagged OVERFLOW like every other non-head page —
+        // only the table's very first page is ever PAGE_TYPE_TABLE_DATA.
+        let (first_new, last_new) = self.write_table_row_chunks(rows, PAGE_TYPE_OVERFLOW)?;
+        self.relink_next(tail_page, first_new)?;
+        Ok(last_new)
+    }
+
+    /// Table-row chains are built incrementally across many separate write
+    /// calls (one per `INSERT`), so — unlike block/index chains, which are
+    /// always written whole in one pass — a short trailing chunk can end up
+    /// in the *middle* of the logical chain, not just at its very end.
+    /// Padding it out to `PAGE_BODY_SIZE` would silently splice zero bytes
+    /// between two batches' real data. So each table-data/overflow page
+    /// reserves its first 2 bytes for the real length of the chunk it holds.
+    fn write_table_row_chunks(
+        &mut self,
+        rows: &[Vec<String>],
+        head_page_type: u32,
+    ) -> Result<(u32, u32), MqdbError> {
+        if rows.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let bytes = encode_table_rows(rows);
+        let chunks: Vec<&[u8]> = bytes.chunks(TABLE_ROW_PAGE_CAPACITY).collect();
+
+        let placeholder = make_page(PAGE_TYPE_OVERFLOW, 0, 0, &[]);
+        let mut page_ids = Vec::with_capacity(chunks.len());
+        for _ in 0..chunks.len() {
+            page_ids.push(self.page_file.append_page(&placeholder)?);
+        }
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let page_id = page_ids[index];
+            let next_page = page_ids.get(index + 1).copied().unwrap_or(0);
+            let page_type = if index == 0 {
+                head_page_type
+            } else {
+                PAGE_TYPE_OVERFLOW
+            };
+            let mut body = Vec::with_capacity(2 + chunk.len());
+            body.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
+            body.extend_from_slice(chunk);
+            let page = make_page(page_type, page_id, next_page, &body);
+            self.page_file.write_page(page_id, &page)?;
+        }
+
+        let first = *page_ids.first().expect("checked non-empty above");
+        let last = *page_ids.last().expect("checked non-empty above");
+        Ok((first, last))
+    }
+
+    /// Rewrite a single page's `next_page` pointer in place, preserving its
+    /// type, id, and body. Used to extend a page chain without touching any
+    /// other page.
+    fn relink_next(&mut self, page_id: u32, next_page: u32) -> Result<(), MqdbError> {
+        let page = self.page_file.read_page(page_id)?;
+        let (page_type, _, stored_page_id, _) = parse_page_header(&page);
+        let body = &page[PAGE_HEADER_SIZE..];
+        let relinked = make_page(page_type, stored_page_id, next_page, body);
+        self.page_file.write_page(page_id, &relinked)
+    }
+
+    /// Read all rows for a table given its chain head, row count, and column count.
+    pub fn read_table_rows(
+        &mut self,
+        first_page: u32,
+        num_rows: u32,
+        num_cols: usize,
+    ) -> Result<Vec<Vec<String>>, MqdbError> {
+        if first_page == 0 || num_rows == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut bytes = Vec::new();
+        let mut page_id = first_page;
+        let mut visited = HashSet::new();
+        let mut first = true;
+
+        loop {
+            if !visited.insert(page_id) {
+                return Err(invalid_data("table row page chain contains a cycle"));
+            }
+
+            let page = self.page_file.read_page(page_id)?;
+            let (page_type, _, stored_page_id, next_page) = parse_page_header(&page);
+            let expected_type = if first {
+                PAGE_TYPE_TABLE_DATA
+            } else {
+                PAGE_TYPE_OVERFLOW
+            };
+            if page_type != expected_type {
+                return Err(invalid_data(format!(
+                    "unexpected page type {page_type} in table row chain; expected {expected_type}"
+                )));
+            }
+            if stored_page_id != page_id {
+                return Err(invalid_data(format!(
+                    "table row page header mismatch: expected {page_id}, found {stored_page_id}"
+                )));
+            }
+
+            let body = &page[PAGE_HEADER_SIZE..];
+            let chunk_len = usize::from(u16::from_le_bytes([body[0], body[1]]));
+            let chunk_end = chunk_len
+                .checked_add(2)
+                .ok_or_else(|| invalid_data("table row page chunk length overflow"))?;
+            if chunk_end > body.len() {
+                return Err(invalid_data("table row page chunk length out of bounds"));
+            }
+            bytes.extend_from_slice(&body[2..chunk_end]);
+
+            if next_page == 0 {
+                break;
+            }
+            page_id = next_page;
+            first = false;
+        }
+
+        decode_table_rows(&bytes, num_rows as usize, num_cols)
     }
 }
 
@@ -515,6 +662,54 @@ mod tests {
         let (decoded, consumed) = decode_block(&encoded).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn table_row_chain_round_trip_across_multiple_appends() {
+        // Regression test for the incremental INSERT path: each batch is
+        // written with `append_table_rows` (mirroring multiple separate SQL
+        // INSERTs), and only the very first page of the whole chain should
+        // be tagged PAGE_TYPE_TABLE_DATA — every later page, including the
+        // head of each appended batch, must be PAGE_TYPE_OVERFLOW or the
+        // chain reader rejects it.
+        let path = test_file_path("table-row-chain-append");
+        cleanup(&path);
+
+        let mut storage = Storage::create(&path).unwrap();
+        storage.flush_catalog(&[], &[]).unwrap();
+
+        let batch1 = vec![
+            vec!["1".to_string(), "a".to_string()],
+            vec!["2".to_string(), "b".to_string()],
+        ];
+        let batch2 = vec![vec!["3".to_string(), "c".to_string()]];
+        let batch3 = vec![
+            vec!["4".to_string(), "d".to_string()],
+            vec!["5".to_string(), "e".to_string()],
+        ];
+
+        let (first_page, last_page) = storage.write_table_rows(&batch1).unwrap();
+        let last_page = storage.append_table_rows(last_page, &batch2).unwrap();
+        let last_page = storage.append_table_rows(last_page, &batch3).unwrap();
+        assert_ne!(last_page, 0);
+
+        let all_rows = storage.read_table_rows(first_page, 5, 2).unwrap();
+        let expected: Vec<Vec<String>> = batch1.into_iter().chain(batch2).chain(batch3).collect();
+        assert_eq!(all_rows, expected);
+
+        // A batch large enough to span multiple pages, appended after the
+        // small single-page batches above, must not corrupt either side.
+        let big_batch: Vec<Vec<String>> = (0..10)
+            .map(|i| vec![i.to_string(), "x".repeat(PAGE_BODY_SIZE)])
+            .collect();
+        let last_page = storage.append_table_rows(last_page, &big_batch).unwrap();
+        assert_ne!(last_page, 0);
+
+        let all_rows = storage.read_table_rows(first_page, 15, 2).unwrap();
+        let expected: Vec<Vec<String>> = expected.into_iter().chain(big_batch).collect();
+        assert_eq!(all_rows, expected);
+
+        cleanup(&path);
     }
 
     #[test]

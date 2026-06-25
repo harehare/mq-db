@@ -19,11 +19,20 @@ pub struct CatalogEntry {
 }
 
 /// A user-defined table entry stored in the catalog.
+///
+/// Row data is *not* stored inline — it lives in its own page chain
+/// (see [`crate::storage::Storage::write_table_rows`]) so that appending
+/// rows only requires writing the new pages plus this small fixed-size
+/// entry, instead of rewriting every previously-inserted row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CustomTableEntry {
     pub name: String,
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    /// First page of the row chain. 0 = no rows persisted yet.
+    pub first_row_page: u32,
+    /// Last page of the row chain — new rows are appended after this page.
+    pub last_row_page: u32,
+    pub num_rows: u32,
 }
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {
@@ -88,14 +97,6 @@ impl<'a> Decoder<'a> {
             .map_err(|e| invalid_data(format!("invalid catalog string UTF-8: {e}")))
     }
 
-    fn read_string_u32(&mut self) -> Result<String, MqdbError> {
-        let len = usize::try_from(self.read_u32()?)
-            .map_err(|_| invalid_data("string length exceeds usize range"))?;
-        let bytes = self.read_exact(len)?;
-        String::from_utf8(bytes.to_vec())
-            .map_err(|e| invalid_data(format!("invalid catalog string UTF-8: {e}")))
-    }
-
     fn remaining(&self) -> usize {
         self.data.len() - self.pos
     }
@@ -122,8 +123,6 @@ fn serialize_catalog(entries: &[CatalogEntry], custom_tables: &[CustomTableEntry
         out.extend_from_slice(&entry.index_start_page.to_le_bytes());
     }
 
-    // Custom tables section (appended for backward compatibility — old readers see trailing zeros
-    // and stop; new readers detect the count field).
     out.extend_from_slice(&as_u32(custom_tables.len(), "custom table count").to_le_bytes());
     for ct in custom_tables {
         out.extend_from_slice(&as_u16(ct.name.len(), "table name length").to_le_bytes());
@@ -133,13 +132,9 @@ fn serialize_catalog(entries: &[CatalogEntry], custom_tables: &[CustomTableEntry
             out.extend_from_slice(&as_u16(col.len(), "column name length").to_le_bytes());
             out.extend_from_slice(col.as_bytes());
         }
-        out.extend_from_slice(&as_u32(ct.rows.len(), "row count").to_le_bytes());
-        for row in &ct.rows {
-            for cell in row {
-                out.extend_from_slice(&as_u32(cell.len(), "cell length").to_le_bytes());
-                out.extend_from_slice(cell.as_bytes());
-            }
-        }
+        out.extend_from_slice(&ct.first_row_page.to_le_bytes());
+        out.extend_from_slice(&ct.last_row_page.to_le_bytes());
+        out.extend_from_slice(&ct.num_rows.to_le_bytes());
     }
 
     out
@@ -246,8 +241,6 @@ pub fn read_catalog(
         });
     }
 
-    // Custom tables section — present in new-format files; old files have trailing zeros here
-    // which decode as count=0 (backward compatible).
     let custom_tables = if decoder.remaining() >= 4 {
         let count = usize::try_from(decoder.read_u32()?)
             .map_err(|_| invalid_data("custom table count exceeds usize range"))?;
@@ -259,20 +252,15 @@ pub fn read_catalog(
             for _ in 0..num_cols {
                 columns.push(decoder.read_string_u16()?);
             }
-            let num_rows = usize::try_from(decoder.read_u32()?)
-                .map_err(|_| invalid_data("row count exceeds usize range"))?;
-            let mut rows = Vec::with_capacity(num_rows);
-            for _ in 0..num_rows {
-                let mut row = Vec::with_capacity(num_cols);
-                for _ in 0..num_cols {
-                    row.push(decoder.read_string_u32()?);
-                }
-                rows.push(row);
-            }
+            let first_row_page = decoder.read_u32()?;
+            let last_row_page = decoder.read_u32()?;
+            let num_rows = decoder.read_u32()?;
             tables.push(CustomTableEntry {
                 name,
                 columns,
-                rows,
+                first_row_page,
+                last_row_page,
+                num_rows,
             });
         }
         tables
