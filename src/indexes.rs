@@ -26,6 +26,10 @@
 //! [`crate::document::ZoneMaps`] provides document-level skipping (skip entire
 //! files that cannot match). These indexes operate *within* a document once
 //! Zone Maps have decided it is worth scanning.
+//!
+//! `SqlEngine` applies this automatically (see `zone_map_skip` in
+//! `src/sql.rs`) for `lang =` / `depth =` / heading `content =` conjuncts,
+//! but only for a single, non-`JOIN`ed `FROM blocks`.
 
 use std::collections::{BTreeMap, HashMap};
 

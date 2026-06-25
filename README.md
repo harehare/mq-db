@@ -38,6 +38,7 @@ flowchart TD
 - **Zone Maps** — per-document statistics skip irrelevant files before scanning any blocks
 - **Dual query engines** — SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
 - **DDL support** — `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
+- **Comprehensive SQL function library** — string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
 - **`mq()` scalar function** — run an mq program against Markdown content inline in SQL
 - **Custom page-file persistence** — 8 KB fixed pages, checksums, atomic writes
 - **CLI + interactive REPL + TUI** — full terminal experience
@@ -384,13 +385,64 @@ SELECT id, document_id, block_type, content, pre, post,
 
 ### Built-in functions
 
+mq-db-specific:
+
 | Function                              | Description                                |
 | ------------------------------------- | ------------------------------------------ |
 | `under(pre, post, anc_pre, anc_post)` | O(1) interval ancestor check               |
 | `mq(program, content)`                | Run an mq program against Markdown content |
 | `json_extract(json, path)`            | Extract a value from a JSON string         |
-| `count(*) / min / max / sum / avg`    | Aggregate functions                        |
-| `lower / upper / length / coalesce`   | Scalar utilities                           |
+
+String:
+
+| Function | Description |
+| --- | --- |
+| `lower` / `upper` | Case conversion |
+| `length` / `len` | Character count |
+| `trim` / `ltrim` / `rtrim` | Strip whitespace, or the given characters |
+| `concat` / `concat_ws` | Join strings (with optional separator) |
+| `replace` | Replace all occurrences of a substring |
+| `substring` / `substr` | Extract a substring (1-based, `FROM`/`FOR` or comma form) |
+| `position` / `instr` | Find the 1-based index of a substring (0 if absent) |
+| `left` / `right` | First/last `n` characters |
+| `lpad` / `rpad` | Pad to a fixed length |
+| `reverse` | Reverse a string |
+| `repeat` | Repeat a string `n` times |
+| `initcap` | Capitalize each word |
+| `ascii` / `chr` | Char ↔ code point |
+| `split_part` | Extract the nth delimiter-separated field |
+
+Numeric:
+
+| Function | Description |
+| --- | --- |
+| `abs` | Absolute value |
+| `round` / `trunc` | Round / truncate, with optional decimal scale |
+| `ceil` / `floor` | Round up / down |
+| `mod` | Remainder |
+| `power` / `sqrt` | Exponentiation / square root |
+| `exp` / `ln` | `e^x` / natural log |
+| `log` / `log10` / `log2` | Logarithm (1-arg = base 10, 2-arg = custom base) |
+| `sign` | `-1` / `0` / `1` |
+| `pi` | π |
+| `greatest` / `least` | Max / min across arguments (ignoring NULL) |
+
+Null handling & control flow:
+
+| Function | Description |
+| --- | --- |
+| `coalesce` / `ifnull` | First non-NULL argument |
+| `nullif` | NULL if the two arguments are equal |
+| `CASE WHEN … THEN … ELSE … END` | Conditional expressions |
+| `typeof` | Runtime type of a value |
+
+Aggregates (usable with `GROUP BY`):
+
+| Function | Description |
+| --- | --- |
+| `count(*)` / `count(DISTINCT col)` | Row / distinct-value count |
+| `min` / `max` / `sum` / `avg` | Standard aggregates |
+| `group_concat` / `string_agg(expr[, sep])` | Concatenate group values (default separator `,`) |
 
 ### DDL statements
 
@@ -431,6 +483,15 @@ WHERE h.block_type = 'heading' AND depth = 2 AND nxt.block_type = 'list';
 SELECT DISTINCT d.path
 FROM documents d JOIN blocks b ON b.document_id = d.id
 WHERE b.block_type = 'code' AND lang = 'python';
+
+-- Bucket headings by depth and summarize with string/numeric functions
+SELECT
+  CASE WHEN depth <= 1 THEN 'top-level' ELSE 'nested' END AS bucket,
+  count(*),
+  group_concat(initcap(trim(content)), ', ') AS headings
+FROM blocks
+WHERE block_type = 'heading'
+GROUP BY CASE WHEN depth <= 1 THEN 'top-level' ELSE 'nested' END;
 ```
 
 ## Architecture
@@ -475,14 +536,17 @@ flowchart LR
 
 #### Layer 1 — Zone Maps (document-level skip)
 
-Built once per document and stored in the `.mq-db` file. Checked before any block is read:
+Built once per document and stored in the `.mq-db` file. Checked before any block is read.
 
-| Field               | Skips documents where…               |
-| ------------------- | ------------------------------------ |
-| `heading_contents`  | The requested heading text is absent |
-| `code_languages`    | The requested language tag is absent |
-| `max_heading_depth` | The requested depth cannot exist     |
-| `tags`              | The tag filter cannot match          |
+**Via SQL** — `SqlEngine` derives a skip automatically from the WHERE clause, for a single, non-`JOIN`ed `SELECT ... FROM blocks`:
+
+| WHERE conjunct                          | Skips documents where…                              |
+| ---------------------------------------- | --------------------------------------------------- |
+| `lang = 'X'`                             | `code_languages` doesn't contain `X`                |
+| `depth = N` (`N > 0`)                    | `N` exceeds `max_heading_depth`                     |
+| `block_type = 'heading' AND content = 'X'` | `heading_contents` has no case-insensitive match for `X` |
+
+**Via the Rust API** — `store.query().documents(|doc| ...)` lets you filter on *any* zone-map field yourself (`heading_slugs`, `frontmatter_keys`, `title`, `tags`, …), not just the patterns `SqlEngine` recognizes automatically.
 
 #### Layer 2 — Interval Index (section hierarchy)
 
