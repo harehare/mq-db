@@ -1,34 +1,23 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
-  <defs>
-    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#2B5773"/>
-      <stop offset="100%" style="stop-color:#61AFEF"/>
-    </linearGradient>
-    <linearGradient id="gradLight" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#3B6E8A"/>
-      <stop offset="100%" style="stop-color:#7BBFFF"/>
-    </linearGradient>
-  </defs>
-
   <!-- Database cylinder body -->
-  <rect x="18" y="30" width="64" height="46" rx="4" fill="url(#grad)"/>
+  <rect x="18" y="30" width="64" height="46" rx="4" fill="#B3402C"/>
 
   <!-- Cylinder top ellipse -->
-  <ellipse cx="50" cy="30" rx="32" ry="10" fill="url(#gradLight)"/>
+  <ellipse cx="50" cy="30" rx="32" ry="10" fill="#B3402C"/>
 
   <!-- Cylinder shelf lines -->
-  <ellipse cx="50" cy="44" rx="32" ry="7" fill="none" stroke="rgba(255,255,255,0.25)" stroke-width="1.5"/>
-  <ellipse cx="50" cy="56" rx="32" ry="7" fill="none" stroke="rgba(255,255,255,0.20)" stroke-width="1.5"/>
+  <ellipse cx="50" cy="44" rx="32" ry="7" fill="none" stroke="#FAF6EF" stroke-width="1.5" opacity="0.4"/>
+  <ellipse cx="50" cy="56" rx="32" ry="7" fill="none" stroke="#FAF6EF" stroke-width="1.5" opacity="0.32"/>
 
   <!-- Bottom ellipse cap -->
-  <ellipse cx="50" cy="76" rx="32" ry="10" fill="url(#grad)"/>
-  <ellipse cx="50" cy="76" rx="32" ry="10" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="1"/>
+  <ellipse cx="50" cy="76" rx="32" ry="10" fill="#B3402C"/>
+  <ellipse cx="50" cy="76" rx="32" ry="10" fill="none" stroke="#FAF6EF" stroke-width="1" opacity="0.25"/>
 
   <!-- M mark (Markdown) centered on cylinder -->
   <path d="M34 62 L34 46 L42 56 L50 46 L58 56 L66 46 L66 62"
         fill="none"
-        stroke="white"
-        stroke-width="5"
+        stroke="#FAF6EF"
+        stroke-width="5.5"
         stroke-linecap="round"
         stroke-linejoin="round"
         opacity="0.95"/>
