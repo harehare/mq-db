@@ -7,7 +7,7 @@
 
 [![ci](https://img.shields.io/github/actions/workflow/status/harehare/mq-db/ci.yml?logo=github-actions&label=ci)](https://github.com/harehare/mq-db/actions/workflows/ci.yml)
 [![audit](https://img.shields.io/github/actions/workflow/status/harehare/mq-db/audit.yml?logo=shield&label=audit)](https://github.com/harehare/mq-db/actions/workflows/audit.yml)
-[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![license](https://img.shields.io/badge/license-MIT-b3402c)](LICENSE)
 
 ![demo](./assets/demo.gif)
 
@@ -16,6 +16,7 @@
 `mq-db` treats Markdown documents as **structured, hierarchical databases** rather than plain text. It parses Markdown into a flat block list with an **interval index** (Nested Set / Pre-Post Order), enabling O(1) section hierarchy queries. Documents can be queried with **SQL** or **[mq](https://github.com/harehare/mq)** and persisted to a compact custom page-file format.
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#f2ebdb','primaryTextColor':'#2a2420','primaryBorderColor':'#b3402c','lineColor':'#b3402c','secondaryColor':'#e3c3b7','tertiaryColor':'#faf6ef','background':'#faf6ef','fontFamily':'JetBrains Mono, monospace'}}}%%
 flowchart TD
     A["Markdown File(s)"] -->|"CST Parser (mq-markdown)"| B["Block Tree\n(heading · paragraph · code · list …)"]
     B -->|"Interval Index + Secondary Indexes"| C["Flat Block Vector\n(pre/post integers)"]
@@ -525,6 +526,7 @@ struct Block {
 mq-db applies three complementary index layers, cheapest-first.
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#f2ebdb','primaryTextColor':'#2a2420','primaryBorderColor':'#b3402c','lineColor':'#b3402c','secondaryColor':'#e3c3b7','tertiaryColor':'#faf6ef','background':'#faf6ef','fontFamily':'JetBrains Mono, monospace'}}}%%
 flowchart LR
     Q["SQL Query"] --> ZM["Layer 1\nZone Maps\n(document skip)"]
     ZM -->|"relevant docs"| II["Layer 2\nInterval Index\n(section scope)"]
@@ -553,6 +555,7 @@ Built once per document and stored in the `.mq-db` file. Checked before any bloc
 Heading hierarchy encoded as `(pre, post)` pairs via Pre-Post Order (Nested Set) traversal:
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#f2ebdb','primaryTextColor':'#2a2420','primaryBorderColor':'#b3402c','lineColor':'#b3402c','secondaryColor':'#e3c3b7','tertiaryColor':'#faf6ef','background':'#faf6ef','fontFamily':'JetBrains Mono, monospace'}}}%%
 graph TD
     doc["# Doc\npre=0 · post=11"]
     secA["## Section A\npre=2 · post=7"]
@@ -581,6 +584,7 @@ graph TD
 SQL predicate pushdown picks an `IndexHint`:
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#f2ebdb','primaryTextColor':'#2a2420','primaryBorderColor':'#b3402c','lineColor':'#b3402c','secondaryColor':'#e3c3b7','tertiaryColor':'#faf6ef','background':'#faf6ef','fontFamily':'JetBrains Mono, monospace'}}}%%
 flowchart TD
     P["SQL WHERE predicate"]
     P -->|"block_type = '...'"| B["BitmapIndex"]
@@ -597,6 +601,7 @@ flowchart TD
 Custom 8 KB page file:
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#f2ebdb','primaryTextColor':'#2a2420','primaryBorderColor':'#b3402c','lineColor':'#b3402c','secondaryColor':'#e3c3b7','tertiaryColor':'#faf6ef','background':'#faf6ef','fontFamily':'JetBrains Mono, monospace'}}}%%
 graph TD
     P0["Page 0 — File Header\nmagic 0x4D514442 · version · page count"]
     P1["Page 1 — Catalog\ndoc_id → first_block_page · num_blocks · ZoneMaps"]
