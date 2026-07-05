@@ -1,0 +1,182 @@
+<!--
+  Source for docs/assets/ogp.png. Regenerate after edits with:
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    --headless --disable-gpu --hide-scrollbars --window-size=1200,630 \
+    --screenshot=docs/assets/ogp.png assets/ogp.html
+-->
+<!doctype html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap"
+  rel="stylesheet"
+/>
+<style>
+  :root {
+    /* dark ("manuscript by candlelight") palette — matches docs/index.html
+       @media (prefers-color-scheme: dark) :root values */
+    --c-paper: #1b1714;
+    --c-paper-alt: #231e1a;
+    --c-paper-deep: #383028;
+    --c-ink: #ece4d8;
+    --c-ink-dim: #a89c8c;
+    --c-accent: #d9714f;
+    --c-accent-hover: #e68c6c;
+    --c-mark: #d6a84c;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    width: 1200px; height: 630px;
+    background-color: var(--c-paper);
+    /* matches docs/index.html body: radial-gradient(rgb(var(--c-ink) / 0.035) 1px, transparent 1.2px) / 3px 3px */
+    background-image: radial-gradient(rgba(236, 228, 216, 0.035) 1px, transparent 1.2px);
+    background-size: 3px 3px;
+    font-family: "Inter", sans-serif;
+    color: var(--c-ink);
+    overflow: hidden;
+  }
+  .card {
+    width: 1200px;
+    height: 630px;
+    padding: 56px 64px 48px;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+  }
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .brand span {
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 700;
+    font-size: 26px;
+    letter-spacing: -0.02em;
+    color: var(--c-ink);
+  }
+  .eyebrow {
+    font-family: "Inter", sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--c-accent);
+  }
+  h1 {
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 700;
+    font-size: 56px;
+    line-height: 1.1;
+    letter-spacing: -0.025em;
+    margin: 36px 0 22px;
+    max-width: 920px;
+  }
+  h1 em {
+    font-style: normal;
+    color: var(--c-accent);
+  }
+  p.tagline {
+    font-family: "Inter", sans-serif;
+    font-size: 20px;
+    line-height: 1.55;
+    color: var(--c-ink-dim);
+    max-width: 780px;
+    margin: 0 0 34px;
+  }
+  p.tagline b {
+    color: var(--c-ink);
+    font-weight: 600;
+  }
+  .panel {
+    border: 1px solid var(--c-paper-deep);
+    border-radius: 10px;
+    background: var(--c-paper-alt);
+    overflow: hidden;
+    box-shadow: 0 1px 2px rgba(42,36,32,0.06);
+  }
+  .panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--c-paper-deep);
+  }
+  .dots { display: flex; gap: 7px; }
+  .dots span {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--c-ink-dim); opacity: 0.35;
+  }
+  .panel-head .label {
+    font-family: "Inter", sans-serif;
+    font-size: 13px;
+    color: var(--c-ink-dim);
+  }
+  .panel-head .tag {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 13px;
+    color: var(--c-mark);
+  }
+  pre {
+    margin: 0;
+    padding: 20px 24px 22px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 15px;
+    line-height: 1.62;
+    white-space: pre;
+  }
+  .kw { color: var(--c-accent); }
+  .str { color: var(--c-mark); }
+  .cm { color: var(--c-ink-dim); font-style: italic; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="topbar">
+      <div class="brand">
+        <svg width="34" height="34" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+          <rect x="18" y="30" width="64" height="46" rx="4" fill="#B3402C"/>
+          <ellipse cx="50" cy="30" rx="32" ry="10" fill="#B3402C"/>
+          <ellipse cx="50" cy="44" rx="32" ry="7" fill="none" stroke="#FAF6EF" stroke-width="1.5" opacity="0.4"/>
+          <ellipse cx="50" cy="56" rx="32" ry="7" fill="none" stroke="#FAF6EF" stroke-width="1.5" opacity="0.32"/>
+          <ellipse cx="50" cy="76" rx="32" ry="10" fill="#B3402C"/>
+          <ellipse cx="50" cy="76" rx="32" ry="10" fill="none" stroke="#FAF6EF" stroke-width="1" opacity="0.25"/>
+          <path d="M34 62 L34 46 L42 56 L50 46 L58 56 L66 46 L66 62" fill="none" stroke="#FAF6EF" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.95"/>
+        </svg>
+        <span>mq-db</span>
+      </div>
+      <div class="eyebrow">A Markdown-specialized embedded database, in Rust</div>
+    </div>
+
+    <h1>Your Markdown is<br />already <em>a database.</em></h1>
+
+    <p class="tagline">
+      Interval-indexed block storage for Markdown — query it with <b>SQL</b> or <b>mq</b>,
+      persist it to a compact page-file format. No SQLite dependency.
+    </p>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="dots"><span></span><span></span><span></span></div>
+        <div class="label">sql&gt; everything nested under a heading</div>
+        <div class="tag">under()</div>
+      </div>
+      <pre><span class="cm">-- all text/code nested under the "Architecture" heading</span>
+<span class="kw">SELECT</span> b.block_type, b.content <span class="kw">FROM</span> blocks b
+<span class="kw">WHERE</span> under(b.pre, b.post,
+  (<span class="kw">SELECT</span> pre  <span class="kw">FROM</span> blocks <span class="kw">WHERE</span> block_type = <span class="str">'heading'</span> <span class="kw">AND</span> content = <span class="str">'Architecture'</span>),
+  (<span class="kw">SELECT</span> post <span class="kw">FROM</span> blocks <span class="kw">WHERE</span> block_type = <span class="str">'heading'</span> <span class="kw">AND</span> content = <span class="str">'Architecture'</span>))
+<span class="kw">ORDER BY</span> b.pre;</pre>
+    </div>
+  </div>
+</body>
+</html>

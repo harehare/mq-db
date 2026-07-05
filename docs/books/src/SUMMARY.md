@@ -1,0 +1,18 @@
+# Summary
+
+- [Introduction](index.md)
+- [Getting Started](start/index.md)
+  - [Install](start/install.md)
+  - [CLI](start/cli.md)
+  - [REPL](start/repl.md)
+  - [TUI](start/tui.md)
+  - [HTTP Server](start/http-server.md)
+  - [Library API (Rust)](start/library.md)
+- [Reference](reference/index.md)
+  - [Virtual Schema](reference/sql-schema.md)
+  - [Built-in Functions](reference/sql-functions.md)
+  - [DDL Statements](reference/sql-ddl.md)
+  - [Example Queries](reference/sql-examples.md)
+  - [Block Model](reference/block-model.md)
+  - [Index Layers](reference/index-layers.md)
+  - [Storage Format](reference/storage-format.md)

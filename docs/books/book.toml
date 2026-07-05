@@ -1,0 +1,20 @@
+[book]
+authors = ["Takahiro Sato"]
+description = "mq-db documentation: a Markdown-specialized embedded database with interval-indexed block storage, queryable with SQL or mq."
+language = "en"
+src = "src"
+title = "mq-db - a Markdown-specialized embedded database"
+
+[output.html]
+additional-css = ["theme/custom.css"]
+additional-js = ["theme/highlight-mq.js"]
+default-theme = "coal"
+git-repository-url = "https://github.com/harehare/mq-db"
+no-section-label = true
+preferred-dark-theme = "coal"
+site-url = "/book"
+smart-punctuation = true
+
+[output.html.fold]
+enable = true
+level = 1

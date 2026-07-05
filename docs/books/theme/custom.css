@@ -1,0 +1,392 @@
+/* mq-db theme — matching docs/index.html (paper / ink / accent / mark) */
+
+:root {
+    /* mq-db brand colors — light ("paper" manuscript) */
+    --mqdb-paper: #faf6ef;
+    --mqdb-paper-alt: #f2ebdb;
+    --mqdb-paper-deep: #e2d6bf;
+    --mqdb-ink: #2a2420;
+    --mqdb-ink-dim: #71685d;
+    --mqdb-accent: #b3402c;
+    --mqdb-accent-hover: #9c3625;
+    --mqdb-accent-dim: #e3c3b7;
+    --mqdb-mark: #9c6f18;
+    --mqdb-code-bg: #f2ebdb;
+    --mqdb-code-bg-inline: #e3c3b7;
+
+    --bg: var(--mqdb-paper);
+    --fg: var(--mqdb-ink);
+    --sidebar-bg: var(--mqdb-paper-alt);
+    --sidebar-fg: var(--mqdb-ink);
+    --sidebar-non-existent: var(--mqdb-ink-dim);
+    --sidebar-active: var(--mqdb-accent);
+    --sidebar-spacer: var(--mqdb-paper-deep);
+    --scrollbar: var(--mqdb-paper-deep);
+    --icons: var(--mqdb-ink-dim);
+    --icons-hover: var(--mqdb-accent);
+    --links: var(--mqdb-accent);
+    --inline-code-color: var(--mqdb-accent-hover);
+    --theme-popup-bg: var(--mqdb-paper);
+    --theme-popup-border: var(--mqdb-paper-deep);
+    --theme-hover: var(--mqdb-paper-deep);
+    --quote-bg: var(--mqdb-paper-alt);
+    --quote-border: var(--mqdb-accent);
+    --table-border-color: var(--mqdb-paper-deep);
+    --table-header-bg: var(--mqdb-paper-alt);
+    --table-alternate-bg: var(--mqdb-paper-alt);
+    --searchbar-border-color: var(--mqdb-paper-deep);
+    --searchbar-bg: var(--mqdb-paper);
+    --searchbar-fg: var(--mqdb-ink);
+    --searchbar-shadow-color: rgba(42, 36, 32, 0.1);
+    --searchresults-header-fg: var(--mqdb-ink-dim);
+    --searchresults-border-color: var(--mqdb-paper-deep);
+    --searchresults-li-bg: var(--mqdb-paper);
+    --search-mark-bg: var(--mqdb-mark);
+    --color-scheme: light;
+    --content-max-width: 900px;
+}
+
+.coal {
+    /* mq-db brand colors — dark ("manuscript by candlelight") */
+    --mqdb-paper: #1b1714;
+    --mqdb-paper-alt: #231e1a;
+    --mqdb-paper-deep: #383028;
+    --mqdb-ink: #ece4d8;
+    --mqdb-ink-dim: #a89c8c;
+    --mqdb-accent: #d9714f;
+    --mqdb-accent-hover: #e68c6c;
+    --mqdb-accent-dim: #4a2e24;
+    --mqdb-mark: #d6a84c;
+    --mqdb-code-bg: #231e1a;
+    --mqdb-code-bg-inline: #383028;
+
+    --bg: var(--mqdb-paper);
+    --fg: var(--mqdb-ink);
+    --sidebar-bg: var(--mqdb-paper-alt);
+    --sidebar-fg: var(--mqdb-ink-dim);
+    --sidebar-non-existent: var(--mqdb-ink-dim);
+    --sidebar-active: var(--mqdb-accent);
+    --sidebar-spacer: var(--mqdb-paper-deep);
+    --scrollbar: var(--mqdb-paper-deep);
+    --icons: var(--mqdb-ink-dim);
+    --icons-hover: var(--mqdb-accent);
+    --links: var(--mqdb-accent);
+    --inline-code-color: var(--mqdb-accent);
+    --theme-popup-bg: var(--mqdb-paper-alt);
+    --theme-popup-border: var(--mqdb-paper-deep);
+    --theme-hover: var(--mqdb-paper-deep);
+    --quote-bg: var(--mqdb-code-bg);
+    --quote-border: var(--mqdb-accent);
+    --table-border-color: var(--mqdb-paper-deep);
+    --table-header-bg: var(--mqdb-paper-deep);
+    --table-alternate-bg: var(--mqdb-code-bg);
+    --searchbar-border-color: var(--mqdb-paper-deep);
+    --searchbar-bg: var(--mqdb-code-bg);
+    --searchbar-fg: var(--mqdb-ink);
+    --searchbar-shadow-color: rgba(0, 0, 0, 0.35);
+    --searchresults-header-fg: var(--mqdb-ink-dim);
+    --searchresults-border-color: var(--mqdb-paper-deep);
+    --searchresults-li-bg: var(--mqdb-code-bg);
+    --search-mark-bg: var(--mqdb-accent);
+    --color-scheme: dark;
+}
+
+/* Global font */
+html,
+body {
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* Menu bar */
+#menu-bar {
+    background-color: rgba(250, 246, 239, 0.9);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid rgba(226, 214, 191, 0.6);
+}
+
+.coal #menu-bar {
+    background-color: rgba(27, 23, 20, 0.9);
+    border-bottom: 1px solid rgba(56, 48, 40, 0.6);
+}
+
+/* Title — Space Grotesk, matching index.html hero */
+.menu-title {
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 700;
+    font-size: 1.15em;
+    letter-spacing: -0.02em;
+    color: var(--mqdb-accent);
+    transition: opacity 0.2s;
+}
+
+.menu-title:hover {
+    opacity: 0.85;
+}
+
+/* Sidebar */
+.sidebar {
+    background-color: var(--sidebar-bg);
+    border-right: 1px solid var(--sidebar-spacer);
+}
+
+.sidebar .sidebar-scrollbox {
+    padding-top: 0;
+}
+
+.sidebar .sidebar-scrollbox::before {
+    content: "";
+    display: block;
+    width: 44px;
+    height: 44px;
+    margin: 18px auto 20px;
+    background-image: url("../images/logo.svg");
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+}
+
+.chapter-item {
+    padding: 4px 12px;
+    font-family: "Inter", sans-serif;
+}
+
+.chapter-item > a.active {
+    color: var(--sidebar-active);
+    font-weight: 600;
+}
+
+.chapter-item > a:hover {
+    background-color: rgba(179, 64, 44, 0.08);
+    border-radius: 4px;
+}
+
+/* Content */
+.page {
+    background-color: var(--bg);
+    color: var(--fg);
+}
+
+.content {
+    font-family: "Inter", sans-serif;
+    line-height: 1.7;
+}
+
+/* Headings — Space Grotesk, matching index.html */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--mqdb-accent);
+}
+
+h1 {
+    font-size: 2.1em;
+    margin-bottom: 1rem;
+}
+
+h2 {
+    font-size: 1.5em;
+    margin-top: 2rem;
+    margin-bottom: 0.75rem;
+}
+
+h3 {
+    font-size: 1.2em;
+    margin-top: 1.5rem;
+    margin-bottom: 0.5rem;
+}
+
+/* Links */
+a {
+    color: var(--links);
+    transition: color 0.2s;
+}
+
+a:hover {
+    color: var(--mqdb-accent-hover);
+    text-decoration: underline;
+}
+
+/* Code blocks */
+pre {
+    background-color: var(--quote-bg);
+    border: 1px solid var(--table-border-color);
+    border-radius: 4px;
+    padding: 1rem;
+}
+
+.coal pre {
+    background-color: var(--mqdb-code-bg) !important;
+    border-color: var(--mqdb-paper-deep);
+}
+
+/* inline code only — not code inside pre */
+:not(pre) > code {
+    display: inline;
+    font-family: "JetBrains Mono", "Consolas", "Monaco", monospace;
+    background-color: var(--mqdb-code-bg-inline);
+    color: var(--inline-code-color);
+    border-radius: 3px;
+    padding: 2px 6px;
+    white-space: normal;
+}
+
+pre code {
+    font-family: "JetBrains Mono", "Consolas", "Monaco", monospace;
+    padding: 0;
+    background-color: transparent;
+    border-radius: 0;
+}
+
+/* Blockquotes */
+blockquote {
+    background-color: var(--quote-bg);
+    border-left: 3px solid var(--quote-border);
+    margin: 1.5rem 0;
+    padding: 0.75rem 1.25rem;
+    border-radius: 0 4px 4px 0;
+    color: var(--mqdb-ink-dim);
+}
+
+/* Tables */
+table {
+    border-collapse: collapse;
+    margin: 1.5rem 0;
+    width: 100%;
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+table th {
+    background-color: var(--table-header-bg);
+    border: 1px solid var(--table-border-color);
+    padding: 10px 14px;
+    text-align: left;
+    font-weight: 600;
+    font-family: "Inter", sans-serif;
+    font-size: 0.82em;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--mqdb-ink-dim);
+}
+
+table td {
+    border: 1px solid var(--table-border-color);
+    padding: 10px 14px;
+}
+
+table td code {
+    white-space: nowrap;
+}
+
+table tbody tr:nth-child(even) {
+    background-color: var(--table-alternate-bg);
+}
+
+table tbody tr:hover {
+    background-color: var(--theme-hover);
+}
+
+/* Search */
+#searchbar {
+    border: 1px solid var(--searchbar-border-color);
+    background-color: var(--searchbar-bg);
+    color: var(--searchbar-fg);
+    border-radius: 4px;
+    font-family: "Inter", sans-serif;
+}
+
+#searchbar:focus {
+    border-color: var(--mqdb-accent);
+    box-shadow: 0 0 0 2px rgba(179, 64, 44, 0.2);
+    outline: none;
+}
+
+/* Navigation arrows */
+.nav-chapters a {
+    color: var(--mqdb-accent);
+    background-color: rgba(179, 64, 44, 0.06);
+    border-radius: 4px;
+    padding: 10px 14px;
+    transition: all 0.2s;
+    border: 1px solid rgba(179, 64, 44, 0.15);
+}
+
+.nav-chapters a:hover {
+    background-color: var(--mqdb-accent);
+    color: var(--mqdb-paper);
+    text-decoration: none;
+}
+
+/* Icon buttons */
+.icon-button {
+    transition: color 0.2s;
+}
+
+.icon-button:hover {
+    color: var(--mqdb-accent) !important;
+}
+
+/* Theme popup */
+#theme-list {
+    border-radius: 4px;
+    border: 1px solid var(--theme-popup-border);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--scrollbar);
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--mqdb-accent);
+}
+
+/* Selection */
+::selection {
+    background-color: var(--mqdb-accent);
+    color: var(--mqdb-paper);
+}
+
+/* Syntax highlighting — scoped per theme */
+.coal .hljs {
+    display: block;
+    overflow-x: auto;
+    background: var(--mqdb-code-bg) !important;
+    color: var(--mqdb-ink);
+    padding: 1rem;
+    border-radius: 4px;
+}
+
+.coal :not(pre) > .hljs {
+    display: inline;
+    overflow-x: initial;
+    background: var(--mqdb-code-bg-inline) !important;
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+}
+
+.light .hljs,
+html:not(.js) .hljs {
+    display: block;
+    overflow-x: auto;
+    background: var(--mqdb-paper-alt) !important;
+    padding: 1rem;
+    border-radius: 4px;
+}

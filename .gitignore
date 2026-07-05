@@ -3,4 +3,5 @@ target
 *.mq-db
 .DS_Store
 /work
+book
 

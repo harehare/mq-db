@@ -37,7 +37,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="preconnect" href="https://cdn.tailwindcss.com" />
     <link
-      href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,400;0,500;0,600;0,700;0,900;1,400;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap"
       rel="stylesheet"
     />
     <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
@@ -63,7 +63,7 @@
               mark: withOpacity("--c-mark"),
             },
             fontFamily: {
-              headline: ["Fraunces", "serif"],
+              headline: ["Space Grotesk", "sans-serif"],
               body: ["Inter", "sans-serif"],
               mono: ["JetBrains Mono", "monospace"],
             },
@@ -125,7 +125,7 @@
         animation: fadeUp 0.6s ease-out both;
       }
       .drop-cap::first-letter {
-        font-family: "Fraunces", serif;
+        font-family: "Space Grotesk", sans-serif;
         font-weight: 700;
         font-size: 3.4em;
         line-height: 0.82;
@@ -180,6 +180,7 @@
           <a class="text-ink-dim hover:text-accent transition-colors" href="#query">Query</a>
           <a class="text-ink-dim hover:text-accent transition-colors" href="#features">Index</a>
           <a class="text-ink-dim hover:text-accent transition-colors" href="#install">Install</a>
+          <a class="text-ink-dim hover:text-accent transition-colors" href="./book/">Docs</a>
         </div>
         <div class="flex items-center gap-4 text-xs font-body uppercase tracking-widest">
           <a href="https://crates.io/crates/mq-db" target="_blank" class="text-ink-dim hover:text-accent transition-colors hidden sm:inline"
@@ -202,7 +203,7 @@
         <div class="relative max-w-[1200px] mx-auto px-6">
           <h1 class="text-4xl sm:text-5xl font-headline font-semibold tracking-tight leading-[1.1] mb-6 max-w-3xl fade-up">
             Your Markdown<br />
-            is already <em class="italic text-accent">a database.</em>
+            is already <em class="not-italic text-accent">a database.</em>
           </h1>
           <p class="text-lg text-ink-dim max-w-2xl mb-10 leading-relaxed fade-up">
             mq-db parses Markdown into a flat block list with an interval
@@ -538,10 +539,11 @@
     <!-- Footer / Colophon -->
     <footer class="border-t border-paper-deep py-10">
       <div class="max-w-[1200px] mx-auto px-6 text-center">
-        <p class="italic font-headline text-sm text-ink-dim mb-4">
-          Set in Fraunces, Inter &amp; JetBrains Mono &middot; MIT licensed &middot; &copy; 2026 mq-db
+        <p class="font-headline text-sm text-ink-dim mb-4">
+          Set in Space Grotesk, Inter &amp; JetBrains Mono &middot; MIT licensed &middot; &copy; 2026 mq-db
         </p>
         <div class="flex justify-center gap-8 text-xs font-body uppercase tracking-widest text-ink-dim">
+          <a class="hover:text-accent transition-colors" href="./book/">docs</a>
           <a class="hover:text-accent transition-colors" href="https://github.com/harehare/mq-db" target="_blank">github</a>
           <a class="hover:text-accent transition-colors" href="https://crates.io/crates/mq-db" target="_blank">crates.io</a>
           <a class="hover:text-accent transition-colors" href="https://github.com/harehare/mq-db/blob/main/LICENSE" target="_blank">license</a>
