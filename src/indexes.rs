@@ -270,7 +270,10 @@ impl DocumentIndex {
         out.extend_from_slice(&(content_entries.len() as u32).to_le_bytes());
         for (key, indices) in &content_entries {
             let kb = key.as_bytes();
-            out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+            // Block content is unbounded (e.g. a large code block or table cell can
+            // exceed 64KB), so the length prefix must be u32 — a u16 here would
+            // silently wrap and desync the rest of the index stream.
+            out.extend_from_slice(&(kb.len() as u32).to_le_bytes());
             out.extend_from_slice(kb);
             out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
             for &idx in indices.iter() {
@@ -284,7 +287,7 @@ impl DocumentIndex {
         out.extend_from_slice(&(lang_entries.len() as u32).to_le_bytes());
         for (key, indices) in &lang_entries {
             let kb = key.as_bytes();
-            out.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+            out.extend_from_slice(&(kb.len() as u32).to_le_bytes());
             out.extend_from_slice(kb);
             out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
             for &idx in indices.iter() {
@@ -318,17 +321,6 @@ impl DocumentIndex {
                 }
                 let v = data[pos];
                 pos += 1;
-                v
-            }};
-        }
-        macro_rules! read_u16 {
-            () => {{
-                let end = pos + 2;
-                if end > data.len() {
-                    return Err(MqdbError::Storage("unexpected end of index data".into()));
-                }
-                let v = u16::from_le_bytes(data[pos..end].try_into().unwrap());
-                pos = end;
                 v
             }};
         }
@@ -391,7 +383,7 @@ impl DocumentIndex {
         let num_content = read_u32!() as usize;
         let mut by_content: HashMap<String, Vec<u32>> = HashMap::new();
         for _ in 0..num_content {
-            let key_len = read_u16!() as usize;
+            let key_len = read_u32!() as usize;
             let key = read_str!(key_len);
             let count = read_u32!() as usize;
             let mut indices = Vec::with_capacity(count);
@@ -405,7 +397,7 @@ impl DocumentIndex {
         let num_lang = read_u32!() as usize;
         let mut by_lang: HashMap<String, Vec<u32>> = HashMap::new();
         for _ in 0..num_lang {
-            let key_len = read_u16!() as usize;
+            let key_len = read_u32!() as usize;
             let key = read_str!(key_len);
             let count = read_u32!() as usize;
             let mut indices = Vec::with_capacity(count);
