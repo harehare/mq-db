@@ -156,7 +156,8 @@ impl Storage {
         entries: &[CatalogEntry],
         custom_tables: &[CustomTableEntry],
     ) -> Result<(), MqdbError> {
-        write_catalog(&mut self.page_file, entries, custom_tables)
+        write_catalog(&mut self.page_file, entries, custom_tables)?;
+        self.page_file.sync_header()
     }
 
     /// Read the catalog.
