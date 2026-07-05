@@ -151,6 +151,22 @@
       .manuscript-row:last-child {
         border-bottom: none;
       }
+      pre.overflow-x-auto {
+        -webkit-mask-image: none;
+        mask-image: none;
+      }
+      pre.overflow-x-auto[data-fade="right"] {
+        -webkit-mask-image: linear-gradient(to right, black calc(100% - 28px), transparent 100%);
+        mask-image: linear-gradient(to right, black calc(100% - 28px), transparent 100%);
+      }
+      pre.overflow-x-auto[data-fade="left"] {
+        -webkit-mask-image: linear-gradient(to right, transparent 0, black 28px);
+        mask-image: linear-gradient(to right, transparent 0, black 28px);
+      }
+      pre.overflow-x-auto[data-fade="both"] {
+        -webkit-mask-image: linear-gradient(to right, transparent 0, black 28px, black calc(100% - 28px), transparent 100%);
+        mask-image: linear-gradient(to right, transparent 0, black 28px, black calc(100% - 28px), transparent 100%);
+      }
     </style>
     <script type="application/ld+json">
       {
@@ -193,6 +209,34 @@
           >
             GitHub
           </a>
+          <button
+            id="mobile-menu-button"
+            type="button"
+            aria-expanded="false"
+            aria-controls="mobile-menu"
+            aria-label="Toggle navigation menu"
+            class="md:hidden flex items-center justify-center h-8 w-8 -mr-1.5 text-ink hover:text-accent transition-colors"
+          >
+            <svg id="mobile-menu-icon-open" xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <line x1="3" y1="6" x2="21" y2="6"></line>
+              <line x1="3" y1="12" x2="21" y2="12"></line>
+              <line x1="3" y1="18" x2="21" y2="18"></line>
+            </svg>
+            <svg id="mobile-menu-icon-close" xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
+      </div>
+      <div id="mobile-menu" class="hidden md:hidden border-t border-paper-deep bg-paper">
+        <div class="flex flex-col px-6 py-3 text-xs font-body uppercase tracking-widest">
+          <a class="mobile-nav-link py-2.5 text-ink-dim hover:text-accent transition-colors" href="#anatomy">Anatomy</a>
+          <a class="mobile-nav-link py-2.5 text-ink-dim hover:text-accent transition-colors" href="#why-mqdb">Why mq-db</a>
+          <a class="mobile-nav-link py-2.5 text-ink-dim hover:text-accent transition-colors" href="#query">Query</a>
+          <a class="mobile-nav-link py-2.5 text-ink-dim hover:text-accent transition-colors" href="#features">Index</a>
+          <a class="mobile-nav-link py-2.5 text-ink-dim hover:text-accent transition-colors" href="#install">Install</a>
+          <a class="mobile-nav-link py-2.5 text-ink-dim hover:text-accent transition-colors" href="./book/">Docs</a>
         </div>
       </div>
     </nav>
@@ -317,7 +361,7 @@
 <span class="text-accent">ORDER BY</span> b.pre;</pre>
             </div>
             <p class="text-xs italic text-ink-dim mt-3 mb-6">fig. 1 — scoping a query to everything nested under a heading, via a single interval comparison.</p>
-            <div class="grid sm:grid-cols-3 gap-4 text-sm">
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
               <div class="border-t-2 border-accent pt-3">
                 <p class="font-body font-semibold text-ink mb-1 text-xs uppercase tracking-wide">O(1) ancestry</p>
                 <p class="text-xs text-ink-dim leading-relaxed">
@@ -350,7 +394,7 @@
             plain virtual tables — join them like any relational schema, plus
             self-joins over the interval index for structural checks.
           </p>
-          <div class="grid md:grid-cols-2 gap-x-6 gap-y-10">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-10">
             <div>
               <div class="border border-paper-deep rounded-lg bg-paper overflow-hidden">
                 <div class="flex items-center justify-between px-4 py-2.5 border-b border-paper-deep text-xs font-body text-ink-dim">
@@ -566,6 +610,47 @@
       }
 
       document.addEventListener("DOMContentLoaded", () => {
+        const menuButton = document.getElementById("mobile-menu-button");
+        const menu = document.getElementById("mobile-menu");
+        const menuIconOpen = document.getElementById("mobile-menu-icon-open");
+        const menuIconClose = document.getElementById("mobile-menu-icon-close");
+
+        function setMenuOpen(isOpen) {
+          menu.classList.toggle("hidden", !isOpen);
+          menuIconOpen.classList.toggle("hidden", isOpen);
+          menuIconClose.classList.toggle("hidden", !isOpen);
+          menuButton.setAttribute("aria-expanded", String(isOpen));
+        }
+
+        menuButton.addEventListener("click", () => {
+          setMenuOpen(menu.classList.contains("hidden"));
+        });
+
+        menu.querySelectorAll(".mobile-nav-link").forEach((link) => {
+          link.addEventListener("click", () => setMenuOpen(false));
+        });
+
+        function updateCodeFade(pre) {
+          const canScrollLeft = pre.scrollLeft > 1;
+          const canScrollRight = pre.scrollLeft + pre.clientWidth < pre.scrollWidth - 1;
+          if (canScrollLeft && canScrollRight) {
+            pre.setAttribute("data-fade", "both");
+          } else if (canScrollRight) {
+            pre.setAttribute("data-fade", "right");
+          } else if (canScrollLeft) {
+            pre.setAttribute("data-fade", "left");
+          } else {
+            pre.removeAttribute("data-fade");
+          }
+        }
+
+        const scrollableCodeBlocks = document.querySelectorAll("pre.overflow-x-auto");
+        scrollableCodeBlocks.forEach((pre) => {
+          updateCodeFade(pre);
+          pre.addEventListener("scroll", () => updateCodeFade(pre), { passive: true });
+        });
+        window.addEventListener("resize", () => scrollableCodeBlocks.forEach(updateCodeFade));
+
         const tabButtons = document.querySelectorAll(".tab-button");
         const tabContents = document.querySelectorAll(".tab-content");
 
