@@ -19,6 +19,28 @@ use ratatui::{
 use crate::{DocumentStore, MqEngine, MqdbError, SqlEngine, block::BlockType};
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Theme — mirrors the warm paper/ink/accent palette of docs/index.html
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod theme {
+    use ratatui::style::Color;
+
+    pub const PAPER: Color = Color::Rgb(27, 23, 20);
+    pub const PAPER_ALT: Color = Color::Rgb(35, 30, 26);
+    pub const PAPER_DEEP: Color = Color::Rgb(56, 48, 40);
+    pub const INK: Color = Color::Rgb(236, 228, 216);
+    pub const INK_DIM: Color = Color::Rgb(168, 156, 140);
+    pub const ACCENT: Color = Color::Rgb(217, 113, 79);
+    pub const ACCENT_DIM: Color = Color::Rgb(74, 46, 36);
+    pub const MARK: Color = Color::Rgb(214, 168, 76);
+    pub const ERROR: Color = Color::Rgb(224, 90, 90);
+    pub const SAGE: Color = Color::Rgb(150, 168, 111);
+    pub const LAVENDER: Color = Color::Rgb(163, 140, 173);
+    pub const TEAL: Color = Color::Rgb(122, 170, 163);
+    pub const DUSK: Color = Color::Rgb(140, 150, 191);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -120,14 +142,14 @@ impl App {
                     Err(e) => {
                         self.result_lines = vec![ResultLine::styled(
                             format!("error: {}", e),
-                            Style::default().fg(Color::Red),
+                            Style::default().fg(theme::ERROR),
                         )];
                     }
                 },
                 Err(e) => {
                     self.result_lines = vec![ResultLine::styled(
                         format!("engine error: {}", e),
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(theme::ERROR),
                     )];
                 }
             },
@@ -136,7 +158,7 @@ impl App {
                     if lines.is_empty() {
                         self.result_lines = vec![ResultLine::styled(
                             "(no results)".to_string(),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(theme::INK_DIM),
                         )];
                     } else {
                         self.result_lines = lines.iter().map(ResultLine::plain).collect();
@@ -150,7 +172,7 @@ impl App {
                 Err(e) => {
                     self.result_lines = vec![ResultLine::styled(
                         format!("error: {}", e),
-                        Style::default().fg(Color::Red),
+                        Style::default().fg(theme::ERROR),
                     )];
                 }
             },
@@ -176,23 +198,23 @@ impl App {
         lines.push(ResultLine::styled(
             path,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ));
         if let Some(title) = &doc.zone_maps.title {
             lines.push(ResultLine::styled(
                 format!("  title   {}", title),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme::INK),
             ));
         }
         lines.push(ResultLine::styled(
             format!("  blocks  {}", doc.blocks.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::INK_DIM),
         ));
         if !doc.zone_maps.tags.is_empty() {
             lines.push(ResultLine::styled(
                 format!("  tags    {}", doc.zone_maps.tags.join(", ")),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::MARK),
             ));
         }
         lines.push(ResultLine::plain(String::new()));
@@ -200,7 +222,7 @@ impl App {
         // Header
         lines.push(ResultLine::styled(
             format!("  {:<4}  {:<4}  {:<14}  content", "pre", "post", "type"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::INK_DIM),
         ));
         lines.push(ResultLine::styled(
             format!(
@@ -210,7 +232,7 @@ impl App {
                 "──────────────",
                 "─".repeat(40)
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::PAPER_DEEP),
         ));
 
         for block in &doc.blocks {
@@ -309,21 +331,21 @@ fn block_display(bt: &BlockType, depth: Option<u8>) -> (&'static str, String, Co
         BlockType::Heading => {
             let icon = "#";
             let label = format!("H{}", depth.unwrap_or(1));
-            (icon, label, Color::Cyan)
+            (icon, label, theme::ACCENT)
         }
-        BlockType::Paragraph => ("¶", "paragraph".to_string(), Color::White),
-        BlockType::Code => ("{}", "code".to_string(), Color::Yellow),
-        BlockType::List => ("•", "list".to_string(), Color::Green),
-        BlockType::Blockquote => ("❝", "blockquote".to_string(), Color::Magenta),
+        BlockType::Paragraph => ("¶", "paragraph".to_string(), theme::INK),
+        BlockType::Code => ("{}", "code".to_string(), theme::MARK),
+        BlockType::List => ("•", "list".to_string(), theme::SAGE),
+        BlockType::Blockquote => ("❝", "blockquote".to_string(), theme::LAVENDER),
         BlockType::TableCell | BlockType::TableRow | BlockType::TableAlign => {
-            ("▦", "table".to_string(), Color::Blue)
+            ("▦", "table".to_string(), theme::TEAL)
         }
-        BlockType::Yaml | BlockType::Toml => ("≡", "frontmatter".to_string(), Color::LightBlue),
-        BlockType::Html => ("<>", "html".to_string(), Color::DarkGray),
-        BlockType::HorizontalRule => ("─", "hr".to_string(), Color::DarkGray),
-        BlockType::Math => ("∑", "math".to_string(), Color::LightMagenta),
-        BlockType::Definition => ("§", "definition".to_string(), Color::DarkGray),
-        BlockType::Footnote => ("†", "footnote".to_string(), Color::DarkGray),
+        BlockType::Yaml | BlockType::Toml => ("≡", "frontmatter".to_string(), theme::INK_DIM),
+        BlockType::Html => ("<>", "html".to_string(), theme::INK_DIM),
+        BlockType::HorizontalRule => ("─", "hr".to_string(), theme::PAPER_DEEP),
+        BlockType::Math => ("∑", "math".to_string(), theme::DUSK),
+        BlockType::Definition => ("§", "definition".to_string(), theme::INK_DIM),
+        BlockType::Footnote => ("†", "footnote".to_string(), theme::INK_DIM),
     }
 }
 
@@ -409,6 +431,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme::PAPER).fg(theme::INK)),
+        area,
+    );
+
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -455,8 +482,8 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(text).style(
             Style::default()
-                .bg(Color::Rgb(43, 87, 115))
-                .fg(Color::White)
+                .bg(theme::ACCENT)
+                .fg(theme::PAPER)
                 .add_modifier(Modifier::BOLD),
         ),
         area,
@@ -489,11 +516,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         msg,
     );
     f.render_widget(
-        Paragraph::new(total).style(
-            Style::default()
-                .bg(Color::Rgb(30, 30, 30))
-                .fg(Color::DarkGray),
-        ),
+        Paragraph::new(total).style(Style::default().bg(theme::PAPER_ALT).fg(theme::INK_DIM)),
         area,
     );
 }
@@ -515,9 +538,7 @@ fn render_doc_list(f: &mut Frame, app: &mut App, area: Rect) {
 
             let name_line = Line::from(vec![Span::styled(
                 filename,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme::INK).add_modifier(Modifier::BOLD),
             )]);
             let meta_line = Line::from(vec![Span::styled(
                 format!(
@@ -529,7 +550,7 @@ fn render_doc_list(f: &mut Frame, app: &mut App, area: Rect) {
                         format!("  {}", title.chars().take(18).collect::<String>())
                     }
                 ),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::INK_DIM),
             )]);
 
             ListItem::new(vec![name_line, meta_line])
@@ -537,13 +558,21 @@ fn render_doc_list(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(Span::styled(
-            " Documents ",
-            Style::default().fg(Color::Cyan),
-        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::PAPER_DEEP))
+                .title(Span::styled(
+                    " Documents ",
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        )
         .highlight_style(
             Style::default()
-                .bg(Color::Rgb(50, 70, 90))
+                .bg(theme::ACCENT_DIM)
+                .fg(theme::INK)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");
@@ -553,16 +582,16 @@ fn render_doc_list(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_input(f: &mut Frame, app: &App, area: Rect) {
     let border_style = if app.input_focused {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme::MARK)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme::PAPER_DEEP)
     };
     let title_style = if app.input_focused {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(theme::MARK)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme::INK_DIM)
     };
     let title = format!(" {} ", app.mode.label());
 
@@ -578,16 +607,13 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
     let spans = if app.input_focused {
         vec![
             Span::raw(before_cursor),
-            Span::styled(
-                at_cursor,
-                Style::default().bg(Color::Yellow).fg(Color::Black),
-            ),
+            Span::styled(at_cursor, Style::default().bg(theme::MARK).fg(theme::PAPER)),
             Span::raw(after_cursor),
         ]
     } else {
         vec![Span::styled(
             app.input.clone(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::INK_DIM),
         )]
     };
 
@@ -613,7 +639,13 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(Span::styled(" Results ", Style::default().fg(Color::Cyan))),
+                .border_style(Style::default().fg(theme::PAPER_DEEP))
+                .title(Span::styled(
+                    " Results ",
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                )),
         )
         .wrap(Wrap { trim: false })
         .scroll((app.result_scroll, 0));
