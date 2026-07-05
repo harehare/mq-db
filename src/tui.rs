@@ -526,7 +526,7 @@ fn render_doc_list(f: &mut Frame, app: &mut App, area: Rect) {
                     if title.is_empty() {
                         String::new()
                     } else {
-                        format!("  {}", &title[..title.len().min(18)])
+                        format!("  {}", title.chars().take(18).collect::<String>())
                     }
                 ),
                 Style::default().fg(Color::DarkGray),

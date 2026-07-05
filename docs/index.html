@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="./assets/logo.svg" />
+    <title>mq-db – a Markdown-specialized embedded database in Rust</title>
+    <meta
+      name="description"
+      content="mq-db treats Markdown documents as structured, hierarchical databases. An interval index (Nested Set / Pre-Post Order) gives O(1) section hierarchy queries, queryable with SQL or mq and persisted to a compact custom page-file format."
+    />
+    <link rel="canonical" href="https://harehare.github.io/mq-db/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://harehare.github.io/mq-db/" />
+    <meta property="og:site_name" content="mq-db" />
+    <meta
+      property="og:title"
+      content="mq-db – a Markdown-specialized embedded database in Rust"
+    />
+    <meta
+      property="og:description"
+      content="Interval-indexed block storage for Markdown, queryable with SQL or mq. O(1) hierarchy queries, zone-map pruning, a compact custom page format."
+    />
+    <meta property="og:image" content="https://harehare.github.io/mq-db/assets/ogp.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="mq-db – a Markdown-specialized embedded database in Rust" />
+    <meta
+      name="twitter:description"
+      content="Interval-indexed block storage for Markdown, queryable with SQL or mq. O(1) hierarchy queries, zone-map pruning, a compact custom page format."
+    />
+    <meta name="twitter:image" content="https://harehare.github.io/mq-db/assets/ogp.png" />
+    <meta name="theme-color" content="#faf6ef" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#1b1714" media="(prefers-color-scheme: dark)" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="preconnect" href="https://cdn.tailwindcss.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,400;0,500;0,600;0,700;0,900;1,400;1,500;1,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <script id="tailwind-config">
+      function withOpacity(varName) {
+        return ({ opacityValue }) =>
+          opacityValue !== undefined
+            ? `rgb(var(${varName}) / ${opacityValue})`
+            : `rgb(var(${varName}))`;
+      }
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              paper: withOpacity("--c-paper"),
+              "paper-alt": withOpacity("--c-paper-alt"),
+              "paper-deep": withOpacity("--c-paper-deep"),
+              ink: withOpacity("--c-ink"),
+              "ink-dim": withOpacity("--c-ink-dim"),
+              accent: withOpacity("--c-accent"),
+              "accent-hover": withOpacity("--c-accent-hover"),
+              "accent-dim": withOpacity("--c-accent-dim"),
+              mark: withOpacity("--c-mark"),
+            },
+            fontFamily: {
+              headline: ["Fraunces", "serif"],
+              body: ["Inter", "sans-serif"],
+              mono: ["JetBrains Mono", "monospace"],
+            },
+            borderRadius: {
+              DEFAULT: "0.125rem",
+              lg: "0.2rem",
+            },
+          },
+        },
+      };
+    </script>
+    <style>
+      :root {
+        --c-paper: 250 246 239;
+        --c-paper-alt: 242 235 219;
+        --c-paper-deep: 226 214 191;
+        --c-ink: 42 36 32;
+        --c-ink-dim: 113 104 93;
+        --c-accent: 179 64 44;
+        --c-accent-hover: 156 54 37;
+        --c-accent-dim: 227 195 183;
+        --c-mark: 156 111 24;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --c-paper: 27 23 20;
+          --c-paper-alt: 35 30 26;
+          --c-paper-deep: 56 48 40;
+          --c-ink: 236 228 216;
+          --c-ink-dim: 168 156 140;
+          --c-accent: 217 113 79;
+          --c-accent-hover: 230 140 108;
+          --c-accent-dim: 74 46 36;
+          --c-mark: 214 168 76;
+        }
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        background-image: radial-gradient(rgb(var(--c-ink) / 0.035) 1px, transparent 1.2px);
+        background-size: 3px 3px;
+      }
+      ::selection {
+        background: rgb(var(--c-accent));
+        color: rgb(var(--c-paper));
+      }
+      @keyframes fadeUp {
+        from {
+          opacity: 0;
+          transform: translateY(8px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+      .fade-up {
+        animation: fadeUp 0.6s ease-out both;
+      }
+      .drop-cap::first-letter {
+        font-family: "Fraunces", serif;
+        font-weight: 700;
+        font-size: 3.4em;
+        line-height: 0.82;
+        float: left;
+        padding-right: 0.09em;
+        padding-top: 0.03em;
+        color: rgb(var(--c-accent));
+      }
+      .leader {
+        flex: 1 1 auto;
+        border-bottom: 1px dotted rgb(var(--c-paper-deep));
+        transform: translateY(-0.35em);
+        min-width: 1rem;
+      }
+      .manuscript-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 0.75rem 1rem;
+        align-items: baseline;
+        padding: 0.55rem 0;
+        border-bottom: 1px solid rgb(var(--c-paper-deep) / 0.6);
+      }
+      .manuscript-row:last-child {
+        border-bottom: none;
+      }
+    </style>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "mq-db",
+        "description": "A Markdown-specialized embedded database with interval-indexed block storage, queryable with SQL or the mq query language, written in Rust.",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Linux, macOS, Windows",
+        "codeRepository": "https://github.com/harehare/mq-db",
+        "programmingLanguage": "Rust",
+        "url": "https://harehare.github.io/mq-db/"
+      }
+    </script>
+  </head>
+  <body class="bg-paper text-ink font-body selection:bg-accent selection:text-paper">
+    <!-- Navigation -->
+    <nav class="top-0 sticky z-50 border-b border-paper-deep bg-paper/95 backdrop-blur-sm">
+      <div class="flex justify-between items-center w-full px-6 h-14 max-w-[1200px] mx-auto">
+        <a href="#" class="flex items-center gap-2.5">
+          <img src="./assets/logo.svg" alt="mq-db logo" class="h-6 w-6 block" />
+          <span class="text-lg font-semibold tracking-tight text-ink font-headline">mq-db</span>
+        </a>
+        <div class="hidden md:flex items-center gap-7 text-xs font-body uppercase tracking-widest">
+          <a class="text-ink-dim hover:text-accent transition-colors" href="#anatomy">Anatomy</a>
+          <a class="text-ink-dim hover:text-accent transition-colors" href="#why-mqdb">Why mq-db</a>
+          <a class="text-ink-dim hover:text-accent transition-colors" href="#query">Query</a>
+          <a class="text-ink-dim hover:text-accent transition-colors" href="#features">Index</a>
+          <a class="text-ink-dim hover:text-accent transition-colors" href="#install">Install</a>
+        </div>
+        <div class="flex items-center gap-4 text-xs font-body uppercase tracking-widest">
+          <a href="https://crates.io/crates/mq-db" target="_blank" class="text-ink-dim hover:text-accent transition-colors hidden sm:inline"
+            >crates.io</a
+          >
+          <a
+            href="https://github.com/harehare/mq-db"
+            target="_blank"
+            class="flex items-center gap-1.5 px-3 py-1.5 border border-ink/25 hover:border-accent hover:text-accent transition-colors rounded"
+          >
+            GitHub
+          </a>
+        </div>
+      </div>
+    </nav>
+
+    <main>
+      <!-- Hero -->
+      <section class="relative pt-16 pb-16 overflow-hidden">
+        <div class="relative max-w-[1200px] mx-auto px-6">
+          <h1 class="text-4xl sm:text-5xl font-headline font-semibold tracking-tight leading-[1.1] mb-6 max-w-3xl fade-up">
+            Your Markdown<br />
+            is already <em class="italic text-accent">a database.</em>
+          </h1>
+          <p class="text-lg text-ink-dim max-w-2xl mb-10 leading-relaxed fade-up">
+            mq-db parses Markdown into a flat block list with an interval
+            index (Nested Set / Pre-Post Order), turning heading hierarchy
+            into O(1) integer comparisons. Query it with
+            <span class="text-ink font-medium">SQL</span> or
+            <a href="https://github.com/harehare/mq" target="_blank" class="text-accent hover:underline">mq</a>,
+            persist it to a compact custom page-file format — no SQLite
+            dependency.
+          </p>
+          <div class="flex flex-wrap gap-3 mb-20 fade-up">
+            <a
+              href="#install"
+              class="px-6 py-3 bg-accent text-paper font-semibold rounded font-body text-sm hover:bg-accent-hover transition-colors"
+              >install mq-db &rarr;</a
+            >
+            <a
+              href="https://github.com/harehare/mq-db"
+              target="_blank"
+              class="px-6 py-3 border border-ink/25 text-ink font-body text-sm rounded hover:border-accent hover:text-accent transition-colors"
+              >view source</a
+            >
+          </div>
+
+          <!-- Annotated manuscript -->
+          <div id="anatomy" class="scroll-mt-20">
+            <p class="font-body text-xs text-ink-dim tracking-widest uppercase mb-4">the source, annotated at index time</p>
+            <div class="border border-paper-deep rounded-lg bg-paper-alt shadow-[0_1px_2px_rgba(42,36,32,0.06)] p-5 md:p-7">
+              <div class="flex items-center justify-between pb-3 mb-1 border-b border-paper-deep">
+                <span class="font-mono text-xs text-ink-dim">README.md</span>
+                <span class="font-mono text-xs text-accent">block_type &middot; pre / post</span>
+              </div>
+              <div class="font-mono text-xs md:text-sm">
+                <div class="manuscript-row">
+                  <span class="text-ink-dim"># mq-db</span>
+                  <span class="text-ink-dim"><span class="text-ink">heading</span> &middot; 1 / 18</span>
+                </div>
+                <div class="manuscript-row">
+                  <span class="text-ink-dim">mq-db parses Markdown into a flat block list with an interval index.</span>
+                  <span class="text-ink-dim"><span class="text-ink">paragraph</span> &middot; 2 / 3</span>
+                </div>
+                <div class="manuscript-row">
+                  <span class="text-ink-dim">## Architecture</span>
+                  <span class="text-ink-dim"><span class="text-ink">heading</span> &middot; 4 / 17</span>
+                </div>
+                <div class="manuscript-row">
+                  <span class="text-ink-dim">Every heading opens an interval; blocks inherit pre/post bounds.</span>
+                  <span class="text-ink-dim"><span class="text-ink">paragraph</span> &middot; 5 / 6</span>
+                </div>
+                <div class="manuscript-row">
+                  <span class="text-ink-dim">- Bitmap index on block_type</span>
+                  <span class="text-ink-dim"><span class="text-ink">list_item</span> &middot; 8 / 9</span>
+                </div>
+                <div class="manuscript-row">
+                  <span class="text-ink-dim">- BTree index on (pre, post)</span>
+                  <span class="text-ink-dim"><span class="text-ink">list_item</span> &middot; 10 / 11</span>
+                </div>
+                <div class="manuscript-row">
+                  <span class="text-ink-dim">- Hash index on content, lang, depth</span>
+                  <span class="text-ink-dim"><span class="text-ink">list_item</span> &middot; 12 / 13</span>
+                </div>
+                <div class="manuscript-row">
+                  <span class="text-ink-dim">```sql SELECT block_type, count(*) FROM blocks GROUP BY 1; ```</span>
+                  <span class="text-ink-dim"><span class="text-ink">code</span> &middot; 15 / 16</span>
+                </div>
+              </div>
+              <div class="mt-5 pt-5 border-t border-dotted border-paper-deep grid sm:grid-cols-2 gap-3 text-xs font-body text-ink-dim">
+                <p><sup class="text-accent">1</sup> every block gets a pre/post pair at index time — "is X inside Y?" becomes one integer range comparison, not a tree walk.</p>
+                <p><sup class="text-accent">2</sup> the query planner picks a BitmapIndex, BTreeIndex, or HashIndex automatically, based on the predicate.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Why mq-db -->
+      <section id="why-mqdb" class="py-24 border-t border-paper-deep">
+        <div class="max-w-[1200px] mx-auto px-6 grid grid-cols-1 lg:grid-cols-5 gap-16">
+          <div class="lg:col-span-2">
+            <h2 class="text-3xl font-headline font-semibold mb-6 tracking-tight text-ink">
+              Hierarchy checks<br />without a tree walk.
+            </h2>
+            <p class="text-ink-dim leading-relaxed mb-6 drop-cap">
+              Most Markdown tooling answers "what's inside this section?" by
+              walking a tree. mq-db assigns every block a
+              <span class="text-ink font-medium">pre</span>/<span class="text-ink font-medium">post</span>
+              pair (Nested Set encoding) at index time, so an ancestor
+              check becomes a single interval comparison —
+              <code class="text-accent">under(pre, post, anc_pre, anc_post)</code>.
+            </p>
+            <p class="text-ink-dim leading-relaxed">
+              Three secondary index layers push SQL predicates down before a
+              single block is materialized: a <code class="text-accent">BitmapIndex</code>
+              on block type, a <code class="text-accent">BTreeIndex</code> on pre/post, and a
+              <code class="text-accent">HashIndex</code> on content/lang/depth.
+            </p>
+          </div>
+          <div class="lg:col-span-3">
+            <div class="border border-paper-deep rounded-lg bg-paper-alt overflow-hidden">
+              <div class="flex items-center justify-between px-4 py-2.5 border-b border-paper-deep text-xs font-body text-ink-dim">
+                <span>sql&gt; RAG extraction under a section</span>
+                <span class="text-mark font-mono">under()</span>
+              </div>
+              <pre class="p-5 text-xs md:text-sm font-mono leading-relaxed overflow-x-auto"><span class="text-ink-dim italic">-- all text/code nested under the "Architecture" heading</span>
+<span class="text-accent">SELECT</span> b.block_type, b.content
+<span class="text-accent">FROM</span> blocks b
+<span class="text-accent">WHERE</span> under(b.pre, b.post,
+  (<span class="text-accent">SELECT</span> pre  <span class="text-accent">FROM</span> blocks <span class="text-accent">WHERE</span> block_type = <span class="text-mark">'heading'</span> <span class="text-accent">AND</span> content = <span class="text-mark">'Architecture'</span>),
+  (<span class="text-accent">SELECT</span> post <span class="text-accent">FROM</span> blocks <span class="text-accent">WHERE</span> block_type = <span class="text-mark">'heading'</span> <span class="text-accent">AND</span> content = <span class="text-mark">'Architecture'</span>))
+  <span class="text-accent">AND</span> b.block_type <span class="text-accent">IN</span> (<span class="text-mark">'paragraph'</span>, <span class="text-mark">'code'</span>)
+<span class="text-accent">ORDER BY</span> b.pre;</pre>
+            </div>
+            <p class="text-xs italic text-ink-dim mt-3 mb-6">fig. 1 — scoping a query to everything nested under a heading, via a single interval comparison.</p>
+            <div class="grid sm:grid-cols-3 gap-4 text-sm">
+              <div class="border-t-2 border-accent pt-3">
+                <p class="font-body font-semibold text-ink mb-1 text-xs uppercase tracking-wide">O(1) ancestry</p>
+                <p class="text-xs text-ink-dim leading-relaxed">
+                  Interval index turns "is X inside Y?" into an integer range check.
+                </p>
+              </div>
+              <div class="border-t-2 border-accent pt-3">
+                <p class="font-body font-semibold text-ink mb-1 text-xs uppercase tracking-wide">Dual engines</p>
+                <p class="text-xs text-ink-dim leading-relaxed">
+                  A custom sqlparser-based SQL evaluator, and mq via mq-lang — no SQLite.
+                </p>
+              </div>
+              <div class="border-t-2 border-accent pt-3">
+                <p class="font-body font-semibold text-ink mb-1 text-xs uppercase tracking-wide">Zone pruning</p>
+                <p class="text-xs text-ink-dim leading-relaxed">
+                  Per-document stats skip irrelevant files before any block is scanned.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Query examples -->
+      <section id="query" class="py-24 border-t border-paper-deep bg-paper-alt/60">
+        <div class="max-w-[1200px] mx-auto px-6">
+          <h2 class="text-3xl font-headline font-semibold mb-4 tracking-tight text-ink">SQL, joins included</h2>
+          <p class="text-ink-dim max-w-2xl mb-14 leading-relaxed">
+            <code class="text-accent">documents</code> and <code class="text-accent">blocks</code> are
+            plain virtual tables — join them like any relational schema, plus
+            self-joins over the interval index for structural checks.
+          </p>
+          <div class="grid md:grid-cols-2 gap-x-6 gap-y-10">
+            <div>
+              <div class="border border-paper-deep rounded-lg bg-paper overflow-hidden">
+                <div class="flex items-center justify-between px-4 py-2.5 border-b border-paper-deep text-xs font-body text-ink-dim">
+                  <span>documents &#8904; blocks</span>
+                  <span class="text-mark font-mono">JOIN</span>
+                </div>
+                <pre class="p-5 text-xs md:text-sm font-mono leading-relaxed overflow-x-auto"><span class="text-ink-dim italic">-- documents that contain Python code</span>
+<span class="text-accent">SELECT DISTINCT</span> d.path
+<span class="text-accent">FROM</span> documents d
+<span class="text-accent">JOIN</span> blocks b <span class="text-accent">ON</span> b.document_id = d.id
+<span class="text-accent">WHERE</span> b.block_type = <span class="text-mark">'code'</span> <span class="text-accent">AND</span> b.lang = <span class="text-mark">'python'</span>;</pre>
+              </div>
+              <p class="text-xs italic text-ink-dim mt-3">fig. 2 — a plain relational join across documents and blocks.</p>
+            </div>
+            <div>
+              <div class="border border-paper-deep rounded-lg bg-paper overflow-hidden">
+                <div class="flex items-center justify-between px-4 py-2.5 border-b border-paper-deep text-xs font-body text-ink-dim">
+                  <span>self-join over pre/post</span>
+                  <span class="text-mark font-mono">JOIN &times;2</span>
+                </div>
+                <pre class="p-5 text-xs md:text-sm font-mono leading-relaxed overflow-x-auto"><span class="text-ink-dim italic">-- H2 headings immediately followed by a list</span>
+<span class="text-accent">SELECT</span> d.path, h.content <span class="text-accent">AS</span> heading
+<span class="text-accent">FROM</span> blocks h
+<span class="text-accent">JOIN</span> blocks nxt <span class="text-accent">ON</span> nxt.document_id = h.document_id
+                 <span class="text-accent">AND</span> nxt.pre = h.pre + 1
+<span class="text-accent">JOIN</span> documents d <span class="text-accent">ON</span> d.id = h.document_id
+<span class="text-accent">WHERE</span> h.block_type = <span class="text-mark">'heading'</span> <span class="text-accent">AND</span> h.depth = 2
+  <span class="text-accent">AND</span> nxt.block_type = <span class="text-mark">'list'</span>;</pre>
+              </div>
+              <p class="text-xs italic text-ink-dim mt-3">fig. 3 — a structural self-join, one row apart in pre-order.</p>
+            </div>
+            <div>
+              <div class="border border-paper-deep rounded-lg bg-paper overflow-hidden">
+                <div class="flex items-center justify-between px-4 py-2.5 border-b border-paper-deep text-xs font-body text-ink-dim">
+                  <span>mq() scalar function</span>
+                  <span class="text-mark font-mono">inline mq</span>
+                </div>
+                <pre class="p-5 text-xs md:text-sm font-mono leading-relaxed overflow-x-auto"><span class="text-ink-dim italic">-- run an mq program against Markdown content, in SQL</span>
+<span class="text-accent">SELECT</span> mq(<span class="text-mark">'.h1 | to_text'</span>, content) <span class="text-accent">AS</span> title
+<span class="text-accent">FROM</span> blocks
+<span class="text-accent">WHERE</span> block_type = <span class="text-mark">'code'</span> <span class="text-accent">AND</span> lang = <span class="text-mark">'markdown'</span>;</pre>
+              </div>
+              <p class="text-xs italic text-ink-dim mt-3">fig. 4 — mq embedded as a scalar function inside a SQL projection.</p>
+            </div>
+            <div>
+              <div class="border border-paper-deep rounded-lg bg-paper overflow-hidden">
+                <div class="flex items-center justify-between px-4 py-2.5 border-b border-paper-deep text-xs font-body text-ink-dim">
+                  <span>CASE + aggregates</span>
+                  <span class="text-mark font-mono">GROUP BY</span>
+                </div>
+                <pre class="p-5 text-xs md:text-sm font-mono leading-relaxed overflow-x-auto"><span class="text-ink-dim italic">-- bucket headings by depth, summarize per bucket</span>
+<span class="text-accent">SELECT</span>
+  <span class="text-accent">CASE WHEN</span> depth &lt;= 1 <span class="text-accent">THEN</span> <span class="text-mark">'top-level'</span> <span class="text-accent">ELSE</span> <span class="text-mark">'nested'</span> <span class="text-accent">END AS</span> bucket,
+  count(*),
+  group_concat(initcap(trim(content)), <span class="text-mark">', '</span>) <span class="text-accent">AS</span> headings
+<span class="text-accent">FROM</span> blocks
+<span class="text-accent">WHERE</span> block_type = <span class="text-mark">'heading'</span>
+<span class="text-accent">GROUP BY</span> <span class="text-accent">CASE WHEN</span> depth &lt;= 1 <span class="text-accent">THEN</span> <span class="text-mark">'top-level'</span> <span class="text-accent">ELSE</span> <span class="text-mark">'nested'</span> <span class="text-accent">END</span>;</pre>
+              </div>
+              <p class="text-xs italic text-ink-dim mt-3">fig. 5 — CASE expressions and aggregates over heading depth.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Features / Index -->
+      <section id="features" class="py-24 border-t border-paper-deep">
+        <div class="max-w-[1200px] mx-auto px-6">
+          <div class="flex items-baseline justify-between mb-10">
+            <h2 class="text-3xl font-headline font-semibold tracking-tight text-ink">Index</h2>
+            <span class="font-mono text-xs text-ink-dim">9 entries</span>
+          </div>
+          <div class="border-t border-paper-deep">
+            <div class="manuscript-row" style="grid-template-columns: 1fr auto;">
+              <div class="flex items-baseline gap-3">
+                <span class="font-mono text-accent text-xs w-5 shrink-0">01</span>
+                <h4 class="font-headline font-semibold text-ink">Flat block storage</h4>
+                <span class="leader hidden sm:block"></span>
+              </div>
+              <p class="text-xs text-ink-dim leading-relaxed max-w-sm text-right sm:text-left">Every Markdown element becomes a typed Block with row-polymorphic properties.</p>
+            </div>
+            <div class="manuscript-row" style="grid-template-columns: 1fr auto;">
+              <div class="flex items-baseline gap-3">
+                <span class="font-mono text-accent text-xs w-5 shrink-0">02</span>
+                <h4 class="font-headline font-semibold text-ink">O(1) hierarchy queries</h4>
+                <span class="leader hidden sm:block"></span>
+              </div>
+              <p class="text-xs text-ink-dim leading-relaxed max-w-sm text-right sm:text-left">Interval index (pre/post) makes ancestor/descendant checks a single comparison.</p>
+            </div>
+            <div class="manuscript-row" style="grid-template-columns: 1fr auto;">
+              <div class="flex items-baseline gap-3">
+                <span class="font-mono text-accent text-xs w-5 shrink-0">03</span>
+                <h4 class="font-headline font-semibold text-ink">Three-layer indexes</h4>
+                <span class="leader hidden sm:block"></span>
+              </div>
+              <p class="text-xs text-ink-dim leading-relaxed max-w-sm text-right sm:text-left">Bitmap, BTree, and Hash indexes for fast SQL predicate pushdown.</p>
+            </div>
+            <div class="manuscript-row" style="grid-template-columns: 1fr auto;">
+              <div class="flex items-baseline gap-3">
+                <span class="font-mono text-accent text-xs w-5 shrink-0">04</span>
+                <h4 class="font-headline font-semibold text-ink">Zone maps</h4>
+                <span class="leader hidden sm:block"></span>
+              </div>
+              <p class="text-xs text-ink-dim leading-relaxed max-w-sm text-right sm:text-left">Per-document statistics skip irrelevant files before scanning any blocks.</p>
+            </div>
+            <div class="manuscript-row" style="grid-template-columns: 1fr auto;">
+              <div class="flex items-baseline gap-3">
+                <span class="font-mono text-accent text-xs w-5 shrink-0">05</span>
+                <h4 class="font-headline font-semibold text-ink">Dual query engines</h4>
+                <span class="leader hidden sm:block"></span>
+              </div>
+              <p class="text-xs text-ink-dim leading-relaxed max-w-sm text-right sm:text-left">SQL via a custom sqlparser-based evaluator, and mq via mq-lang.</p>
+            </div>
+            <div class="manuscript-row" style="grid-template-columns: 1fr auto;">
+              <div class="flex items-baseline gap-3">
+                <span class="font-mono text-accent text-xs w-5 shrink-0">06</span>
+                <h4 class="font-headline font-semibold text-ink">DDL support</h4>
+                <span class="leader hidden sm:block"></span>
+              </div>
+              <p class="text-xs text-ink-dim leading-relaxed max-w-sm text-right sm:text-left"><code class="text-accent">CREATE TABLE</code>, <code class="text-accent">INSERT INTO</code>, <code class="text-accent">DROP TABLE</code> for in-memory custom tables.</p>
+            </div>
+            <div class="manuscript-row" style="grid-template-columns: 1fr auto;">
+              <div class="flex items-baseline gap-3">
+                <span class="font-mono text-accent text-xs w-5 shrink-0">07</span>
+                <h4 class="font-headline font-semibold text-ink">Function library</h4>
+                <span class="leader hidden sm:block"></span>
+              </div>
+              <p class="text-xs text-ink-dim leading-relaxed max-w-sm text-right sm:text-left">String, numeric, null-handling, CASE, and aggregate functions comparable to a general-purpose RDBMS.</p>
+            </div>
+            <div class="manuscript-row" style="grid-template-columns: 1fr auto;">
+              <div class="flex items-baseline gap-3">
+                <span class="font-mono text-accent text-xs w-5 shrink-0">08</span>
+                <h4 class="font-headline font-semibold text-ink">Custom page storage</h4>
+                <span class="leader hidden sm:block"></span>
+              </div>
+              <p class="text-xs text-ink-dim leading-relaxed max-w-sm text-right sm:text-left">8 KB fixed pages, checksums, atomic writes to a single-file format.</p>
+            </div>
+            <div class="manuscript-row" style="grid-template-columns: 1fr auto;">
+              <div class="flex items-baseline gap-3">
+                <span class="font-mono text-accent text-xs w-5 shrink-0">09</span>
+                <h4 class="font-headline font-semibold text-ink">CLI + REPL + TUI</h4>
+                <span class="leader hidden sm:block"></span>
+              </div>
+              <p class="text-xs text-ink-dim leading-relaxed max-w-sm text-right sm:text-left">Full terminal experience, plus an HTTP server for SQL and mq over JSON.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Install -->
+      <section id="install" class="py-24 border-t border-paper-deep">
+        <div class="max-w-3xl mx-auto px-6">
+          <h2 class="text-3xl font-headline font-semibold mb-10 tracking-tight text-ink text-center">Install</h2>
+          <div class="border border-paper-deep rounded-lg bg-paper-alt overflow-hidden">
+            <div class="flex border-b border-paper-deep text-xs font-body uppercase tracking-widest">
+              <button class="tab-button active px-5 py-3 border-b-2 border-accent text-accent" data-tab="script">script</button>
+              <button class="tab-button px-5 py-3 border-b-2 border-transparent text-ink-dim" data-tab="cargo">cargo</button>
+              <button class="tab-button px-5 py-3 border-b-2 border-transparent text-ink-dim" data-tab="source">source</button>
+            </div>
+            <div class="relative">
+              <div id="script" class="tab-content p-5 font-mono text-sm">
+                <button onclick="copyCode(this)" class="absolute top-4 right-4 text-xs text-ink-dim hover:text-accent transition-colors cursor-pointer font-body">copy</button>
+                <p class="text-ink-dim italic"># downloads, verifies (SHA256), and installs to ~/.local/bin</p>
+                <p class="text-ink">curl -fsSL https://raw.githubusercontent.com/harehare/mq-db/main/bin/install.sh | bash</p>
+              </div>
+              <div id="cargo" class="tab-content hidden p-5 font-mono text-sm">
+                <button onclick="copyCode(this)" class="absolute top-4 right-4 text-xs text-ink-dim hover:text-accent transition-colors cursor-pointer font-body">copy</button>
+                <p class="text-ink">cargo install mq-db</p>
+              </div>
+              <div id="source" class="tab-content hidden p-5 font-mono text-sm">
+                <button onclick="copyCode(this)" class="absolute top-4 right-4 text-xs text-ink-dim hover:text-accent transition-colors cursor-pointer font-body">copy</button>
+                <p class="text-ink">git clone https://github.com/harehare/mq-db.git</p>
+                <p class="text-ink">cd mq-db</p>
+                <p class="text-ink">cargo install --path .</p>
+              </div>
+            </div>
+          </div>
+          <p class="mt-8 text-center text-sm font-mono text-ink-dim">
+            mq-db index docs/ --recursive <span class="text-ink-dim">&&</span>
+            <span class="text-accent">mq-db sql "SELECT block_type, count(*) FROM blocks GROUP BY block_type"</span>
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <!-- Footer / Colophon -->
+    <footer class="border-t border-paper-deep py-10">
+      <div class="max-w-[1200px] mx-auto px-6 text-center">
+        <p class="italic font-headline text-sm text-ink-dim mb-4">
+          Set in Fraunces, Inter &amp; JetBrains Mono &middot; MIT licensed &middot; &copy; 2026 mq-db
+        </p>
+        <div class="flex justify-center gap-8 text-xs font-body uppercase tracking-widest text-ink-dim">
+          <a class="hover:text-accent transition-colors" href="https://github.com/harehare/mq-db" target="_blank">github</a>
+          <a class="hover:text-accent transition-colors" href="https://crates.io/crates/mq-db" target="_blank">crates.io</a>
+          <a class="hover:text-accent transition-colors" href="https://github.com/harehare/mq-db/blob/main/LICENSE" target="_blank">license</a>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      function copyCode(button) {
+        const code = button.parentElement.innerText.replace(/^copy\s*/, "").trim();
+        navigator.clipboard.writeText(code).then(() => {
+          const original = button.textContent;
+          button.textContent = "copied";
+          button.classList.add("text-accent");
+          setTimeout(() => {
+            button.textContent = original;
+            button.classList.remove("text-accent");
+          }, 1500);
+        });
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        const tabButtons = document.querySelectorAll(".tab-button");
+        const tabContents = document.querySelectorAll(".tab-content");
+
+        function switchTab(tabId) {
+          tabButtons.forEach((btn) => {
+            const isActive = btn.getAttribute("data-tab") === tabId;
+            btn.classList.toggle("text-accent", isActive);
+            btn.classList.toggle("border-accent", isActive);
+            btn.classList.toggle("text-ink-dim", !isActive);
+            btn.classList.toggle("border-transparent", !isActive);
+          });
+          tabContents.forEach((content) => {
+            content.classList.toggle("hidden", content.id !== tabId);
+          });
+        }
+
+        tabButtons.forEach((button) => {
+          button.addEventListener("click", () => switchTab(button.getAttribute("data-tab")));
+        });
+      });
+    </script>
+  </body>
+</html>

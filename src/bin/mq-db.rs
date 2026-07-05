@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::{Parser, Subcommand, ValueEnum};
-use mq_db::{DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape};
+use mq_db::{DocumentStore, MqEngine, MqdbError, SqlEngine, block::BlockType, sql::html_escape};
 use serde::Deserialize;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -231,6 +231,39 @@ fn is_markdown(path: &Path) -> bool {
     )
 }
 
+/// Reads every file in `files`, in order, using a small worker-thread pool —
+/// indexing many small files is I/O-latency bound, not CPU bound.
+fn read_files_parallel(files: &[PathBuf]) -> Vec<Result<String, MqdbError>> {
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(files.len().max(1));
+    if worker_count <= 1 {
+        return files
+            .iter()
+            .map(|p| std::fs::read_to_string(p).map_err(MqdbError::from))
+            .collect();
+    }
+
+    let chunk_size = files.len().div_ceil(worker_count);
+    std::thread::scope(|scope| {
+        files
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|p| std::fs::read_to_string(p).map_err(MqdbError::from))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("file-read worker thread panicked"))
+            .collect()
+    })
+}
+
 fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
     if !db.exists() {
         anyhow::bail!(
@@ -340,8 +373,9 @@ async fn main() -> anyhow::Result<()> {
                 if no_spans {
                     store.set_store_spans(false);
                 }
-                for path in &files {
-                    match store.add_file(path) {
+                let contents = read_files_parallel(&files);
+                for (path, content) in files.iter().zip(contents) {
+                    match content.and_then(|c| store.add_str_with_path(&c, Some(path.clone()))) {
                         Ok(_) => eprintln!("  ✓ {}", path.display()),
                         Err(e) => {
                             eprintln!("  ✗ {}: {}", path.display(), e);

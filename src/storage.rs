@@ -156,7 +156,8 @@ impl Storage {
         entries: &[CatalogEntry],
         custom_tables: &[CustomTableEntry],
     ) -> Result<(), MqdbError> {
-        write_catalog(&mut self.page_file, entries, custom_tables)
+        write_catalog(&mut self.page_file, entries, custom_tables)?;
+        self.page_file.sync_header()
     }
 
     /// Read the catalog.
@@ -636,6 +637,34 @@ mod tests {
         let engine = SqlEngine::new(&opened).unwrap();
         let out = engine.execute("SELECT count(*) FROM blocks").unwrap();
         assert!(!out.rows.is_empty());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn persisted_index_round_trip_large_block_content() {
+        use crate::indexes::DocumentIndex;
+
+        // A single block whose content exceeds 64KB must not desync the
+        // index's by_content length prefix (was u16, truncating/wrapping).
+        let path = test_file_path("index-round-trip-large-block");
+        cleanup(&path);
+
+        let big_code = "x".repeat(70_000);
+        let content = format!("# Title\n\n```text\n{big_code}\n```\n");
+
+        let mut store = DocumentStore::new();
+        store.add_str(&content).unwrap();
+        store.save(&path).unwrap();
+
+        let mut opened = DocumentStore::open(&path).unwrap();
+        opened.load_all_blocks().unwrap();
+        opened.load_all_indexes().unwrap();
+
+        let doc = &opened.documents()[0];
+        let from_file = opened.get_doc_index(0).unwrap().clone();
+        let from_blocks = DocumentIndex::build(&doc.blocks);
+        assert_eq!(from_file.to_bytes(), from_blocks.to_bytes());
 
         cleanup(&path);
     }

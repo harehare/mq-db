@@ -180,7 +180,10 @@ impl DocumentStore {
         self.add_str_with_path(content, None)
     }
 
-    fn add_str_with_path(
+    /// Parses and adds already-read Markdown content, attributing it to
+    /// `path`. For callers that read files concurrently and want to skip
+    /// [`add_file`](Self::add_file)'s own read.
+    pub fn add_str_with_path(
         &mut self,
         content: &str,
         path: Option<std::path::PathBuf>,

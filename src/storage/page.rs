@@ -19,7 +19,7 @@ pub(crate) const PAGE_TYPE_INDEX: u32 = 5;
 pub(crate) const PAGE_TYPE_TABLE_DATA: u32 = 6;
 
 const FILE_MAGIC: u32 = 0x4D51_4442;
-const FILE_VERSION: u32 = 3;
+const FILE_VERSION: u32 = 4;
 const CATALOG_START_PAGE: u32 = 1;
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {
@@ -77,6 +77,9 @@ pub fn make_page(page_type: u32, page_id: u32, next_page: u32, body: &[u8]) -> [
 pub struct PageFile {
     file: File,
     pub num_pages: u32,
+    /// `true` if `num_pages` has advanced since the header page was last
+    /// written to disk; `append_page` no longer writes it eagerly.
+    header_dirty: bool,
 }
 
 impl PageFile {
@@ -87,7 +90,11 @@ impl PageFile {
             .create(true)
             .truncate(true)
             .open(path)?;
-        let mut page_file = Self { file, num_pages: 1 };
+        let mut page_file = Self {
+            file,
+            num_pages: 1,
+            header_dirty: false,
+        };
         page_file.write_file_header()?;
         Ok(page_file)
     }
@@ -146,7 +153,11 @@ impl PageFile {
             ));
         }
 
-        Ok(Self { file, num_pages })
+        Ok(Self {
+            file,
+            num_pages,
+            header_dirty: false,
+        })
     }
 
     pub fn read_page(&mut self, page_id: u32) -> Result<[u8; PAGE_SIZE], MqdbError> {
@@ -195,8 +206,18 @@ impl PageFile {
             .num_pages
             .checked_add(1)
             .ok_or_else(|| invalid_data("page count overflow"))?;
-        self.write_file_header()?;
+        self.header_dirty = true;
         Ok(page_id)
+    }
+
+    /// Persists `num_pages` if it changed since the last write. Must run
+    /// before the file is reopened from disk (see `Storage::flush_catalog`).
+    pub fn sync_header(&mut self) -> Result<(), MqdbError> {
+        if self.header_dirty {
+            self.write_file_header()?;
+            self.header_dirty = false;
+        }
+        Ok(())
     }
 
     fn write_file_header(&mut self) -> Result<(), MqdbError> {

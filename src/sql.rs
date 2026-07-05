@@ -130,6 +130,31 @@ impl Value {
     }
 }
 
+/// Hashable projection of [`Value`], mirroring its derived `PartialEq` (no
+/// cross-variant coercion, `NULL` equals `NULL`, `NaN` matches nothing).
+#[derive(PartialEq, Eq, Hash)]
+enum JoinKey {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    FloatBits(u64),
+    Null,
+}
+
+fn value_join_key(v: &Value) -> Option<JoinKey> {
+    match v {
+        Value::Str(s) => Some(JoinKey::Str(s.clone())),
+        Value::Int(i) => Some(JoinKey::Int(*i)),
+        Value::Bool(b) => Some(JoinKey::Bool(*b)),
+        Value::Null => Some(JoinKey::Null),
+        Value::Float(f) if f.is_nan() => None, // NaN matches nothing
+        Value::Float(f) => {
+            let normalized = if *f == 0.0 { 0.0 } else { *f };
+            Some(JoinKey::FloatBits(normalized.to_bits()))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Row {
     columns: Vec<String>,
@@ -509,6 +534,50 @@ fn cross_join(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
                 columns: cols,
                 values: vals,
             });
+        }
+    }
+    out
+}
+
+/// Equi-join fast path: hashes `right` by `right_key_expr` and probes it with
+/// `left_key_expr` per left row instead of the full `left * right` cross
+/// product. `full_predicate` is still checked per candidate pair, so results
+/// match `cross_join` + `.retain(full_predicate)` exactly.
+fn hash_equi_join(
+    left: Vec<Row>,
+    right: Vec<Row>,
+    left_key_expr: &Expr,
+    right_key_expr: &Expr,
+    full_predicate: &Expr,
+) -> Vec<Row> {
+    let mut buckets: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+    for (i, r) in right.iter().enumerate() {
+        if let Some(key) = value_join_key(&eval_expr(right_key_expr, r)) {
+            buckets.entry(key).or_default().push(i);
+        }
+    }
+
+    let mut out = Vec::new();
+    for l in &left {
+        let Some(key) = value_join_key(&eval_expr(left_key_expr, l)) else {
+            continue;
+        };
+        let Some(candidates) = buckets.get(&key) else {
+            continue;
+        };
+        for &i in candidates {
+            let r = &right[i];
+            let mut cols = l.columns.clone();
+            cols.extend(r.columns.iter().cloned());
+            let mut vals = l.values.clone();
+            vals.extend(r.values.iter().cloned());
+            let combined = Row {
+                columns: cols,
+                values: vals,
+            };
+            if eval_expr(full_predicate, &combined).is_truthy() {
+                out.push(combined);
+            }
         }
     }
     out
@@ -1807,16 +1876,28 @@ impl<'a> SqlEngine<'a> {
         for join in &from[0].joins {
             // Joined tables always full-scan (join partner)
             let right = self.table_rows_with_hint(&join.relation, &IndexHint::FullScan, None)?;
-            rows = cross_join(rows, right);
             match &join.join_operator {
                 JoinOperator::Inner(JoinConstraint::On(on))
                 | JoinOperator::Join(JoinConstraint::On(on))
                 | JoinOperator::Left(JoinConstraint::On(on))
                 | JoinOperator::LeftOuter(JoinConstraint::On(on)) => {
                     let resolved = self.resolve_subqueries(on)?;
-                    rows.retain(|row| eval_expr(&resolved, row).is_truthy());
+                    let left_cols = rows.first().map(|r| r.columns.clone()).unwrap_or_default();
+                    let right_cols = right.first().map(|r| r.columns.clone()).unwrap_or_default();
+                    rows = match find_equi_join_exprs(&resolved, &left_cols, &right_cols) {
+                        Some((left_key, right_key)) => {
+                            hash_equi_join(rows, right, left_key, right_key, &resolved)
+                        }
+                        None => {
+                            let mut combined = cross_join(rows, right);
+                            combined.retain(|row| eval_expr(&resolved, row).is_truthy());
+                            combined
+                        }
+                    };
                 }
-                _ => {}
+                _ => {
+                    rows = cross_join(rows, right);
+                }
             }
         }
         for twj in from.iter().skip(1) {
@@ -2309,6 +2390,46 @@ fn flatten_and_conjuncts(expr: &Expr) -> Vec<&Expr> {
         Expr::Nested(inner) => flatten_and_conjuncts(inner),
         other => vec![other],
     }
+}
+
+/// Whether `schema` has a column matching `short` (an already-lowercased,
+/// unqualified name from [`expr_col_name`]). Mirrors `Row::get`'s fallback.
+fn schema_has_short_col(schema: &[String], short: &str) -> bool {
+    schema.iter().any(|c| {
+        let cl = c.to_lowercase();
+        cl == short || cl.split('.').next_back().unwrap_or(&cl) == short
+    })
+}
+
+/// First top-level `AND`-conjunct of `on` that is a plain `column = column`
+/// equality across `left_cols`/`right_cols`, as `(left_key_expr,
+/// right_key_expr)`. `None` if there's no such conjunct (e.g. only a
+/// computed key like `nxt.pre = h.pre + 1`) — caller falls back to cross-join.
+fn find_equi_join_exprs<'a>(
+    on: &'a Expr,
+    left_cols: &[String],
+    right_cols: &[String],
+) -> Option<(&'a Expr, &'a Expr)> {
+    for conjunct in flatten_and_conjuncts(on) {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } = conjunct
+        else {
+            continue;
+        };
+        let (Some(lname), Some(rname)) = (expr_col_name(left), expr_col_name(right)) else {
+            continue;
+        };
+        if schema_has_short_col(left_cols, &lname) && schema_has_short_col(right_cols, &rname) {
+            return Some((left, right));
+        }
+        if schema_has_short_col(right_cols, &lname) && schema_has_short_col(left_cols, &rname) {
+            return Some((right, left));
+        }
+    }
+    None
 }
 
 /// Decides whether a whole document can be skipped using [`ZoneMaps`],
