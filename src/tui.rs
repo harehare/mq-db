@@ -632,6 +632,12 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         )
         .wrap(Wrap { trim: false });
     f.render_widget(widget, area);
+
+    if app.input_focused {
+        let max_x = area.x + area.width.saturating_sub(2);
+        let cursor_x = (area.x + 1 + app.cursor_pos as u16).min(max_x);
+        f.set_cursor_position((cursor_x, area.y + 1));
+    }
 }
 
 fn render_results(f: &mut Frame, app: &App, area: Rect) {
