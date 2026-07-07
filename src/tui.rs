@@ -3,7 +3,7 @@
 use std::io;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -369,6 +369,7 @@ pub fn run(store: DocumentStore) -> Result<(), MqdbError> {
 
         if event::poll(std::time::Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
+            && is_key_press(&key)
             && handle_key(&mut app, key)
         {
             break;
@@ -378,6 +379,11 @@ pub fn run(store: DocumentStore) -> Result<(), MqdbError> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+/// Windows reports both press and release per keystroke; only handle press.
+fn is_key_press(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
 }
 
 /// Returns `true` if the app should quit.
@@ -626,6 +632,12 @@ fn render_input(f: &mut Frame, app: &App, area: Rect) {
         )
         .wrap(Wrap { trim: false });
     f.render_widget(widget, area);
+
+    if app.input_focused {
+        let max_x = area.x + area.width.saturating_sub(2);
+        let cursor_x = (area.x + 1 + app.cursor_pos as u16).min(max_x);
+        f.set_cursor_position((cursor_x, area.y + 1));
+    }
 }
 
 fn render_results(f: &mut Frame, app: &App, area: Rect) {
@@ -650,4 +662,57 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((app.result_scroll, 0));
     f.render_widget(widget, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press)
+    }
+
+    fn release(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Release)
+    }
+
+    #[test]
+    fn is_key_press_accepts_press_only() {
+        assert!(is_key_press(&press(KeyCode::Char('i'))));
+        assert!(!is_key_press(&release(KeyCode::Char('i'))));
+        assert!(!is_key_press(&KeyEvent::new_with_kind(
+            KeyCode::Char('i'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        )));
+    }
+
+    /// Regression test for the Windows double-input bug.
+    #[test]
+    fn windows_style_press_and_release_pair_inserts_char_once() {
+        let mut app = App::new(DocumentStore::default());
+        app.input_focused = true;
+
+        for key in [press(KeyCode::Char('j')), release(KeyCode::Char('j'))] {
+            if is_key_press(&key) {
+                handle_key(&mut app, key);
+            }
+        }
+
+        assert_eq!(app.input, "j");
+    }
+
+    #[test]
+    fn windows_style_press_and_release_pair_toggles_mode_once() {
+        let mut app = App::new(DocumentStore::default());
+        app.input_focused = true;
+
+        for key in [press(KeyCode::Tab), release(KeyCode::Tab)] {
+            if is_key_press(&key) {
+                handle_key(&mut app, key);
+            }
+        }
+
+        assert_eq!(app.mode, QueryMode::Mq);
+    }
 }
