@@ -23,6 +23,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+mimalloc = {version = "0.1.48", optional = true}
 
 [dev-dependencies]
 tempfile = "3"
@@ -39,4 +40,10 @@ lto = "fat"
 opt-level = 3
 panic = 'abort'
 strip = true
+
+
+[features]
+default = ["std", "use_mimalloc"]
+use_mimalloc = ["dep:mimalloc"]
+std = []
 
