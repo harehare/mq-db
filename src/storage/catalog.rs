@@ -90,6 +90,14 @@ impl<'a> Decoder<'a> {
         Ok(u32::from_le_bytes(bytes))
     }
 
+    fn read_u64(&mut self) -> Result<u64, MqdbError> {
+        let bytes: [u8; 8] = self
+            .read_exact(8)?
+            .try_into()
+            .map_err(|_| invalid_data("failed to read u64"))?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
     fn read_string_u16(&mut self) -> Result<String, MqdbError> {
         let len = usize::from(self.read_u16()?);
         let bytes = self.read_exact(len)?;
@@ -102,7 +110,11 @@ impl<'a> Decoder<'a> {
     }
 }
 
-fn serialize_catalog(entries: &[CatalogEntry], custom_tables: &[CustomTableEntry]) -> Vec<u8> {
+fn serialize_catalog(
+    entries: &[CatalogEntry],
+    custom_tables: &[CustomTableEntry],
+    content_hashes: &[(u32, u64)],
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&as_u32(entries.len(), "catalog entry count").to_le_bytes());
 
@@ -137,6 +149,16 @@ fn serialize_catalog(entries: &[CatalogEntry], custom_tables: &[CustomTableEntry
         out.extend_from_slice(&ct.num_rows.to_le_bytes());
     }
 
+    // Trailing optional section (added after custom tables so older catalog
+    // blobs without it still parse — `read_catalog` only reads this if bytes
+    // remain). Maps `document_id` -> content hash, used to skip re-parsing
+    // unchanged files on `reindex_paths`.
+    out.extend_from_slice(&as_u32(content_hashes.len(), "content hash count").to_le_bytes());
+    for (document_id, hash) in content_hashes {
+        out.extend_from_slice(&document_id.to_le_bytes());
+        out.extend_from_slice(&hash.to_le_bytes());
+    }
+
     out
 }
 
@@ -144,12 +166,13 @@ pub fn write_catalog(
     pf: &mut PageFile,
     entries: &[CatalogEntry],
     custom_tables: &[CustomTableEntry],
+    content_hashes: &[(u32, u64)],
 ) -> Result<(), MqdbError> {
     if pf.num_pages < 2 {
         return Err(invalid_data("catalog start page is missing"));
     }
 
-    let bytes = serialize_catalog(entries, custom_tables);
+    let bytes = serialize_catalog(entries, custom_tables, content_hashes);
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
         vec![&[]]
     } else {
@@ -177,7 +200,7 @@ pub fn write_catalog(
 
 pub fn read_catalog(
     pf: &mut PageFile,
-) -> Result<(Vec<CatalogEntry>, Vec<CustomTableEntry>), MqdbError> {
+) -> Result<(Vec<CatalogEntry>, Vec<CustomTableEntry>, Vec<(u32, u64)>), MqdbError> {
     if pf.num_pages < 2 {
         return Err(invalid_data("catalog start page is missing"));
     }
@@ -268,5 +291,140 @@ pub fn read_catalog(
         vec![]
     };
 
-    Ok((entries, custom_tables))
+    let content_hashes = if decoder.remaining() >= 4 {
+        let count = usize::try_from(decoder.read_u32()?)
+            .map_err(|_| invalid_data("content hash count exceeds usize range"))?;
+        let mut hashes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let document_id = decoder.read_u32()?;
+            let hash = decoder.read_u64()?;
+            hashes.push((document_id, hash));
+        }
+        hashes
+    } else {
+        vec![]
+    };
+
+    Ok((entries, custom_tables, content_hashes))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::*;
+    use crate::storage::page::{PAGE_TYPE_CATALOG, PageFile, make_page};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_file_path(name: &str) -> PathBuf {
+        let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("mq-db-catalog-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(format!("{name}-{unique}.mq-db"))
+    }
+
+    /// Encodes catalog bytes in the format that predates content-hash
+    /// tracking (entries + custom tables, no trailing hash section) — this
+    /// mirrors what `.mq-db` files written by older `mq-db` versions look
+    /// like on disk, to confirm `read_catalog` still parses them.
+    fn serialize_catalog_pre_hash_format(entries: &[CatalogEntry]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&as_u32(entries.len(), "entry count").to_le_bytes());
+        for entry in entries {
+            out.extend_from_slice(&entry.document_id.to_le_bytes());
+            match &entry.path {
+                Some(path) => {
+                    out.push(1);
+                    out.extend_from_slice(&as_u16(path.len(), "path len").to_le_bytes());
+                    out.extend_from_slice(path.as_bytes());
+                }
+                None => out.push(0),
+            }
+            out.extend_from_slice(&entry.first_block_page.to_le_bytes());
+            out.extend_from_slice(&entry.num_blocks.to_le_bytes());
+            out.extend_from_slice(
+                &as_u32(entry.zone_map_bytes.len(), "zone map len").to_le_bytes(),
+            );
+            out.extend_from_slice(&entry.zone_map_bytes);
+            out.extend_from_slice(&entry.index_start_page.to_le_bytes());
+        }
+        // Pre-migration files always had a (possibly empty) custom-table
+        // count here, but no bytes at all after it.
+        out.extend_from_slice(&as_u32(0, "table count").to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn read_catalog_parses_pre_content_hash_format() {
+        let path = test_file_path("pre-hash-format");
+        let _ = std::fs::remove_file(&path);
+
+        let entry = CatalogEntry {
+            document_id: 7,
+            path: Some("doc.md".to_string()),
+            first_block_page: 3,
+            num_blocks: 5,
+            zone_map_bytes: vec![1, 2, 3],
+            index_start_page: 9,
+        };
+        let bytes = serialize_catalog_pre_hash_format(std::slice::from_ref(&entry));
+
+        let mut pf = PageFile::create(&path).unwrap();
+        let page = make_page(PAGE_TYPE_CATALOG, 1, 0, &bytes);
+        pf.append_page(&page).unwrap();
+        pf.sync_header().unwrap();
+        drop(pf);
+
+        let mut reopened = PageFile::open(&path).unwrap();
+        let (entries, custom_tables, content_hashes) = read_catalog(&mut reopened).unwrap();
+
+        assert_eq!(entries, vec![entry]);
+        assert!(custom_tables.is_empty());
+        assert!(content_hashes.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_then_read_catalog_round_trips_content_hashes() {
+        let path = test_file_path("hash-round-trip");
+        let _ = std::fs::remove_file(&path);
+
+        let entry = CatalogEntry {
+            document_id: 1,
+            path: Some("a.md".to_string()),
+            first_block_page: 1,
+            num_blocks: 2,
+            zone_map_bytes: vec![],
+            index_start_page: 0,
+        };
+        let hashes = vec![(1u32, 0xDEAD_BEEFu64), (2u32, 42u64)];
+
+        let mut pf = PageFile::create(&path).unwrap();
+        // Reserve page 1 the same way `Storage::create` does.
+        let placeholder = make_page(PAGE_TYPE_CATALOG, 1, 0, &0u32.to_le_bytes());
+        pf.append_page(&placeholder).unwrap();
+        write_catalog(&mut pf, &[entry.clone()], &[], &hashes).unwrap();
+        pf.sync_header().unwrap();
+        drop(pf);
+
+        let mut reopened = PageFile::open(&path).unwrap();
+        let (entries, custom_tables, read_hashes) = read_catalog(&mut reopened).unwrap();
+
+        assert_eq!(entries, vec![entry]);
+        assert!(custom_tables.is_empty());
+        let mut read_hashes = read_hashes;
+        read_hashes.sort();
+        let mut expected = hashes;
+        expected.sort();
+        assert_eq!(read_hashes, expected);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

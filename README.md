@@ -38,6 +38,8 @@ flowchart TD
 - **Three-layer secondary indexes** — `BitmapIndex` (block type), `BTreeIndex` (pre/post), `HashIndex` (content/lang/depth) for fast SQL predicate pushdown
 - **Zone Maps** — per-document statistics skip irrelevant files before scanning any blocks
 - **Dual query engines** — SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
+- **Incremental re-indexing** — re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
+- **SQL `UPDATE`/`DELETE` with write-back** — edit `blocks` and push the change back to the source Markdown file, opt-in via `--write-back`
 - **DDL support** — `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
 - **Comprehensive SQL function library** — string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
 - **`mq()` scalar function** — run an mq program against Markdown content inline in SQL
@@ -93,10 +95,19 @@ mq-db index docs/ --no-spans   # omit source spans (~21 bytes/block saved)
 ```
 
 ```
-  ✓ docs/DESIGN.md
-  ✓ docs/API.md
+  + docs/DESIGN.md
+  + docs/API.md
 
-Indexed 2 files → store.mq-db
+2 added, 0 updated, 0 unchanged, 0 removed → store.mq-db
+```
+
+Re-running `index` against an existing `--output` is **incremental**: files
+whose content hash hasn't changed are skipped, changed files are re-parsed
+in place (keeping the same `DocumentId`), and new files are added. Pass
+`--prune` to also drop catalogued documents whose file no longer exists:
+
+```bash
+mq-db index docs/ --recursive --output store.mq-db --prune
 ```
 
 ### List indexed documents
@@ -154,6 +165,26 @@ mq-db sql "
 mq-db sql "SELECT mq('.h1 | to_text', content) AS title FROM blocks WHERE block_type = 'code'" --db store.mq-db
 ```
 
+### UPDATE / DELETE with write-back
+
+`UPDATE`/`DELETE` on `blocks` write the change back to the block's *source
+Markdown file* (re-parsed in place, same `DocumentId`) — pass `--write-back`
+to allow it; without the flag the statement is rejected:
+
+```bash
+mq-db sql "UPDATE blocks SET content = 'New Title' WHERE block_type = 'heading' AND content = 'Old Title'" \
+  --db store.mq-db --write-back
+
+mq-db sql "DELETE FROM blocks WHERE content = 'Outdated paragraph'" \
+  --db store.mq-db --write-back
+```
+
+Limitations in this version:
+
+- `UPDATE ... SET content` only supports `heading`/`paragraph` blocks (not tables, code, lists, ...)
+- Only documents indexed **with spans** (the default; not `--no-spans`) and from a real file (not added via the library's `add_str`) are eligible
+- Not available over `serve`'s HTTP endpoint or from `mq-mcp` — CLI (`sql`/`repl` with `--write-back`) and the library (`DocumentStore::execute_sql_mut`) only
+
 ### DDL — custom in-memory tables
 
 ```bash
@@ -205,6 +236,12 @@ sql> .mode mq
 mq> .h2
 ## Architecture
 ## Query Engine
+```
+
+Pass `--write-back` to `repl` to allow `UPDATE`/`DELETE` on `blocks` in SQL mode:
+
+```bash
+mq-db repl --db store.mq-db --mode sql --write-back
 ```
 
 ### HTTP server
@@ -357,6 +394,20 @@ let results = MqEngine::eval_store(".h1", &store)?;
 
 // Structural lint
 let violations = store.query().lint_heading_followed_by(2, &[BlockType::List]);
+
+// ── Incremental re-index ─────────────────────────────────────────────────────
+// Skips unchanged files (content-hash based), replaces changed ones in place
+// (same DocumentId), adds new ones; prune=true drops missing paths.
+let report = store.reindex_paths(&[std::path::PathBuf::from("docs/DESIGN.md")], false)?;
+println!("{} added, {} updated, {} unchanged", report.added.len(), report.updated.len(), report.unchanged);
+
+// ── UPDATE/DELETE with write-back ────────────────────────────────────────────
+// Rewrites the affected block's *source file* (heading/paragraph content
+// only), then re-parses it in place — see the CLI section above for the
+// full write-back constraints.
+store.execute_sql_mut(
+    "UPDATE blocks SET content = 'New Title' WHERE block_type = 'heading' AND content = 'Old Title'"
+)?;
 
 // ── Persist / load ───────────────────────────────────────────────────────────
 store.save("store.mq-db")?;

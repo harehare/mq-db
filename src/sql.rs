@@ -48,11 +48,12 @@ use std::collections::HashMap;
 
 use sqlparser::{
     ast::{
-        BinaryOperator, CaseWhen, CeilFloorKind, CreateTable, DateTimeField, DuplicateTreatment,
-        Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Insert,
-        JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType,
-        OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-        TableObject, TrimWhereField, UnaryOperator, Value as SqlValue, Values,
+        AssignmentTarget, BinaryOperator, CaseWhen, CeilFloorKind, CreateTable, DateTimeField,
+        DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
+        FunctionArguments, GroupByExpr, Insert, JoinConstraint, JoinOperator, LimitClause,
+        ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select,
+        SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
+        TrimWhereField, UnaryOperator, Value as SqlValue, Values,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -2114,6 +2115,304 @@ impl<'a> SqlEngine<'a> {
     }
 }
 
+/// A single matched `blocks` row targeted by `UPDATE`/`DELETE`, identified
+/// by `(document_id, pre)` — `pre` is a unique per-document DFS number, so
+/// this is stable even though the SQL-visible `id` column is a store-wide
+/// running index that doesn't correspond to any field on [`Block`].
+struct MatchedBlockEdit {
+    document_id: u32,
+    pre: u32,
+    /// `Some(rendered content)` for `UPDATE`, `None` for `DELETE`.
+    new_content: Option<String>,
+}
+
+fn single_table_name(twj: &TableWithJoins) -> Result<String, MqdbError> {
+    if !twj.joins.is_empty() {
+        return Err(MqdbError::SqlExec(
+            "UPDATE/DELETE with write-back do not support joins".into(),
+        ));
+    }
+    match &twj.relation {
+        TableFactor::Table { name, .. } => {
+            Ok(name.0.last().map(ident_value).unwrap_or("").to_lowercase())
+        }
+        _ => Err(MqdbError::SqlExec(
+            "unsupported UPDATE/DELETE target".into(),
+        )),
+    }
+}
+
+/// Materialises the rows matched by `target`/`selection`, optionally
+/// evaluating `set_value` (the `UPDATE ... SET content = <expr>` value,
+/// per matched row) into `MatchedBlockEdit`s. `set_value` is `None` for
+/// `DELETE`.
+fn collect_matched_edits(
+    store: &DocumentStore,
+    target: &TableWithJoins,
+    selection: Option<&Expr>,
+    set_value: Option<&Expr>,
+) -> Result<Vec<MatchedBlockEdit>, MqdbError> {
+    let table_name = single_table_name(target)?;
+    if table_name != "blocks" {
+        return Err(MqdbError::SqlExec(format!(
+            "UPDATE/DELETE with write-back is only supported on 'blocks' (got '{table_name}')"
+        )));
+    }
+
+    let engine = SqlEngine::new(store)?;
+    let mut rows =
+        engine.materialise_from_with_hint(std::slice::from_ref(target), &IndexHint::FullScan, None)?;
+    if let Some(sel) = selection {
+        let resolved = engine.resolve_subqueries(sel)?;
+        rows.retain(|row| eval_expr(&resolved, row).is_truthy());
+    }
+
+    rows.iter()
+        .map(|row| {
+            let document_id = row
+                .get("document_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| MqdbError::SqlExec("matched row missing document_id".into()))?
+                as u32;
+            let pre = row
+                .get("pre")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| MqdbError::SqlExec("matched row missing pre".into()))?
+                as u32;
+            let new_content = set_value.map(|expr| eval_expr(expr, row).display());
+            Ok(MatchedBlockEdit {
+                document_id,
+                pre,
+                new_content,
+            })
+        })
+        .collect()
+}
+
+/// Renders `edit`'s replacement text for a matched block, or returns `Ok(None)`
+/// for a `DELETE` (no replacement — the lines are removed outright).
+///
+/// `UPDATE ... SET content` is only supported for `Heading`/`Paragraph`
+/// blocks in this version — anything else (tables, code, lists, ...) would
+/// need real structural re-rendering to stay valid Markdown, which is out
+/// of scope here.
+fn render_replacement(block: &Block, new_content: &str) -> Result<String, MqdbError> {
+    match &block.block_type {
+        BlockType::Heading => Ok(format!(
+            "{} {}",
+            "#".repeat(block.heading_depth().unwrap_or(1).max(1) as usize),
+            new_content
+        )),
+        BlockType::Paragraph => Ok(new_content.to_string()),
+        other => Err(MqdbError::SqlExec(format!(
+            "UPDATE ... SET content is only supported for heading/paragraph blocks (found {})",
+            other.as_str()
+        ))),
+    }
+}
+
+/// Applies `edits` (grouped by document) as a source-text patch + reparse:
+/// for each affected document, reads the *current* file off disk, splices
+/// in the rendered replacement (or removes the lines entirely for a
+/// `DELETE`) at each matched block's `Span`, writes the patched text back to
+/// the file, then calls [`DocumentStore::replace_document`] to re-parse it
+/// in place (same `DocumentId`, fresh blocks/index/catalog entry).
+///
+/// Returns the number of blocks affected.
+fn apply_matched_edits(
+    store: &mut DocumentStore,
+    edits: Vec<MatchedBlockEdit>,
+) -> Result<usize, MqdbError> {
+    let mut by_doc: HashMap<u32, Vec<MatchedBlockEdit>> = HashMap::new();
+    for edit in edits {
+        by_doc.entry(edit.document_id).or_default().push(edit);
+    }
+
+    let mut affected = 0usize;
+    for (doc_id, doc_edits) in by_doc {
+        struct LineEdit {
+            start_line: usize,
+            end_line: usize,
+            replacement: Option<String>,
+        }
+
+        let (path, mut line_edits) = {
+            let doc = store
+                .get_document(doc_id)
+                .ok_or_else(|| MqdbError::SqlExec(format!("no such document: {doc_id}")))?;
+            let path = doc.path.clone().ok_or_else(|| {
+                MqdbError::SqlExec(
+                    "cannot write back: document has no source file (added via add_str)".into(),
+                )
+            })?;
+
+            let mut line_edits = Vec::with_capacity(doc_edits.len());
+            for edit in &doc_edits {
+                let block = doc
+                    .blocks
+                    .iter()
+                    .find(|b| b.pre == edit.pre)
+                    .ok_or_else(|| MqdbError::SqlExec("matched block no longer exists".into()))?;
+                let span = block.span.as_ref().ok_or_else(|| {
+                    MqdbError::SqlExec(
+                        "write-back requires source spans; reindex without --no-spans".into(),
+                    )
+                })?;
+                let replacement = edit
+                    .new_content
+                    .as_deref()
+                    .map(|c| render_replacement(block, c))
+                    .transpose()?;
+                line_edits.push(LineEdit {
+                    start_line: span.start_line,
+                    end_line: span.end_line,
+                    replacement,
+                });
+            }
+            (path, line_edits)
+        };
+
+        let original = std::fs::read_to_string(&path)?;
+        let had_trailing_newline = original.ends_with('\n');
+        let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+
+        // Apply from the bottom up so earlier edits don't shift later
+        // (already-resolved) line numbers.
+        line_edits.sort_by(|a, b| b.start_line.cmp(&a.start_line));
+        for edit in &line_edits {
+            let start = edit.start_line.saturating_sub(1);
+            let end = edit.end_line.min(lines.len());
+            if start >= end || start >= lines.len() {
+                continue;
+            }
+            match &edit.replacement {
+                Some(text) => {
+                    lines.splice(start..end, std::iter::once(text.clone()));
+                }
+                None => {
+                    let mut remove_start = start;
+                    let mut remove_end = end;
+                    if remove_end < lines.len() && lines[remove_end].trim().is_empty() {
+                        // Blank line after (the common case: an interior or
+                        // first block) — swallow it.
+                        remove_end += 1;
+                    } else if remove_start > 0 && lines[remove_start - 1].trim().is_empty() {
+                        // No blank line after (block was the last one in the
+                        // file) — swallow the blank line before it instead.
+                        remove_start -= 1;
+                    }
+                    lines.splice(remove_start..remove_end, std::iter::empty());
+                }
+            }
+        }
+
+        let mut patched = lines.join("\n");
+        if had_trailing_newline {
+            patched.push('\n');
+        }
+
+        std::fs::write(&path, &patched)?;
+        affected += doc_edits.len();
+        store.replace_document(doc_id, &patched, Some(path))?;
+    }
+
+    Ok(affected)
+}
+
+impl DocumentStore {
+    /// Execute a SQL statement that may mutate the store.
+    ///
+    /// `UPDATE`/`DELETE` against the `blocks` table are handled directly —
+    /// see the module-level write-back notes above — and are written back
+    /// to the affected document's *source Markdown file* (re-parsed in
+    /// place, same `DocumentId`). Everything else (`SELECT`, `CREATE
+    /// TABLE`, `INSERT`, `DROP TABLE`, `DESC`, `SHOW TABLES`) delegates to
+    /// the regular read-only [`SqlEngine::execute`].
+    ///
+    /// Callers that expose this over an interface an end user might not
+    /// expect to mutate files (a CLI, an HTTP/MCP endpoint) should gate it
+    /// behind an explicit opt-in before calling this — write-back mutates
+    /// the user's Markdown source on disk.
+    pub fn execute_sql_mut(&mut self, sql: &str) -> Result<QueryOutput, MqdbError> {
+        let trimmed = sql.trim().trim_end_matches(';');
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("DESC ") || upper.starts_with("DESCRIBE ") || upper == "SHOW TABLES" {
+            return SqlEngine::new(self)?.execute(sql);
+        }
+
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql)
+            .map_err(|e| MqdbError::SqlParse(e.to_string()))?;
+        let stmt = stmts
+            .into_iter()
+            .next()
+            .ok_or_else(|| MqdbError::SqlParse("empty query".into()))?;
+
+        match stmt {
+            Statement::Update(update) => {
+                if update.from.is_some() {
+                    return Err(MqdbError::SqlExec(
+                        "UPDATE ... FROM is not supported for write-back".into(),
+                    ));
+                }
+                if update.assignments.len() != 1 {
+                    return Err(MqdbError::SqlExec(
+                        "write-back UPDATE supports exactly one assignment: SET content = ..."
+                            .into(),
+                    ));
+                }
+                let assignment = &update.assignments[0];
+                let column = match &assignment.target {
+                    AssignmentTarget::ColumnName(name) => {
+                        name.0.last().map(ident_value).unwrap_or("").to_lowercase()
+                    }
+                    AssignmentTarget::Tuple(_) => {
+                        return Err(MqdbError::SqlExec(
+                            "write-back UPDATE does not support tuple assignment targets".into(),
+                        ));
+                    }
+                };
+                if column != "content" {
+                    return Err(MqdbError::SqlExec(format!(
+                        "write-back UPDATE only supports the 'content' column (got '{column}')"
+                    )));
+                }
+
+                let edits = collect_matched_edits(
+                    self,
+                    &update.table,
+                    update.selection.as_ref(),
+                    Some(&assignment.value),
+                )?;
+                let n = apply_matched_edits(self, edits)?;
+                Ok(QueryOutput {
+                    columns: vec!["updated".to_string()],
+                    rows: vec![vec![n.to_string()]],
+                })
+            }
+            Statement::Delete(delete) => {
+                let tables = match &delete.from {
+                    FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+                        tables
+                    }
+                };
+                if tables.len() != 1 {
+                    return Err(MqdbError::SqlExec(
+                        "write-back DELETE supports exactly one target table".into(),
+                    ));
+                }
+                let edits =
+                    collect_matched_edits(self, &tables[0], delete.selection.as_ref(), None)?;
+                let n = apply_matched_edits(self, edits)?;
+                Ok(QueryOutput {
+                    columns: vec!["deleted".to_string()],
+                    rows: vec![vec![n.to_string()]],
+                })
+            }
+            _ => SqlEngine::new(self)?.execute(sql),
+        }
+    }
+}
+
 fn projection_columns(projection: &[SelectItem], first_row: Option<&Row>) -> Vec<String> {
     if projection.len() == 1 && matches!(projection[0], SelectItem::Wildcard(_)) {
         return first_row
@@ -3263,5 +3562,149 @@ mod tests {
             .unwrap();
         let headings: Vec<&str> = out.rows.iter().map(|r| r[0].as_str()).collect();
         assert_eq!(headings, vec!["A", "C", "C2", "C3"]);
+    }
+
+    // ── UPDATE/DELETE write-back ────────────────────────────────────────────
+
+    fn write_md(dir: &tempfile::TempDir, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn write_back_update_rewrites_heading_and_keeps_rest_of_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Old Title\n\nBody text\n");
+
+        let mut store = DocumentStore::new();
+        let doc_id = store.add_file(&path).unwrap();
+
+        let out = store
+            .execute_sql_mut("UPDATE blocks SET content = 'New Title' WHERE block_type = 'heading'")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "1");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "# New Title\n\nBody text\n");
+
+        assert_eq!(store.documents()[0].id, doc_id);
+        assert!(
+            store.documents()[0]
+                .blocks
+                .iter()
+                .any(|b| b.content == "New Title")
+        );
+    }
+
+    #[test]
+    fn write_back_update_rewrites_paragraph_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nOld body\n\nAnother paragraph\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        store
+            .execute_sql_mut("UPDATE blocks SET content = 'New body' WHERE content = 'Old body'")
+            .unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on_disk,
+            "# Title\n\nNew body\n\nAnother paragraph\n"
+        );
+    }
+
+    #[test]
+    fn write_back_delete_removes_matched_block_and_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nKeep me\n\nRemove me\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let out = store
+            .execute_sql_mut("DELETE FROM blocks WHERE content = 'Remove me'")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "1");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "# Title\n\nKeep me\n");
+        assert!(
+            !store.documents()[0]
+                .blocks
+                .iter()
+                .any(|b| b.content == "Remove me")
+        );
+    }
+
+    #[test]
+    fn write_back_update_rejects_non_heading_paragraph_block_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\n```rust\nfn main() {}\n```\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let err = store
+            .execute_sql_mut("UPDATE blocks SET content = 'fn other() {}' WHERE block_type = 'code'")
+            .unwrap_err();
+        assert!(err.to_string().contains("heading/paragraph"));
+    }
+
+    #[test]
+    fn write_back_rejects_document_with_no_source_path() {
+        let mut store = DocumentStore::new();
+        store.add_str("# Title\n\nBody\n").unwrap();
+
+        let err = store
+            .execute_sql_mut("UPDATE blocks SET content = 'x' WHERE block_type = 'heading'")
+            .unwrap_err();
+        assert!(err.to_string().contains("no source file"));
+    }
+
+    #[test]
+    fn write_back_rejects_column_other_than_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let err = store
+            .execute_sql_mut("UPDATE blocks SET pre = 5 WHERE block_type = 'heading'")
+            .unwrap_err();
+        assert!(err.to_string().contains("'content'"));
+    }
+
+    #[test]
+    fn write_back_rejects_joins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let err = store
+            .execute_sql_mut(
+                "UPDATE blocks b JOIN blocks c ON c.document_id = b.document_id SET b.content = 'x'",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("joins"));
+    }
+
+    #[test]
+    fn write_back_read_only_statements_still_work_via_execute_sql_mut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let out = store
+            .execute_sql_mut("SELECT content FROM blocks WHERE block_type = 'heading'")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Title".to_string()]]);
     }
 }

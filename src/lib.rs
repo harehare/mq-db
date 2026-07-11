@@ -51,6 +51,7 @@
 //! ```
 
 pub mod block;
+pub mod discover;
 pub mod document;
 pub mod error;
 pub mod index;
@@ -69,4 +70,4 @@ pub use query::{LintViolation, Query, QueryResult};
 pub use sql::{QueryOutput, SqlEngine};
 pub use storage::Storage;
 pub use storage::catalog::CatalogEntry;
-pub use store::DocumentStore;
+pub use store::{DocumentStore, ReindexReport, StoreStats};

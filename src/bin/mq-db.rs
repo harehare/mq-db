@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::{Parser, Subcommand, ValueEnum};
-use mq_db::{DocumentStore, MqEngine, MqdbError, SqlEngine, block::BlockType, sql::html_escape};
+use mq_db::{DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape};
 use serde::Deserialize;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -51,6 +51,11 @@ enum Commands {
         /// Do not store source line/column spans (saves ~21 bytes per block)
         #[arg(long)]
         no_spans: bool,
+
+        /// Remove catalogued documents whose path is no longer present in
+        /// the indexed paths (only applies when --output already exists)
+        #[arg(long)]
+        prune: bool,
     },
 
     /// List all indexed documents
@@ -94,6 +99,12 @@ enum Commands {
         /// Output format
         #[arg(long, short = 'F', default_value = "table")]
         format: OutputFormat,
+
+        /// Allow UPDATE/DELETE on `blocks` to write changes back to the
+        /// source Markdown file (re-parsed in place). Without this flag,
+        /// UPDATE/DELETE are rejected.
+        #[arg(long)]
+        write_back: bool,
     },
 
     /// Interactive REPL (supports both mq and SQL)
@@ -105,6 +116,12 @@ enum Commands {
         /// Initial query mode
         #[arg(short, long, default_value = "sql")]
         mode: ReplMode,
+
+        /// Allow UPDATE/DELETE on `blocks` to write changes back to the
+        /// source Markdown file (re-parsed in place). Without this flag,
+        /// UPDATE/DELETE are rejected.
+        #[arg(long)]
+        write_back: bool,
     },
 
     /// Run structural lint checks
@@ -194,76 +211,6 @@ impl std::fmt::Display for ReplMode {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn collect_md_files(paths: &[PathBuf], recursive: bool) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for path in paths {
-        if path.is_file() {
-            if is_markdown(path) {
-                files.push(path.clone());
-            }
-        } else if path.is_dir() {
-            collect_dir(path, recursive, &mut files);
-        } else {
-            eprintln!("Warning: {} does not exist, skipping", path.display());
-        }
-    }
-    files
-}
-
-fn collect_dir(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.is_file() && is_markdown(&path) {
-            out.push(path);
-        } else if path.is_dir() && recursive {
-            collect_dir(&path, recursive, out);
-        }
-    }
-}
-
-fn is_markdown(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("md") | Some("markdown")
-    )
-}
-
-/// Reads every file in `files`, in order, using a small worker-thread pool —
-/// indexing many small files is I/O-latency bound, not CPU bound.
-fn read_files_parallel(files: &[PathBuf]) -> Vec<Result<String, MqdbError>> {
-    let worker_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(files.len().max(1));
-    if worker_count <= 1 {
-        return files
-            .iter()
-            .map(|p| std::fs::read_to_string(p).map_err(MqdbError::from))
-            .collect();
-    }
-
-    let chunk_size = files.len().div_ceil(worker_count);
-    std::thread::scope(|scope| {
-        files
-            .chunks(chunk_size)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|p| std::fs::read_to_string(p).map_err(MqdbError::from))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flat_map(|handle| handle.join().expect("file-read worker thread panicked"))
-            .collect()
-    })
-}
-
 fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
     if !db.exists() {
         anyhow::bail!(
@@ -346,57 +293,58 @@ async fn main() -> anyhow::Result<()> {
             output,
             recursive,
             no_spans,
+            prune,
         } => {
-            let files = collect_md_files(&paths, recursive);
+            let files = mq_db::discover::collect_markdown_files(&paths, recursive);
             if files.is_empty() {
                 anyhow::bail!("No Markdown files found in the specified paths.");
             }
 
-            let mut errors = 0usize;
-
-            if output.exists() {
-                // Append to the existing store file.
-                let mut store = DocumentStore::open(&output)
-                    .map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?;
-                for path in &files {
-                    match store.append_file(path) {
-                        Ok(_) => eprintln!("  ✓ {}", path.display()),
-                        Err(e) => {
-                            eprintln!("  ✗ {}: {}", path.display(), e);
-                            errors += 1;
-                        }
-                    }
-                }
-            } else {
-                // Create a new store file.
+            let is_new_store = !output.exists();
+            let mut store = if is_new_store {
                 let mut store = DocumentStore::new();
                 if no_spans {
                     store.set_store_spans(false);
                 }
-                let contents = read_files_parallel(&files);
-                for (path, content) in files.iter().zip(contents) {
-                    match content.and_then(|c| store.add_str_with_path(&c, Some(path.clone()))) {
-                        Ok(_) => eprintln!("  ✓ {}", path.display()),
-                        Err(e) => {
-                            eprintln!("  ✗ {}: {}", path.display(), e);
-                            errors += 1;
-                        }
-                    }
-                }
+                store
+            } else {
+                DocumentStore::open(&output)
+                    .map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?
+            };
+
+            let report = store
+                .reindex_paths(&files, prune)
+                .map_err(|e| anyhow::anyhow!("Failed to reindex: {}", e))?;
+
+            if is_new_store {
                 store
                     .save(&output)
                     .map_err(|e| anyhow::anyhow!("Failed to save store: {}", e))?;
             }
 
-            let indexed = files.len() - errors;
+            for path in &report.added {
+                eprintln!("  + {}", path.display());
+            }
+            for path in &report.updated {
+                eprintln!("  ~ {}", path.display());
+            }
+            for path in &report.removed {
+                eprintln!("  - {}", path.display());
+            }
+            for (path, err) in &report.failed {
+                eprintln!("  ✗ {}: {}", path.display(), err);
+            }
+
             println!(
-                "\nIndexed {} file{}{} → {}",
-                indexed,
-                if indexed == 1 { "" } else { "s" },
-                if errors > 0 {
-                    format!("  ({} failed)", errors)
-                } else {
+                "\n{} added, {} updated, {} unchanged, {} removed{} → {}",
+                report.added.len(),
+                report.updated.len(),
+                report.unchanged,
+                report.removed.len(),
+                if report.failed.is_empty() {
                     String::new()
+                } else {
+                    format!(", {} failed", report.failed.len())
                 },
                 output.display()
             );
@@ -572,6 +520,7 @@ async fn main() -> anyhow::Result<()> {
             db,
             file,
             format,
+            write_back,
         } => {
             let sql = if let Some(f) = file {
                 std::fs::read_to_string(&f)
@@ -582,9 +531,19 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("Provide a query argument or --file <path>");
             };
 
-            let store = open_store_for_sql(&db)?;
-            let engine = SqlEngine::new(&store).map_err(|e| anyhow::anyhow!("{}", e))?;
-            let out = engine.execute(&sql).map_err(|e| anyhow::anyhow!("{}", e))?;
+            if !write_back && is_write_statement(&sql) {
+                anyhow::bail!(
+                    "UPDATE/DELETE would write back to the source Markdown file; pass --write-back to allow this."
+                );
+            }
+
+            let mut store = open_store_for_sql(&db)?;
+            let out = if write_back {
+                store.execute_sql_mut(&sql)
+            } else {
+                SqlEngine::new(&store).and_then(|e| e.execute(&sql))
+            }
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
             match format {
                 OutputFormat::Table => print!("{}", out.to_table()),
                 OutputFormat::Json => print!("{}", out.to_json()),
@@ -596,9 +555,13 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // ── repl ─────────────────────────────────────────────────────────────
-        Commands::Repl { db, mode } => {
+        Commands::Repl {
+            db,
+            mode,
+            write_back,
+        } => {
             let store = open_store_for_sql(&db)?;
-            run_repl(store, mode)?;
+            run_repl(store, mode, write_back)?;
         }
 
         // ── lint ─────────────────────────────────────────────────────────────
@@ -641,35 +604,21 @@ async fn main() -> anyhow::Result<()> {
         // ── stats ─────────────────────────────────────────────────────────────
         Commands::Stats { db } => {
             let store = load_store(&db)?;
-            let mut type_counts: std::collections::HashMap<BlockType, usize> =
-                std::collections::HashMap::new();
-            let mut lang_counts: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            let mut total_blocks = 0usize;
+            let stats = store.stats();
 
-            for doc in store.documents() {
-                total_blocks += doc.blocks.len();
-                for block in &doc.blocks {
-                    *type_counts.entry(block.block_type.clone()).or_insert(0) += 1;
-                    if block.block_type == BlockType::Code
-                        && let Some(lang) = block.code_lang()
-                    {
-                        *lang_counts.entry(lang.to_string()).or_insert(0) += 1;
-                    }
-                }
-            }
+            println!("  Documents  {}", stats.documents);
+            println!("  Blocks     {}", stats.blocks);
 
-            println!("  Documents  {}", store.len());
-            println!("  Blocks     {}", total_blocks);
-
-            let mut types: Vec<(BlockType, usize)> = type_counts.into_iter().collect();
-            types.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
-            let max_type = types.first().map(|(_, v)| *v).unwrap_or(1);
+            let max_type = stats
+                .block_type_counts
+                .first()
+                .map(|(_, v)| *v)
+                .unwrap_or(1);
 
             println!("\n  Block types");
             println!("  {}", "─".repeat(56));
-            for (bt, count) in &types {
-                let pct = count * 100 / total_blocks.max(1);
+            for (bt, count) in &stats.block_type_counts {
+                let pct = count * 100 / stats.blocks.max(1);
                 let b = bar(*count, max_type, 20);
                 let icon = block_type_icon(bt);
                 println!(
@@ -682,15 +631,17 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            if !lang_counts.is_empty() {
-                let mut langs: Vec<(String, usize)> = lang_counts.into_iter().collect();
-                langs.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
-                let max_lang = langs.first().map(|(_, v)| *v).unwrap_or(1);
-                let total_code: usize = langs.iter().map(|(_, v)| v).sum();
+            if !stats.code_lang_counts.is_empty() {
+                let max_lang = stats
+                    .code_lang_counts
+                    .first()
+                    .map(|(_, v)| *v)
+                    .unwrap_or(1);
+                let total_code: usize = stats.code_lang_counts.iter().map(|(_, v)| v).sum();
 
                 println!("\n  Code languages");
                 println!("  {}", "─".repeat(56));
-                for (lang, count) in &langs {
+                for (lang, count) in &stats.code_lang_counts {
                     let pct = count * 100 / total_code.max(1);
                     let b = bar(*count, max_lang, 20);
                     println!("  {{}}  {:<12}  {}  {:>5}  ({:>2}%)", lang, b, count, pct);
@@ -1008,15 +959,24 @@ fn md_block_to_html(s: &str) -> String {
 // REPL
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn run_repl(store: DocumentStore, initial_mode: ReplMode) -> anyhow::Result<()> {
+/// Crude prefix check used to gate write-back before even attempting a
+/// parse — mirrors the DESC/SHOW TABLES prefix check in `SqlEngine::execute`.
+fn is_write_statement(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let upper = trimmed.to_ascii_uppercase();
+    upper.starts_with("UPDATE ") || upper.starts_with("DELETE ")
+}
+
+fn run_repl(mut store: DocumentStore, initial_mode: ReplMode, write_back: bool) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut mode = initial_mode;
 
-    // Build the SQL engine once — blocks and indexes are already loaded.
-    let sql_engine = SqlEngine::new(&store).map_err(|e| anyhow::anyhow!("{}", e))?;
-
     println!("mq-db  (.help for commands  .quit to exit)");
-    println!("mode: {}  (.mode mq | .mode sql)\n", mode);
+    println!(
+        "mode: {}  (.mode mq | .mode sql){}\n",
+        mode,
+        if write_back { "  [write-back: on]" } else { "" }
+    );
 
     loop {
         print!("{}> ", mode);
@@ -1046,7 +1006,16 @@ fn run_repl(store: DocumentStore, initial_mode: ReplMode) -> anyhow::Result<()> 
                 println!("→ sql mode");
             }
             _ => match mode {
-                ReplMode::Sql => match sql_engine.execute(input) {
+                ReplMode::Sql if !write_back && is_write_statement(input) => {
+                    eprintln!(
+                        "error: UPDATE/DELETE would write back to the source Markdown file; restart with --write-back to allow this."
+                    );
+                }
+                ReplMode::Sql if write_back => match store.execute_sql_mut(input) {
+                    Ok(out) => print!("{}", out.to_table()),
+                    Err(e) => eprintln!("error: {}", e),
+                },
+                ReplMode::Sql => match SqlEngine::new(&store).and_then(|e| e.execute(input)) {
                     Ok(out) => print!("{}", out.to_table()),
                     Err(e) => eprintln!("error: {}", e),
                 },
