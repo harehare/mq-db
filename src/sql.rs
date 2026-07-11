@@ -52,8 +52,8 @@ use sqlparser::{
         DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
         FunctionArguments, GroupByExpr, Insert, JoinConstraint, JoinOperator, LimitClause,
         ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select,
-        SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
-        TrimWhereField, UnaryOperator, Value as SqlValue, Values,
+        SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, TrimWhereField,
+        UnaryOperator, Value as SqlValue, Values,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -2160,8 +2160,11 @@ fn collect_matched_edits(
     }
 
     let engine = SqlEngine::new(store)?;
-    let mut rows =
-        engine.materialise_from_with_hint(std::slice::from_ref(target), &IndexHint::FullScan, None)?;
+    let mut rows = engine.materialise_from_with_hint(
+        std::slice::from_ref(target),
+        &IndexHint::FullScan,
+        None,
+    )?;
     if let Some(sel) = selection {
         let resolved = engine.resolve_subqueries(sel)?;
         rows.retain(|row| eval_expr(&resolved, row).is_truthy());
@@ -2278,7 +2281,7 @@ fn apply_matched_edits(
 
         // Apply from the bottom up so earlier edits don't shift later
         // (already-resolved) line numbers.
-        line_edits.sort_by(|a, b| b.start_line.cmp(&a.start_line));
+        line_edits.sort_by_key(|edit| std::cmp::Reverse(edit.start_line));
         for edit in &line_edits {
             let start = edit.start_line.saturating_sub(1);
             let end = edit.end_line.min(lines.len());
@@ -3610,10 +3613,7 @@ mod tests {
             .unwrap();
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            on_disk,
-            "# Title\n\nNew body\n\nAnother paragraph\n"
-        );
+        assert_eq!(on_disk, "# Title\n\nNew body\n\nAnother paragraph\n");
     }
 
     #[test]
@@ -3648,7 +3648,9 @@ mod tests {
         store.add_file(&path).unwrap();
 
         let err = store
-            .execute_sql_mut("UPDATE blocks SET content = 'fn other() {}' WHERE block_type = 'code'")
+            .execute_sql_mut(
+                "UPDATE blocks SET content = 'fn other() {}' WHERE block_type = 'code'",
+            )
             .unwrap_err();
         assert!(err.to_string().contains("heading/paragraph"));
     }

@@ -965,10 +965,14 @@ mod reindex_tests {
         let a = write_md(&dir, "a.md", "# A\n\nHello\n");
 
         let mut store = DocumentStore::new();
-        store.reindex_paths(&[a.clone()], false).unwrap();
+        store
+            .reindex_paths(std::slice::from_ref(&a), false)
+            .unwrap();
         let doc_id_before = store.documents()[0].id;
 
-        let report = store.reindex_paths(&[a.clone()], false).unwrap();
+        let report = store
+            .reindex_paths(std::slice::from_ref(&a), false)
+            .unwrap();
 
         assert!(report.added.is_empty());
         assert!(report.updated.is_empty());
@@ -982,11 +986,15 @@ mod reindex_tests {
         let a = write_md(&dir, "a.md", "# A\n\nHello\n");
 
         let mut store = DocumentStore::new();
-        store.reindex_paths(&[a.clone()], false).unwrap();
+        store
+            .reindex_paths(std::slice::from_ref(&a), false)
+            .unwrap();
         let doc_id_before = store.documents()[0].id;
 
         std::fs::write(&a, "# A Changed\n\nNew body\n").unwrap();
-        let report = store.reindex_paths(&[a.clone()], false).unwrap();
+        let report = store
+            .reindex_paths(std::slice::from_ref(&a), false)
+            .unwrap();
 
         assert!(report.added.is_empty());
         assert_eq!(report.updated, vec![a]);
@@ -1010,7 +1018,7 @@ mod reindex_tests {
         store.reindex_paths(&[a.clone(), b.clone()], false).unwrap();
         assert_eq!(store.documents().len(), 2);
 
-        let report = store.reindex_paths(&[a.clone()], true).unwrap();
+        let report = store.reindex_paths(std::slice::from_ref(&a), true).unwrap();
 
         assert_eq!(report.removed, vec![b]);
         assert_eq!(report.unchanged, 1);
@@ -1025,11 +1033,15 @@ mod reindex_tests {
         let db_path = dir.path().join("store.mq-db");
 
         let mut store = DocumentStore::new();
-        store.reindex_paths(&[a.clone()], false).unwrap();
+        store
+            .reindex_paths(std::slice::from_ref(&a), false)
+            .unwrap();
         store.save(&db_path).unwrap();
 
         let mut reopened = DocumentStore::open(&db_path).unwrap();
-        let report = reopened.reindex_paths(&[a.clone()], false).unwrap();
+        let report = reopened
+            .reindex_paths(std::slice::from_ref(&a), false)
+            .unwrap();
 
         assert_eq!(report.unchanged, 1);
         assert!(report.added.is_empty());

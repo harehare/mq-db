@@ -35,6 +35,9 @@ pub struct CustomTableEntry {
     pub num_rows: u32,
 }
 
+/// Catalog entries, custom tables, and content hashes read from a page file.
+pub type CatalogData = (Vec<CatalogEntry>, Vec<CustomTableEntry>, Vec<(u32, u64)>);
+
 fn invalid_data(message: impl Into<String>) -> MqdbError {
     MqdbError::Storage(message.into())
 }
@@ -198,9 +201,7 @@ pub fn write_catalog(
     Ok(())
 }
 
-pub fn read_catalog(
-    pf: &mut PageFile,
-) -> Result<(Vec<CatalogEntry>, Vec<CustomTableEntry>, Vec<(u32, u64)>), MqdbError> {
+pub fn read_catalog(pf: &mut PageFile) -> Result<CatalogData, MqdbError> {
     if pf.num_pages < 2 {
         return Err(invalid_data("catalog start page is missing"));
     }
@@ -410,7 +411,7 @@ mod tests {
         // Reserve page 1 the same way `Storage::create` does.
         let placeholder = make_page(PAGE_TYPE_CATALOG, 1, 0, &0u32.to_le_bytes());
         pf.append_page(&placeholder).unwrap();
-        write_catalog(&mut pf, &[entry.clone()], &[], &hashes).unwrap();
+        write_catalog(&mut pf, std::slice::from_ref(&entry), &[], &hashes).unwrap();
         pf.sync_header().unwrap();
         drop(pf);
 

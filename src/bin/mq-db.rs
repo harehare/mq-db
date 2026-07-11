@@ -632,11 +632,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             if !stats.code_lang_counts.is_empty() {
-                let max_lang = stats
-                    .code_lang_counts
-                    .first()
-                    .map(|(_, v)| *v)
-                    .unwrap_or(1);
+                let max_lang = stats.code_lang_counts.first().map(|(_, v)| *v).unwrap_or(1);
                 let total_code: usize = stats.code_lang_counts.iter().map(|(_, v)| v).sum();
 
                 println!("\n  Code languages");
@@ -967,7 +963,11 @@ fn is_write_statement(sql: &str) -> bool {
     upper.starts_with("UPDATE ") || upper.starts_with("DELETE ")
 }
 
-fn run_repl(mut store: DocumentStore, initial_mode: ReplMode, write_back: bool) -> anyhow::Result<()> {
+fn run_repl(
+    mut store: DocumentStore,
+    initial_mode: ReplMode,
+    write_back: bool,
+) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut mode = initial_mode;
 

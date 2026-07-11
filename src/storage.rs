@@ -9,7 +9,7 @@ use crate::{
     document::Document,
     error::MqdbError,
     storage::{
-        catalog::{CatalogEntry, CustomTableEntry, read_catalog, write_catalog},
+        catalog::{CatalogData, CatalogEntry, CustomTableEntry, read_catalog, write_catalog},
         codec::{decode_block, decode_table_rows, encode_block, encode_table_rows},
         page::{
             PAGE_BODY_SIZE, PAGE_HEADER_SIZE, PAGE_TYPE_BLOCK_DATA, PAGE_TYPE_CATALOG,
@@ -162,9 +162,7 @@ impl Storage {
     }
 
     /// Read the catalog.
-    pub fn load_catalog(
-        &mut self,
-    ) -> Result<(Vec<CatalogEntry>, Vec<CustomTableEntry>, Vec<(u32, u64)>), MqdbError> {
+    pub fn load_catalog(&mut self) -> Result<CatalogData, MqdbError> {
         read_catalog(&mut self.page_file)
     }
 
