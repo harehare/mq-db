@@ -38,8 +38,9 @@ flowchart TD
 - **Three-layer secondary indexes** — `BitmapIndex` (block type), `BTreeIndex` (pre/post), `HashIndex` (content/lang/depth) for fast SQL predicate pushdown
 - **Zone Maps** — per-document statistics skip irrelevant files before scanning any blocks
 - **Dual query engines** — SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
+- **`WITH` (CTE) support** — non-recursive common table expressions, usable in `FROM`, `JOIN`, and subqueries
 - **Incremental re-indexing** — re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
-- **SQL `UPDATE`/`DELETE` with write-back** — edit `blocks` and push the change back to the source Markdown file, opt-in via `--write-back`
+- **SQL `INSERT`/`UPDATE`/`DELETE` with write-back** — add, edit, or remove `blocks` and push the change back to the source Markdown file, opt-in via `--write-back`
 - **DDL support** — `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
 - **Comprehensive SQL function library** — string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
 - **`mq()` scalar function** — run an mq program against Markdown content inline in SQL
@@ -165,11 +166,25 @@ mq-db sql "
 mq-db sql "SELECT mq('.h1 | to_text', content) AS title FROM blocks WHERE block_type = 'code'" --db store.mq-db
 ```
 
-### UPDATE / DELETE with write-back
+**CTE (`WITH`)** — name an intermediate result and reuse it in the main query, a join, or a subquery:
 
-`UPDATE`/`DELETE` on `blocks` write the change back to the block's *source
-Markdown file* (re-parsed in place, same `DocumentId`) — pass `--write-back`
-to allow it; without the flag the statement is rejected:
+```bash
+mq-db sql "
+  WITH headings AS (SELECT content, pre, post FROM blocks WHERE block_type = 'heading')
+  SELECT content FROM headings WHERE pre < 10 ORDER BY pre
+" --db store.mq-db
+```
+
+`WITH RECURSIVE` is not supported. A CTE name identical to `blocks`,
+`documents`, or a custom table shadows it for the duration of the `WITH`
+clause's scope.
+
+### INSERT / UPDATE / DELETE with write-back
+
+`INSERT`/`UPDATE`/`DELETE` on `blocks` write the change back to the
+document's *source Markdown file* (re-parsed in place, same `DocumentId`)
+— pass `--write-back` to allow it; without the flag the statement is
+rejected:
 
 ```bash
 mq-db sql "UPDATE blocks SET content = 'New Title' WHERE block_type = 'heading' AND content = 'Old Title'" \
@@ -177,11 +192,20 @@ mq-db sql "UPDATE blocks SET content = 'New Title' WHERE block_type = 'heading' 
 
 mq-db sql "DELETE FROM blocks WHERE content = 'Outdated paragraph'" \
   --db store.mq-db --write-back
+
+# after_pre anchors the new block right after an existing block's `pre`;
+# omit it to append at the end of the document.
+mq-db sql "INSERT INTO blocks (document_id, block_type, content, depth, after_pre) VALUES (0, 'heading', 'New Section', 2, 4)" \
+  --db store.mq-db --write-back
+
+mq-db sql "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'Appended at the end')" \
+  --db store.mq-db --write-back
 ```
 
 Limitations in this version:
 
-- `UPDATE ... SET content` only supports `heading`/`paragraph` blocks (not tables, code, lists, ...)
+- `UPDATE ... SET content` and `INSERT INTO blocks` only support `heading`/`paragraph` blocks (not tables, code, lists, ...)
+- `INSERT INTO blocks` requires an explicit column list drawn from `document_id`, `block_type`, `content`, `depth` (required for `heading`, 1-6), `after_pre` (optional) — `INSERT ... SELECT` is not supported, only `VALUES`
 - Only documents indexed **with spans** (the default; not `--no-spans`) and from a real file (not added via the library's `add_str`) are eligible
 - Not available over `serve`'s HTTP endpoint or from `mq-mcp` — CLI (`sql`/`repl` with `--write-back`) and the library (`DocumentStore::execute_sql_mut`) only
 
@@ -544,6 +568,18 @@ SELECT
 FROM blocks
 WHERE block_type = 'heading'
 GROUP BY CASE WHEN depth <= 1 THEN 'top-level' ELSE 'nested' END;
+
+-- CTE: rank documents by how many headings they contain
+WITH heading_counts AS (
+  SELECT document_id, count(*) AS n
+  FROM blocks
+  WHERE block_type = 'heading'
+  GROUP BY document_id
+)
+SELECT d.path, h.n
+FROM heading_counts h
+JOIN documents d ON d.id = h.document_id
+ORDER BY h.n DESC;
 ```
 
 ## Architecture

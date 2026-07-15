@@ -5,6 +5,8 @@ use std::{
     sync::{Mutex, RwLock},
 };
 
+use rustc_hash::FxHashMap;
+
 /// In-memory state for a user-defined table.
 ///
 /// `first_row_page`/`last_row_page` track where this table's rows live in
@@ -311,12 +313,9 @@ impl DocumentStore {
 
     /// Core of [`append_str`](Self::append_str)/[`append_file`](Self::append_file).
     ///
-    /// `flush` controls whether the on-disk catalog is rewritten immediately
-    /// after this document's pages are written. Single-document callers pass
-    /// `true` for durability; bulk callers like
-    /// [`reindex_paths`](Self::reindex_paths) pass `false` and flush once
-    /// after the whole batch, since rewriting the full catalog after every
-    /// file makes an N-document reindex cost O(N²).
+    /// `flush` rewrites the on-disk catalog immediately if `true`. Bulk
+    /// callers like [`reindex_paths`](Self::reindex_paths) pass `false` and
+    /// flush once after the whole batch instead.
     fn do_append(
         &mut self,
         content: &str,
@@ -401,10 +400,7 @@ impl DocumentStore {
     }
 
     /// Like [`do_replace`](Self::do_replace) but takes the document's index
-    /// in `self.documents` directly instead of scanning for it — for bulk
-    /// callers like [`reindex_paths`](Self::reindex_paths) that already know
-    /// the position and would otherwise turn an N-document reindex into an
-    /// O(N²) scan.
+    /// in `self.documents` directly instead of scanning for it.
     fn do_replace_at(
         &mut self,
         pos: usize,
@@ -469,11 +465,9 @@ impl DocumentStore {
         let mut seen: HashSet<PathBuf> = HashSet::with_capacity(files.len());
         let contents = read_files_parallel(files);
 
-        // Path -> (DocumentId, position in `self.documents`), built once so
-        // each file below is an O(1) lookup instead of a linear scan over
-        // every already-indexed document — the latter turns an N-document
-        // reindex into O(N²) work.
-        let mut by_path: HashMap<PathBuf, (DocumentId, usize)> = self
+        // Path -> (DocumentId, position), for O(1) lookup instead of an
+        // O(N) scan per file below.
+        let mut by_path: FxHashMap<PathBuf, (DocumentId, usize)> = self
             .documents
             .iter()
             .enumerate()

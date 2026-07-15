@@ -46,6 +46,7 @@
 
 use std::collections::HashMap;
 
+use rustc_hash::FxHashMap;
 use sqlparser::{
     ast::{
         AssignmentTarget, BinaryOperator, CaseWhen, CeilFloorKind, CreateTable, DateTimeField,
@@ -1441,6 +1442,10 @@ pub struct SqlEngine<'a> {
     store: &'a DocumentStore,
     /// One `DocumentIndex` per document, in the same order as `store.documents()`.
     indexes: Vec<DocumentIndex>,
+    /// Stack of CTE scopes from `WITH` clauses, one frame per nested
+    /// `exec_query` call. Looked up innermost-first so a nested subquery's
+    /// own `WITH` shadows an outer CTE of the same name.
+    cte_scopes: std::cell::RefCell<Vec<FxHashMap<String, std::rc::Rc<QueryOutput>>>>,
 }
 
 impl<'a> SqlEngine<'a> {
@@ -1461,7 +1466,11 @@ impl<'a> SqlEngine<'a> {
                 }
             })
             .collect();
-        Ok(Self { store, indexes })
+        Ok(Self {
+            store,
+            indexes,
+            cte_scopes: std::cell::RefCell::new(Vec::new()),
+        })
     }
 
     fn documents_with_indexes(&self) -> impl Iterator<Item = (&Document, &DocumentIndex)> {
@@ -1760,7 +1769,40 @@ impl<'a> SqlEngine<'a> {
         })
     }
 
+    /// Materialises any `WITH` clause's CTEs into a new scope frame, then
+    /// delegates to [`Self::exec_query_body`].
     fn exec_query(&self, query: &Query) -> Result<QueryOutput, MqdbError> {
+        let Some(with) = &query.with else {
+            return self.exec_query_body(query);
+        };
+        if with.recursive {
+            return Err(MqdbError::SqlExec("WITH RECURSIVE is not supported".into()));
+        }
+
+        self.cte_scopes.borrow_mut().push(FxHashMap::default());
+        let result = (|| {
+            for cte in &with.cte_tables {
+                if !cte.alias.columns.is_empty() {
+                    return Err(MqdbError::SqlExec(
+                        "CTE column aliases (WITH x(a, b) AS ...) are not supported".into(),
+                    ));
+                }
+                let name = cte.alias.name.value.to_lowercase();
+                // `name` isn't in scope yet, so no self-reference (WITH RECURSIVE only).
+                let out = self.exec_query(&cte.query)?;
+                self.cte_scopes
+                    .borrow_mut()
+                    .last_mut()
+                    .expect("scope frame just pushed above")
+                    .insert(name, std::rc::Rc::new(out));
+            }
+            self.exec_query_body(query)
+        })();
+        self.cte_scopes.borrow_mut().pop();
+        result
+    }
+
+    fn exec_query_body(&self, query: &Query) -> Result<QueryOutput, MqdbError> {
         let select = match query.body.as_ref() {
             SetExpr::Select(s) => s,
             SetExpr::Values(Values { rows, .. }) => {
@@ -1927,6 +1969,27 @@ impl<'a> SqlEngine<'a> {
             }
             _ => return Err(MqdbError::SqlExec("unsupported FROM clause".into())),
         };
+
+        // A `WITH x AS (...)` shadows a real table named `x`; search
+        // innermost-to-outermost so nested `WITH`s shadow outer ones.
+        for scope in self.cte_scopes.borrow().iter().rev() {
+            if let Some(out) = scope.get(&table_name) {
+                let prefix = alias.as_deref().unwrap_or(&table_name);
+                return Ok(out
+                    .rows
+                    .iter()
+                    .map(|r| {
+                        qualify_row(
+                            Row {
+                                columns: out.columns.clone(),
+                                values: r.iter().map(|v| Value::Str(v.clone())).collect(),
+                            },
+                            prefix,
+                        )
+                    })
+                    .collect());
+            }
+        }
 
         match table_name.as_str() {
             "blocks" => {
@@ -2192,26 +2255,31 @@ fn collect_matched_edits(
         .collect()
 }
 
-/// Renders `edit`'s replacement text for a matched block, or returns `Ok(None)`
-/// for a `DELETE` (no replacement — the lines are removed outright).
-///
-/// `UPDATE ... SET content` is only supported for `Heading`/`Paragraph`
-/// blocks in this version — anything else (tables, code, lists, ...) would
-/// need real structural re-rendering to stay valid Markdown, which is out
-/// of scope here.
-fn render_replacement(block: &Block, new_content: &str) -> Result<String, MqdbError> {
-    match &block.block_type {
+/// Renders Markdown source text for a `Heading`/`Paragraph` block. Shared by
+/// `UPDATE`/`INSERT INTO blocks` write-back. Other block types (tables,
+/// code, lists, ...) aren't supported.
+fn render_markdown_for(
+    block_type: &BlockType,
+    depth: Option<u8>,
+    content: &str,
+) -> Result<String, MqdbError> {
+    match block_type {
         BlockType::Heading => Ok(format!(
             "{} {}",
-            "#".repeat(block.heading_depth().unwrap_or(1).max(1) as usize),
-            new_content
+            "#".repeat(depth.unwrap_or(1).max(1) as usize),
+            content
         )),
-        BlockType::Paragraph => Ok(new_content.to_string()),
+        BlockType::Paragraph => Ok(content.to_string()),
         other => Err(MqdbError::SqlExec(format!(
-            "UPDATE ... SET content is only supported for heading/paragraph blocks (found {})",
+            "write-back is only supported for heading/paragraph blocks (found {})",
             other.as_str()
         ))),
     }
+}
+
+/// Renders `edit`'s replacement text for an existing matched block.
+fn render_replacement(block: &Block, new_content: &str) -> Result<String, MqdbError> {
+    render_markdown_for(&block.block_type, block.heading_depth(), new_content)
 }
 
 /// Applies `edits` (grouped by document) as a source-text patch + reparse:
@@ -2322,6 +2390,272 @@ fn apply_matched_edits(
     Ok(affected)
 }
 
+/// A new block to insert via `INSERT INTO blocks (...) VALUES (...)`.
+/// Mirrors [`MatchedBlockEdit`] but for insertion.
+struct NewBlockSpec {
+    document_id: u32,
+    block_type: BlockType,
+    content: String,
+    /// Required (1-6) iff `block_type` is `Heading`.
+    depth: Option<u8>,
+    /// `pre` of the block to insert after; `None` appends at document end.
+    after_pre: Option<u32>,
+    /// Position within `VALUES`, to preserve order among same-anchor rows.
+    row_index: usize,
+}
+
+const INSERT_BLOCKS_COLUMNS: [&str; 5] =
+    ["document_id", "block_type", "content", "depth", "after_pre"];
+
+/// Parses an `INSERT INTO blocks (...) VALUES (...)` statement into
+/// [`NewBlockSpec`]s. Only an explicit column list and a literal `VALUES`
+/// source are supported (no `INSERT ... SELECT`).
+fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
+    if ins.columns.is_empty() {
+        return Err(MqdbError::SqlExec(
+            "write-back INSERT INTO blocks requires an explicit column list".into(),
+        ));
+    }
+    let col_names: Vec<String> = ins
+        .columns
+        .iter()
+        .map(|c| c.0.last().map(ident_value).unwrap_or("").to_lowercase())
+        .collect();
+    for name in &col_names {
+        if !INSERT_BLOCKS_COLUMNS.contains(&name.as_str()) {
+            return Err(MqdbError::SqlExec(format!(
+                "write-back INSERT INTO blocks does not support column '{name}'"
+            )));
+        }
+    }
+
+    let source = ins
+        .source
+        .as_ref()
+        .ok_or_else(|| MqdbError::SqlExec("INSERT requires VALUES".into()))?;
+    let SetExpr::Values(Values { rows, .. }) = source.body.as_ref() else {
+        return Err(MqdbError::SqlExec(
+            "write-back INSERT INTO blocks only supports VALUES, not INSERT ... SELECT".into(),
+        ));
+    };
+
+    let empty = Row {
+        columns: vec![],
+        values: vec![],
+    };
+    rows.iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            if row.len() != col_names.len() {
+                return Err(MqdbError::SqlExec(format!(
+                    "expected {} values, got {}",
+                    col_names.len(),
+                    row.len()
+                )));
+            }
+
+            let mut document_id: Option<i64> = None;
+            let mut block_type: Option<BlockType> = None;
+            let mut content: Option<String> = None;
+            let mut depth: Option<u8> = None;
+            let mut after_pre: Option<u32> = None;
+
+            for (name, expr) in col_names.iter().zip(row.iter()) {
+                let value = eval_expr(expr, &empty);
+                match name.as_str() {
+                    "document_id" => {
+                        document_id = Some(value.as_i64().ok_or_else(|| {
+                            MqdbError::SqlExec("document_id must be an integer".into())
+                        })?);
+                    }
+                    "block_type" => {
+                        let s = value.as_str().ok_or_else(|| {
+                            MqdbError::SqlExec("block_type must be a string".into())
+                        })?;
+                        let bt = BlockType::from_str(&s.to_lowercase())
+                            .filter(|bt| matches!(bt, BlockType::Heading | BlockType::Paragraph))
+                            .ok_or_else(|| {
+                                MqdbError::SqlExec(format!(
+                                    "write-back is only supported for heading/paragraph blocks (found {s})"
+                                ))
+                            })?;
+                        block_type = Some(bt);
+                    }
+                    "content" => {
+                        content = match value {
+                            Value::Null => None,
+                            other => Some(other.display()),
+                        };
+                    }
+                    "depth" => {
+                        depth = match value {
+                            Value::Null => None,
+                            other => Some(other.as_i64().ok_or_else(|| {
+                                MqdbError::SqlExec("depth must be an integer".into())
+                            })? as u8),
+                        };
+                    }
+                    "after_pre" => {
+                        after_pre = match value {
+                            Value::Null => None,
+                            other => Some(other.as_i64().ok_or_else(|| {
+                                MqdbError::SqlExec("after_pre must be an integer".into())
+                            })? as u32),
+                        };
+                    }
+                    _ => unreachable!("column names validated above"),
+                }
+            }
+
+            let document_id = document_id
+                .ok_or_else(|| MqdbError::SqlExec("INSERT INTO blocks requires document_id".into()))?
+                as u32;
+            let block_type = block_type
+                .ok_or_else(|| MqdbError::SqlExec("INSERT INTO blocks requires block_type".into()))?;
+            let content = content.ok_or_else(|| {
+                MqdbError::SqlExec("INSERT INTO blocks requires non-NULL content".into())
+            })?;
+
+            match block_type {
+                BlockType::Heading => match depth {
+                    None => {
+                        return Err(MqdbError::SqlExec(
+                            "INSERT INTO blocks requires depth (1-6) for block_type 'heading'"
+                                .into(),
+                        ));
+                    }
+                    Some(d) if !(1..=6).contains(&d) => {
+                        return Err(MqdbError::SqlExec(
+                            "depth must be between 1 and 6 for block_type 'heading'".into(),
+                        ));
+                    }
+                    Some(_) => {}
+                },
+                BlockType::Paragraph if depth.is_some() => {
+                    return Err(MqdbError::SqlExec(
+                        "depth is only valid for block_type 'heading'".into(),
+                    ));
+                }
+                _ => {}
+            }
+
+            Ok(NewBlockSpec {
+                document_id,
+                block_type,
+                content,
+                depth,
+                after_pre,
+                row_index,
+            })
+        })
+        .collect()
+}
+
+/// Applies `specs` (grouped by document) by splicing rendered Markdown text
+/// into the source file at each spec's anchor position, then reparsing via
+/// [`DocumentStore::replace_document`], same as [`apply_matched_edits`].
+///
+/// Returns the number of blocks inserted.
+fn apply_new_blocks(
+    store: &mut DocumentStore,
+    specs: Vec<NewBlockSpec>,
+) -> Result<usize, MqdbError> {
+    let mut by_doc: FxHashMap<u32, Vec<NewBlockSpec>> = FxHashMap::default();
+    for spec in specs {
+        by_doc.entry(spec.document_id).or_default().push(spec);
+    }
+
+    let mut inserted = 0usize;
+    for (doc_id, doc_specs) in by_doc {
+        struct Insertion {
+            /// 0-indexed line to insert before. `usize::MAX` means "end of
+            /// file", resolved once the line count is known, below.
+            at: usize,
+            row_index: usize,
+            rendered: String,
+        }
+
+        let (path, mut insertions) = {
+            let doc = store
+                .get_document(doc_id)
+                .ok_or_else(|| MqdbError::SqlExec(format!("no such document: {doc_id}")))?;
+            let path = doc.path.clone().ok_or_else(|| {
+                MqdbError::SqlExec(
+                    "cannot write back: document has no source file (added via add_str)".into(),
+                )
+            })?;
+
+            let mut insertions = Vec::with_capacity(doc_specs.len());
+            for spec in &doc_specs {
+                let at = match spec.after_pre {
+                    Some(pre) => {
+                        let block = doc.blocks.iter().find(|b| b.pre == pre).ok_or_else(|| {
+                            MqdbError::SqlExec(format!(
+                                "after_pre {pre} does not match any block in document {doc_id}"
+                            ))
+                        })?;
+                        let span = block.span.as_ref().ok_or_else(|| {
+                            MqdbError::SqlExec(
+                                "write-back requires source spans; reindex without --no-spans"
+                                    .into(),
+                            )
+                        })?;
+                        span.end_line
+                    }
+                    None => usize::MAX,
+                };
+                let rendered = render_markdown_for(&spec.block_type, spec.depth, &spec.content)?;
+                insertions.push(Insertion {
+                    at,
+                    row_index: spec.row_index,
+                    rendered,
+                });
+            }
+            (path, insertions)
+        };
+
+        let original = std::fs::read_to_string(&path)?;
+        let had_trailing_newline = original.ends_with('\n');
+        let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+
+        for insertion in &mut insertions {
+            if insertion.at == usize::MAX {
+                insertion.at = lines.len();
+            }
+        }
+
+        // Bottom-up so earlier insertions don't shift later line numbers;
+        // ties broken by declared VALUES order.
+        insertions.sort_by_key(|ins| (std::cmp::Reverse(ins.at), std::cmp::Reverse(ins.row_index)));
+
+        for insertion in &insertions {
+            let at = insertion.at.min(lines.len());
+            let needs_leading_blank = at > 0 && !lines[at - 1].trim().is_empty();
+            let needs_trailing_blank = at < lines.len() && !lines[at].trim().is_empty();
+
+            let mut new_lines = vec![insertion.rendered.clone()];
+            if needs_trailing_blank {
+                new_lines.push(String::new());
+            }
+            if needs_leading_blank {
+                new_lines.insert(0, String::new());
+            }
+            lines.splice(at..at, new_lines);
+        }
+
+        let mut patched = lines.join("\n");
+        if had_trailing_newline {
+            patched.push('\n');
+        }
+
+        std::fs::write(&path, &patched)?;
+        inserted += doc_specs.len();
+        store.replace_document(doc_id, &patched, Some(path))?;
+    }
+
+    Ok(inserted)
+}
+
 impl DocumentStore {
     /// Execute a SQL statement that may mutate the store.
     ///
@@ -2410,6 +2744,24 @@ impl DocumentStore {
                     columns: vec!["deleted".to_string()],
                     rows: vec![vec![n.to_string()]],
                 })
+            }
+            Statement::Insert(ins) => {
+                let table_name = match &ins.table {
+                    TableObject::TableName(name) => {
+                        name.0.last().map(ident_value).unwrap_or("").to_lowercase()
+                    }
+                    _ => return Err(MqdbError::SqlExec("unsupported INSERT target".into())),
+                };
+                if table_name == "blocks" {
+                    let specs = collect_new_blocks(&ins)?;
+                    let n = apply_new_blocks(self, specs)?;
+                    Ok(QueryOutput {
+                        columns: vec!["inserted".to_string()],
+                        rows: vec![vec![n.to_string()]],
+                    })
+                } else {
+                    SqlEngine::new(self)?.execute(sql)
+                }
             }
             _ => SqlEngine::new(self)?.execute(sql),
         }
@@ -3567,6 +3919,145 @@ mod tests {
         assert_eq!(headings, vec!["A", "C", "C2", "C3"]);
     }
 
+    #[test]
+    fn cte_basic_select_from_named_cte() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "WITH headings AS (SELECT content FROM blocks WHERE block_type = 'heading')
+                 SELECT content FROM headings ORDER BY content",
+            )
+            .unwrap();
+        let contents: Vec<&str> = out.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(contents, vec!["Architecture", "Doc", "Other"]);
+    }
+
+    #[test]
+    fn cte_later_cte_references_earlier_cte_in_same_with() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "WITH h AS (SELECT content FROM blocks WHERE block_type = 'heading'),
+                      h2 AS (SELECT content FROM h WHERE content != 'Doc')
+                 SELECT content FROM h2 ORDER BY content",
+            )
+            .unwrap();
+        let contents: Vec<&str> = out.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(contents, vec!["Architecture", "Other"]);
+    }
+
+    #[test]
+    fn cte_forward_reference_to_later_cte_errors_unknown_table() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute(
+                "WITH a AS (SELECT content FROM b),
+                      b AS (SELECT content FROM blocks WHERE block_type = 'heading')
+                 SELECT content FROM a",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown table"));
+    }
+
+    #[test]
+    fn cte_used_in_join_both_sides() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "WITH h AS (SELECT content, document_id FROM blocks WHERE block_type = 'heading')
+                 SELECT a.content, b.content FROM h a JOIN h b
+                   ON a.document_id = b.document_id AND a.content = 'Doc' AND b.content = 'Other'",
+            )
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Doc".to_string(), "Other".to_string()]]);
+    }
+
+    #[test]
+    fn cte_visible_inside_subquery_in_where_clause() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "WITH h AS (SELECT content FROM blocks WHERE block_type = 'heading')
+                 SELECT content FROM blocks
+                 WHERE content = (SELECT content FROM h WHERE content = 'Doc')",
+            )
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Doc".to_string()]]);
+    }
+
+    #[test]
+    fn cte_recursive_rejected_with_clear_error() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute("WITH RECURSIVE r AS (SELECT content FROM blocks) SELECT content FROM r")
+            .unwrap_err();
+        assert!(err.to_string().contains("RECURSIVE"));
+    }
+
+    #[test]
+    fn cte_name_shadows_blocks_table() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("WITH blocks AS (SELECT 'shadowed' AS content) SELECT content FROM blocks")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["shadowed".to_string()]]);
+    }
+
+    #[test]
+    fn cte_name_collision_with_custom_table_prefers_cte() {
+        let mut store = make_store();
+        store
+            .execute_sql_mut("CREATE TABLE notes (name TEXT)")
+            .unwrap();
+        store
+            .execute_sql_mut("INSERT INTO notes (name) VALUES ('real')")
+            .unwrap();
+
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("WITH notes AS (SELECT 'cte' AS name) SELECT name FROM notes")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["cte".to_string()]]);
+    }
+
+    #[test]
+    fn cte_column_alias_list_rejected() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute(
+                "WITH h(a) AS (SELECT content FROM blocks WHERE block_type = 'heading')
+                 SELECT a FROM h",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("column aliases"));
+    }
+
+    #[test]
+    fn cte_shadowing_across_nested_subquery_with_same_name() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "WITH x AS (SELECT content FROM blocks WHERE content = 'Doc')
+                 SELECT content FROM blocks
+                 WHERE block_type = 'heading'
+                   AND (content = (WITH x AS (SELECT content FROM blocks WHERE content = 'Other') SELECT content FROM x)
+                        OR content = (SELECT content FROM x))
+                 ORDER BY content",
+            )
+            .unwrap();
+        let contents: Vec<&str> = out.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(contents, vec!["Doc", "Other"]);
+    }
+
     // ── UPDATE/DELETE write-back ────────────────────────────────────────────
 
     fn write_md(dir: &tempfile::TempDir, name: &str, content: &str) -> std::path::PathBuf {
@@ -3708,5 +4199,279 @@ mod tests {
             .execute_sql_mut("SELECT content FROM blocks WHERE block_type = 'heading'")
             .unwrap();
         assert_eq!(out.rows, vec![vec!["Title".to_string()]]);
+    }
+
+    fn title_pre(store: &DocumentStore) -> String {
+        SqlEngine::new(store)
+            .unwrap()
+            .execute("SELECT pre FROM blocks WHERE content = 'Title'")
+            .unwrap()
+            .rows[0][0]
+            .clone()
+    }
+
+    #[test]
+    fn write_back_insert_heading_after_pre_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+        let pre = title_pre(&store);
+
+        let out = store
+            .execute_sql_mut(&format!(
+                "INSERT INTO blocks (document_id, block_type, content, depth, after_pre) VALUES (0, 'heading', 'Subsection', 2, {pre})"
+            ))
+            .unwrap();
+        assert_eq!(out.rows[0][0], "1");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "# Title\n\n## Subsection\n\nBody\n");
+        assert!(
+            store.documents()[0]
+                .blocks
+                .iter()
+                .any(|b| b.content == "Subsection")
+        );
+    }
+
+    #[test]
+    fn write_back_insert_paragraph_append_at_end_no_after_pre() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let out = store
+            .execute_sql_mut(
+                "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'Appended')",
+            )
+            .unwrap();
+        assert_eq!(out.rows[0][0], "1");
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "# Title\n\nBody\n\nAppended\n");
+    }
+
+    #[test]
+    fn write_back_insert_append_preserves_missing_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.md");
+        std::fs::write(&path, "# Title\n\nBody").unwrap();
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        store
+            .execute_sql_mut(
+                "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'Appended')",
+            )
+            .unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "# Title\n\nBody\n\nAppended");
+    }
+
+    #[test]
+    fn write_back_insert_two_rows_same_after_pre_preserves_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+        let pre = title_pre(&store);
+
+        store
+            .execute_sql_mut(&format!(
+                "INSERT INTO blocks (document_id, block_type, content, after_pre) VALUES (0, 'paragraph', 'First', {pre}), (0, 'paragraph', 'Second', {pre})"
+            ))
+            .unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "# Title\n\nFirst\n\nSecond\n\nBody\n");
+    }
+
+    #[test]
+    fn write_back_insert_mixed_anchors_same_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+        let pre = title_pre(&store);
+
+        store
+            .execute_sql_mut(&format!(
+                "INSERT INTO blocks (document_id, block_type, content, after_pre) VALUES \
+                 (0, 'paragraph', 'AfterTitle', {pre}), \
+                 (0, 'paragraph', 'AtEnd', NULL)"
+            ))
+            .unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "# Title\n\nAfterTitle\n\nBody\n\nAtEnd\n");
+    }
+
+    #[test]
+    fn write_back_insert_multi_row_different_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = write_md(&dir, "a.md", "# A\n\nBodyA\n");
+        let path_b = write_md(&dir, "b.md", "# B\n\nBodyB\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path_a).unwrap();
+        store.add_file(&path_b).unwrap();
+
+        let out = store
+            .execute_sql_mut(
+                "INSERT INTO blocks (document_id, block_type, content) VALUES \
+                 (0, 'paragraph', 'ExtraA'), (1, 'paragraph', 'ExtraB')",
+            )
+            .unwrap();
+        assert_eq!(out.rows[0][0], "2");
+
+        assert_eq!(
+            std::fs::read_to_string(&path_a).unwrap(),
+            "# A\n\nBodyA\n\nExtraA\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path_b).unwrap(),
+            "# B\n\nBodyB\n\nExtraB\n"
+        );
+    }
+
+    #[test]
+    fn write_back_insert_rejects_unsupported_block_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let err = store
+            .execute_sql_mut(
+                "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'code', 'fn f(){}')",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("heading/paragraph"));
+    }
+
+    #[test]
+    fn write_back_insert_rejects_missing_depth_for_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let err = store
+            .execute_sql_mut(
+                "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'heading', 'New')",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("depth"));
+    }
+
+    #[test]
+    fn write_back_insert_rejects_depth_for_paragraph() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let err = store
+            .execute_sql_mut(
+                "INSERT INTO blocks (document_id, block_type, content, depth) VALUES (0, 'paragraph', 'New', 2)",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("depth"));
+    }
+
+    #[test]
+    fn write_back_insert_rejects_positional_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let err = store
+            .execute_sql_mut("INSERT INTO blocks VALUES (0, 'paragraph', 'New', NULL, NULL)")
+            .unwrap_err();
+        assert!(err.to_string().contains("column list"));
+    }
+
+    #[test]
+    fn write_back_insert_rejects_unknown_after_pre() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let err = store
+            .execute_sql_mut(
+                "INSERT INTO blocks (document_id, block_type, content, after_pre) VALUES (0, 'paragraph', 'New', 999)",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("after_pre"));
+    }
+
+    #[test]
+    fn write_back_insert_rejects_unknown_document_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let err = store
+            .execute_sql_mut(
+                "INSERT INTO blocks (document_id, block_type, content) VALUES (99, 'paragraph', 'New')",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no such document"));
+    }
+
+    #[test]
+    fn write_back_insert_rejects_document_with_no_source_path() {
+        let mut store = DocumentStore::new();
+        store.add_str("# Title\n\nBody\n").unwrap();
+
+        let err = store
+            .execute_sql_mut(
+                "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'New')",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no source file"));
+    }
+
+    #[test]
+    fn write_back_read_only_insert_into_blocks_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute(
+                "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'New')",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("blocks"));
+    }
+
+    #[test]
+    fn write_back_insert_into_custom_table_still_works_via_execute_sql_mut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        store
+            .execute_sql_mut("CREATE TABLE notes (name TEXT)")
+            .unwrap();
+        let out = store
+            .execute_sql_mut("INSERT INTO notes (name) VALUES ('hello')")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "1");
     }
 }
