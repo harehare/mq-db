@@ -967,20 +967,24 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             eval_mq_scalar(&program, &content)
         }
         "match" => {
-            let (Some(content), Some(query)) =
-                (args.first().and_then(Value::as_str), args.get(1).and_then(Value::as_str))
-            else {
+            let (Some(content), Some(query)) = (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+            ) else {
                 return Value::Bool(false);
             };
             let content_terms: std::collections::HashSet<String> =
                 tokenize(content).into_iter().collect();
             let query_terms = tokenize(query);
-            Value::Bool(!query_terms.is_empty() && query_terms.iter().all(|t| content_terms.contains(t)))
+            Value::Bool(
+                !query_terms.is_empty() && query_terms.iter().all(|t| content_terms.contains(t)),
+            )
         }
         "score" => {
-            let (Some(content), Some(query)) =
-                (args.first().and_then(Value::as_str), args.get(1).and_then(Value::as_str))
-            else {
+            let (Some(content), Some(query)) = (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+            ) else {
                 return Value::Float(0.0);
             };
             let content_terms = tokenize(content);
@@ -3319,15 +3323,23 @@ fn analyze_where_for_index(expr: &Expr) -> IndexHint {
         // match(content, 'query terms') used directly as a boolean predicate
         // (unlike the other arms above, this isn't wrapped in a BinaryOp).
         Expr::Function(f) => {
-            let name = f.name.0.last().map(ident_value).unwrap_or("").to_lowercase();
+            let name = f
+                .name
+                .0
+                .last()
+                .map(ident_value)
+                .unwrap_or("")
+                .to_lowercase();
             if name != "match" {
                 return IndexHint::FullScan;
             }
             let FunctionArguments::List(al) = &f.args else {
                 return IndexHint::FullScan;
             };
-            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(col)), FunctionArg::Unnamed(FunctionArgExpr::Expr(q))] =
-                al.args.as_slice()
+            let [
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(col)),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(q)),
+            ] = al.args.as_slice()
             else {
                 return IndexHint::FullScan;
             };
@@ -3856,9 +3868,11 @@ mod tests {
 
     #[test]
     fn where_match_uses_term_match_index_hint() {
-        let stmts =
-            Parser::parse_sql(&GenericDialect {}, "SELECT * FROM blocks WHERE match(content, 'foo bar')")
-                .unwrap();
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT * FROM blocks WHERE match(content, 'foo bar')",
+        )
+        .unwrap();
         let Statement::Query(q) = stmts.into_iter().next().unwrap() else {
             panic!("expected query")
         };
@@ -3887,9 +3901,11 @@ mod tests {
 
     #[test]
     fn where_match_full_scan_fallback_when_query_not_literal() {
-        let stmts =
-            Parser::parse_sql(&GenericDialect {}, "SELECT * FROM blocks WHERE match(content, lang)")
-                .unwrap();
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT * FROM blocks WHERE match(content, lang)",
+        )
+        .unwrap();
         let Statement::Query(q) = stmts.into_iter().next().unwrap() else {
             panic!("expected query")
         };
