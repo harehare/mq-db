@@ -17,6 +17,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use mq_db::{DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape};
 use serde::Deserialize;
 
+#[cfg(feature = "use_mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI structure
 // ─────────────────────────────────────────────────────────────────────────────
