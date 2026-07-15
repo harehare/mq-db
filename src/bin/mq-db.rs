@@ -17,9 +17,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use mq_db::{DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape};
 use serde::Deserialize;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CLI structure
-// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(feature = "use_mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(
@@ -977,9 +977,10 @@ fn is_insert_into_blocks(upper: &str) -> bool {
         .trim_start()
         .trim_start_matches(['"', '`'])
         .trim_start();
-    table == "BLOCKS" || ["BLOCKS ", "BLOCKS(", "BLOCKS\"", "BLOCKS`"]
-        .iter()
-        .any(|p| table.starts_with(p))
+    table == "BLOCKS"
+        || ["BLOCKS ", "BLOCKS(", "BLOCKS\"", "BLOCKS`"]
+            .iter()
+            .any(|p| table.starts_with(p))
 }
 
 fn run_repl(

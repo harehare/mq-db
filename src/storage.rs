@@ -692,7 +692,9 @@ mod tests {
 
         std::fs::write(&path, &bytes).unwrap();
 
-        let err = DocumentStore::open(&path).err().expect("expected version rejection");
+        let err = DocumentStore::open(&path)
+            .err()
+            .expect("expected version rejection");
         assert!(err.to_string().contains("unsupported file version"));
 
         cleanup(&path);

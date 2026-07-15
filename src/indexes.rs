@@ -281,8 +281,13 @@ impl TermIndex {
             if acc.is_empty() {
                 break;
             }
-            let set: std::collections::HashSet<u32> =
-                self.postings.get(term).into_iter().flatten().copied().collect();
+            let set: std::collections::HashSet<u32> = self
+                .postings
+                .get(term)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
             acc.retain(|idx| set.contains(idx));
         }
         acc.into_iter().collect()
@@ -833,9 +838,8 @@ mod tests {
 
     #[test]
     fn test_document_index_to_bytes_from_bytes_roundtrip_includes_term_index() {
-        let blocks = blocks_from(
-            "# Title\n\nSome prose here.\n\n```rust\nfn main() { let x = 1; }\n```\n",
-        );
+        let blocks =
+            blocks_from("# Title\n\nSome prose here.\n\n```rust\nfn main() { let x = 1; }\n```\n");
         let idx = DocumentIndex::build(&blocks);
         let restored = DocumentIndex::from_bytes(&idx.to_bytes()).unwrap();
 
