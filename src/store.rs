@@ -297,7 +297,7 @@ impl DocumentStore {
     /// When called on an in-memory store (no backing file) this behaves
     /// identically to [`add_str`](DocumentStore::add_str).
     pub fn append_str(&mut self, content: &str) -> Result<DocumentId, MqdbError> {
-        self.do_append(content, None)
+        self.do_append(content, None, true)
     }
 
     /// Append a Markdown file to the existing `.mq-db` file (in-place).
@@ -306,13 +306,22 @@ impl DocumentStore {
     pub fn append_file(&mut self, path: impl AsRef<Path>) -> Result<DocumentId, MqdbError> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path)?;
-        self.do_append(&content, Some(path.to_path_buf()))
+        self.do_append(&content, Some(path.to_path_buf()), true)
     }
 
+    /// Core of [`append_str`](Self::append_str)/[`append_file`](Self::append_file).
+    ///
+    /// `flush` controls whether the on-disk catalog is rewritten immediately
+    /// after this document's pages are written. Single-document callers pass
+    /// `true` for durability; bulk callers like
+    /// [`reindex_paths`](Self::reindex_paths) pass `false` and flush once
+    /// after the whole batch, since rewriting the full catalog after every
+    /// file makes an N-document reindex cost O(N²).
     fn do_append(
         &mut self,
         content: &str,
         md_path: Option<PathBuf>,
+        flush: bool,
     ) -> Result<DocumentId, MqdbError> {
         let md =
             Markdown::from_markdown_str(content).map_err(|e| MqdbError::Parse(e.to_string()))?;
@@ -330,9 +339,6 @@ impl DocumentStore {
         let idx_opt = {
             let mut storage_guard = self.storage.lock().unwrap();
             if let Some(storage) = storage_guard.as_mut() {
-                // Reconstruct catalog entries from already-loaded document metadata.
-                let mut entries = self.catalog_entries();
-
                 let first_block_page = storage.write_document(&doc)?;
                 doc.first_block_page = first_block_page;
 
@@ -340,25 +346,17 @@ impl DocumentStore {
                 let index_start_page = storage.write_index(&idx.to_bytes())?;
                 doc.index_start_page = index_start_page;
 
-                entries.push(CatalogEntry {
-                    document_id: doc.id,
-                    path: doc.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                    first_block_page,
-                    num_blocks: doc.block_count,
-                    zone_map_bytes: encode_zone_map(&doc.zone_maps),
-                    index_start_page,
-                });
-
-                let custom = persist_unsaved_table_rows(storage, &self.custom_tables)?;
-                storage.flush_catalog(&entries, &custom, &self.content_hash_pairs())?;
                 Some(idx)
             } else {
                 None
             }
         };
         self.doc_indexes.push(idx_opt);
-
         self.documents.push(doc);
+
+        if flush {
+            self.try_flush_catalog_to_storage();
+        }
         Ok(doc_id)
     }
 
@@ -382,12 +380,39 @@ impl DocumentStore {
         content: &str,
         path: Option<PathBuf>,
     ) -> Result<(), MqdbError> {
+        self.do_replace(doc_id, content, path, true)
+    }
+
+    /// Core of [`replace_document`](Self::replace_document). See
+    /// [`do_append`](Self::do_append) for what `flush` controls and why.
+    fn do_replace(
+        &mut self,
+        doc_id: DocumentId,
+        content: &str,
+        path: Option<PathBuf>,
+        flush: bool,
+    ) -> Result<(), MqdbError> {
         let pos = self
             .documents
             .iter()
             .position(|d| d.id == doc_id)
             .ok_or_else(|| MqdbError::Storage(format!("no such document: {doc_id}")))?;
+        self.do_replace_at(pos, doc_id, content, path, flush)
+    }
 
+    /// Like [`do_replace`](Self::do_replace) but takes the document's index
+    /// in `self.documents` directly instead of scanning for it — for bulk
+    /// callers like [`reindex_paths`](Self::reindex_paths) that already know
+    /// the position and would otherwise turn an N-document reindex into an
+    /// O(N²) scan.
+    fn do_replace_at(
+        &mut self,
+        pos: usize,
+        doc_id: DocumentId,
+        content: &str,
+        path: Option<PathBuf>,
+        flush: bool,
+    ) -> Result<(), MqdbError> {
         let md =
             Markdown::from_markdown_str(content).map_err(|e| MqdbError::Parse(e.to_string()))?;
         let mut blocks = index::build_blocks(doc_id, &md.nodes);
@@ -401,8 +426,6 @@ impl DocumentStore {
         let idx_opt = {
             let mut storage_guard = self.storage.lock().unwrap();
             if let Some(storage) = storage_guard.as_mut() {
-                let mut entries = self.catalog_entries();
-
                 let first_block_page = storage.write_document(&doc)?;
                 doc.first_block_page = first_block_page;
 
@@ -410,16 +433,6 @@ impl DocumentStore {
                 let index_start_page = storage.write_index(&idx.to_bytes())?;
                 doc.index_start_page = index_start_page;
 
-                if let Some(entry) = entries.iter_mut().find(|e| e.document_id == doc_id) {
-                    entry.path = doc.path.as_ref().map(|p| p.to_string_lossy().into_owned());
-                    entry.first_block_page = first_block_page;
-                    entry.num_blocks = doc.block_count;
-                    entry.zone_map_bytes = encode_zone_map(&doc.zone_maps);
-                    entry.index_start_page = index_start_page;
-                }
-
-                let custom = persist_unsaved_table_rows(storage, &self.custom_tables)?;
-                storage.flush_catalog(&entries, &custom, &self.content_hash_pairs())?;
                 Some(idx)
             } else {
                 None
@@ -428,6 +441,10 @@ impl DocumentStore {
 
         self.documents[pos] = doc;
         self.doc_indexes[pos] = idx_opt;
+
+        if flush {
+            self.try_flush_catalog_to_storage();
+        }
         Ok(())
     }
 
@@ -452,34 +469,42 @@ impl DocumentStore {
         let mut seen: HashSet<PathBuf> = HashSet::with_capacity(files.len());
         let contents = read_files_parallel(files);
 
+        // Path -> (DocumentId, position in `self.documents`), built once so
+        // each file below is an O(1) lookup instead of a linear scan over
+        // every already-indexed document — the latter turns an N-document
+        // reindex into O(N²) work.
+        let mut by_path: HashMap<PathBuf, (DocumentId, usize)> = self
+            .documents
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| d.path.clone().map(|p| (p, (d.id, i))))
+            .collect();
+
         for (path, content) in files.iter().zip(contents) {
             seen.insert(path.clone());
             let result = (|| -> Result<(), MqdbError> {
                 let content = content?;
                 let hash = hash_bytes(content.as_bytes());
 
-                let existing = self
-                    .documents
-                    .iter()
-                    .find(|d| d.path.as_deref() == Some(path.as_path()))
-                    .map(|d| d.id);
+                let existing = by_path.get(path).copied();
 
                 match existing {
-                    Some(doc_id) if self.content_hashes.get(&doc_id) == Some(&hash) => {
+                    Some((doc_id, _)) if self.content_hashes.get(&doc_id) == Some(&hash) => {
                         report.unchanged += 1;
                     }
-                    Some(doc_id) => {
-                        self.replace_document(doc_id, &content, Some(path.clone()))?;
+                    Some((doc_id, pos)) => {
+                        self.do_replace_at(pos, doc_id, &content, Some(path.clone()), false)?;
                         self.content_hashes.insert(doc_id, hash);
                         report.updated.push(path.clone());
                     }
                     None => {
                         let doc_id = if self.storage.lock().unwrap().is_some() {
-                            self.do_append(&content, Some(path.clone()))?
+                            self.do_append(&content, Some(path.clone()), false)?
                         } else {
                             self.add_str_with_path(&content, Some(path.clone()))?
                         };
                         self.content_hashes.insert(doc_id, hash);
+                        by_path.insert(path.clone(), (doc_id, self.documents.len() - 1));
                         report.added.push(path.clone());
                     }
                 }
