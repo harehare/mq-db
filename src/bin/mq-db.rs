@@ -957,10 +957,29 @@ fn md_block_to_html(s: &str) -> String {
 
 /// Crude prefix check used to gate write-back before even attempting a
 /// parse — mirrors the DESC/SHOW TABLES prefix check in `SqlEngine::execute`.
+///
+/// `INSERT INTO <custom table>` is deliberately *not* flagged here — it
+/// never writes back to a Markdown file and works without `--write-back`.
+/// Only `INSERT INTO blocks` does; real enforcement of that distinction
+/// lives in `DocumentStore::execute_sql_mut` (dispatch by parsed table
+/// name), this is just a friendlier pre-parse error message.
 fn is_write_statement(sql: &str) -> bool {
     let trimmed = sql.trim().trim_end_matches(';');
     let upper = trimmed.to_ascii_uppercase();
-    upper.starts_with("UPDATE ") || upper.starts_with("DELETE ")
+    upper.starts_with("UPDATE ") || upper.starts_with("DELETE ") || is_insert_into_blocks(&upper)
+}
+
+fn is_insert_into_blocks(upper: &str) -> bool {
+    let Some(after_into) = upper.strip_prefix("INSERT INTO") else {
+        return false;
+    };
+    let table = after_into
+        .trim_start()
+        .trim_start_matches(['"', '`'])
+        .trim_start();
+    table == "BLOCKS" || ["BLOCKS ", "BLOCKS(", "BLOCKS\"", "BLOCKS`"]
+        .iter()
+        .any(|p| table.starts_with(p))
 }
 
 fn run_repl(

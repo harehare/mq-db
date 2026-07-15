@@ -1,12 +1,13 @@
 //! Secondary indexes for fast block lookups in the SQL engine.
 //!
-//! Three index types, matching the characteristics of each column:
+//! Four index types, matching the characteristics of each column:
 //!
 //! | Index | Column(s) | Type | Why |
 //! |---|---|---|---|
 //! | [`BitmapIndex`] | `block_type` | Inverted list per type | 15 variants → very low cardinality |
 //! | [`BTreeIndex`] | `pre`, `post` | Sorted Vec + binary search | Monotonically increasing integers, range queries |
 //! | [`HashIndex`] | `content`, `lang`, `depth` | HashMap | Point/equality lookups |
+//! | [`TermIndex`] | `content` (tokenized) | Inverted postings list | Full-text `match()`/`score()` |
 //!
 //! ## How it compares to DuckDB
 //!
@@ -210,8 +211,86 @@ impl HashIndex {
     }
 }
 
+/// Lowercase + split on non-alphanumeric (Unicode-aware via
+/// `char::is_alphanumeric`).
+///
+/// This is used both to build [`TermIndex`]'s postings at index time and to
+/// tokenize `match()`/`score()`'s arguments at query time (see `src/sql.rs`)
+/// — the two **must** use this same function. `WHERE match(...)` uses the
+/// index purely as a pre-filter with no full-scan fallback to catch a
+/// mismatch, so if the two tokenizers ever disagreed, the index would
+/// silently *drop* true matches rather than just mis-rank them.
+///
+/// Known limitations (intentional, dependency-free, documented rather than
+/// fixed): no stemming, no stopword removal, no sub-splitting of
+/// `camelCase`/`snake_case` beyond punctuation, and no CJK word segmentation
+/// (a run of CJK characters with no ASCII punctuation between them tokenizes
+/// as a single "word").
+pub fn tokenize(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Inverted index on tokenized `content`: term → sorted, deduped block
+/// indices containing that term at least once.
+///
+/// Best for: `WHERE match(content, 'foo bar')` (AND intersection across
+/// query terms).
+/// Complexity: build `O(n * avg_tokens)`, intersect `O(k)` for the rarest
+/// term's postings length.
+#[derive(Debug, Default, Clone)]
+pub struct TermIndex {
+    postings: HashMap<String, Vec<u32>>,
+}
+
+impl TermIndex {
+    pub fn build(blocks: &[Block]) -> Self {
+        let mut postings: HashMap<String, Vec<u32>> = HashMap::new();
+        for (idx, block) in blocks.iter().enumerate() {
+            // Sort + dedup the token list itself rather than allocating a
+            // side `HashSet` per block — cheaper for the small token counts
+            // typical of one block, and avoids an allocation per block.
+            let mut terms = tokenize(&block.content);
+            terms.sort_unstable();
+            terms.dedup();
+            for term in terms {
+                postings.entry(term).or_default().push(idx as u32);
+            }
+        }
+        Self { postings }
+    }
+
+    /// AND-intersection of postings for `terms`. Empty `terms` → empty
+    /// result (mirrors `match()`'s "no terms → no match" semantics).
+    pub fn intersect(&self, terms: &[String]) -> Vec<u32> {
+        let mut iter = terms.iter();
+        let Some(first) = iter.next() else {
+            return Vec::new();
+        };
+        let mut acc: std::collections::BTreeSet<u32> = self
+            .postings
+            .get(first)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        for term in iter {
+            if acc.is_empty() {
+                break;
+            }
+            let set: std::collections::HashSet<u32> =
+                self.postings.get(term).into_iter().flatten().copied().collect();
+            acc.retain(|idx| set.contains(idx));
+        }
+        acc.into_iter().collect()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// DocumentIndex — all three indexes bundled for one document
+// DocumentIndex — all four indexes bundled for one document
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// All secondary indexes for a single [`crate::document::Document`].
@@ -223,6 +302,7 @@ pub struct DocumentIndex {
     pub bitmap: BitmapIndex,
     pub btree: BTreeIndex,
     pub hash: HashIndex,
+    pub term: TermIndex,
 }
 
 impl DocumentIndex {
@@ -231,6 +311,7 @@ impl DocumentIndex {
             bitmap: BitmapIndex::build(blocks),
             btree: BTreeIndex::build(blocks),
             hash: HashIndex::build(blocks),
+            term: TermIndex::build(blocks),
         }
     }
 
@@ -301,6 +382,22 @@ impl DocumentIndex {
         out.extend_from_slice(&(depth_entries.len() as u32).to_le_bytes());
         for &(&depth, indices) in &depth_entries {
             out.push(depth);
+            out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+            for &idx in indices.iter() {
+                out.extend_from_slice(&idx.to_le_bytes());
+            }
+        }
+
+        // TermIndex postings — appended after the four pre-existing sections
+        // above; each of those is self-length-prefixed, so this is purely
+        // additive and doesn't disturb their encoding/decoding order.
+        let mut term_entries: Vec<(&String, &Vec<u32>)> = self.term.postings.iter().collect();
+        term_entries.sort_by_key(|(k, _)| k.as_str());
+        out.extend_from_slice(&(term_entries.len() as u32).to_le_bytes());
+        for (term, indices) in &term_entries {
+            let tb = term.as_bytes();
+            out.extend_from_slice(&(tb.len() as u32).to_le_bytes());
+            out.extend_from_slice(tb);
             out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
             for &idx in indices.iter() {
                 out.extend_from_slice(&idx.to_le_bytes());
@@ -420,6 +517,20 @@ impl DocumentIndex {
             by_depth.insert(depth, indices);
         }
 
+        // TermIndex postings
+        let num_terms = read_u32!() as usize;
+        let mut postings: HashMap<String, Vec<u32>> = HashMap::new();
+        for _ in 0..num_terms {
+            let term_len = read_u32!() as usize;
+            let term = read_str!(term_len);
+            let count = read_u32!() as usize;
+            let mut indices = Vec::with_capacity(count);
+            for _ in 0..count {
+                indices.push(read_u32!());
+            }
+            postings.insert(term, indices);
+        }
+
         Ok(DocumentIndex {
             bitmap: BitmapIndex { map: bitmap_map },
             btree: BTreeIndex { by_pre, by_post },
@@ -428,6 +539,7 @@ impl DocumentIndex {
                 by_lang,
                 by_depth,
             },
+            term: TermIndex { postings },
         })
     }
 }
@@ -492,6 +604,8 @@ pub enum IndexHint {
     LangExact(String),
     /// Use the hash index: `WHERE depth = N`.
     DepthExact(u8),
+    /// Use the term index: `WHERE match(content, 'foo bar')` (AND of tokens).
+    TermMatch(Vec<String>),
     /// No applicable index — fall back to full scan.
     FullScan,
 }
@@ -508,6 +622,7 @@ impl IndexHint {
             IndexHint::ContentExact(c) => Some(idx.hash.by_content(c).to_vec()),
             IndexHint::LangExact(l) => Some(idx.hash.by_lang(l).to_vec()),
             IndexHint::DepthExact(d) => Some(idx.hash.by_depth(*d).to_vec()),
+            IndexHint::TermMatch(terms) => Some(idx.term.intersect(terms)),
             IndexHint::FullScan => None,
         }
     }
@@ -679,5 +794,67 @@ mod tests {
         let idx = DocumentIndex::build(&blocks);
         let result = IndexHint::BlockType(types).resolve(&idx).unwrap();
         assert_eq!(result.len(), expected);
+    }
+
+    #[rstest]
+    #[case("fn main() {}", vec!["fn", "main"])]
+    #[case("v1.2.3", vec!["v1", "2", "3"])]
+    #[case("", vec![])]
+    #[case("CamelCase HTML_tag", vec!["camelcase", "html", "tag"])]
+    fn test_tokenize_param(#[case] input: &str, #[case] expected: Vec<&str>) {
+        let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        assert_eq!(tokenize(input), expected);
+    }
+
+    #[test]
+    fn test_term_index_build_and_postings() {
+        let blocks = blocks_from("# Hello World\n\nSome prose about Rust\n");
+        let idx = DocumentIndex::build(&blocks);
+        let hits = idx.term.intersect(&["rust".to_string()]);
+        assert_eq!(hits.len(), 1);
+        assert!(blocks[hits[0] as usize].content.contains("Rust"));
+    }
+
+    #[test]
+    fn test_term_index_intersect_and_semantics() {
+        let blocks = blocks_from("# H1\n\nfoo bar baz\n\nfoo only\n");
+        let idx = DocumentIndex::build(&blocks);
+
+        let both = idx.term.intersect(&["foo".to_string(), "bar".to_string()]);
+        assert_eq!(both.len(), 1);
+
+        let missing = idx
+            .term
+            .intersect(&["foo".to_string(), "nonexistent".to_string()]);
+        assert!(missing.is_empty());
+
+        assert!(idx.term.intersect(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_document_index_to_bytes_from_bytes_roundtrip_includes_term_index() {
+        let blocks = blocks_from(
+            "# Title\n\nSome prose here.\n\n```rust\nfn main() { let x = 1; }\n```\n",
+        );
+        let idx = DocumentIndex::build(&blocks);
+        let restored = DocumentIndex::from_bytes(&idx.to_bytes()).unwrap();
+
+        let mut original: Vec<(String, Vec<u32>)> = idx
+            .term
+            .postings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut round_tripped: Vec<(String, Vec<u32>)> = restored
+            .term
+            .postings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        original.sort();
+        round_tripped.sort();
+
+        assert!(!original.is_empty());
+        assert_eq!(original, round_tripped);
     }
 }
