@@ -35,10 +35,11 @@ flowchart TD
 
 - **Flat block storage** — every Markdown element becomes a typed `Block` with row-polymorphic properties
 - **O(1) hierarchy queries** — interval index (`pre`/`post`) makes ancestor/descendant checks a single integer comparison
-- **Three-layer secondary indexes** — `BitmapIndex` (block type), `BTreeIndex` (pre/post), `HashIndex` (content/lang/depth) for fast SQL predicate pushdown
+- **Four-layer secondary indexes** — `BitmapIndex` (block type), `BTreeIndex` (pre/post), `HashIndex` (content/lang/depth), `TermIndex` (tokenized content, full-text) for fast SQL predicate pushdown
 - **Zone Maps** — per-document statistics skip irrelevant files before scanning any blocks
 - **Dual query engines** — SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
 - **`WITH` (CTE) support** — non-recursive common table expressions, usable in `FROM`, `JOIN`, and subqueries
+- **Full-text search** — `match()`/`score()` SQL functions backed by a persisted per-document inverted index
 - **Incremental re-indexing** — re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
 - **SQL `INSERT`/`UPDATE`/`DELETE` with write-back** — add, edit, or remove `blocks` and push the change back to the source Markdown file, opt-in via `--write-back`
 - **DDL support** — `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
@@ -178,6 +179,17 @@ mq-db sql "
 `WITH RECURSIVE` is not supported. A CTE name identical to `blocks`,
 `documents`, or a custom table shadows it for the duration of the `WITH`
 clause's scope.
+
+**Full-text search with `match()`/`score()`** — index-accelerated term matching and simple TF-based ranking:
+
+```bash
+mq-db sql "
+  SELECT content, score(content, 'error handling') AS relevance
+  FROM blocks
+  WHERE match(content, 'error handling')
+  ORDER BY relevance DESC
+" --db store.mq-db
+```
 
 ### INSERT / UPDATE / DELETE with write-back
 
@@ -468,6 +480,8 @@ mq-db-specific:
 | `under(pre, post, anc_pre, anc_post)` | O(1) interval ancestor check               |
 | `mq(program, content)`                | Run an mq program against Markdown content |
 | `json_extract(json, path)`            | Extract a value from a JSON string         |
+| `match(content, query)`               | Full-text search — true iff every tokenized term in `query` appears in `content`; index-accelerated when `content` is a bare column reference and `query` is a string literal |
+| `score(content, query)`               | Simple term-frequency relevance score for `query` against `content` (no IDF — see [Storage format](#storage-format) note) |
 
 String:
 
@@ -580,6 +594,12 @@ SELECT d.path, h.n
 FROM heading_counts h
 JOIN documents d ON d.id = h.document_id
 ORDER BY h.n DESC;
+
+-- Full-text search, ranked by relevance
+SELECT content, score(content, 'error handling') AS relevance
+FROM blocks
+WHERE match(content, 'error handling')
+ORDER BY relevance DESC;
 ```
 
 ## Architecture
@@ -698,6 +718,13 @@ graph TD
 ```
 
 Writes are atomic: data goes to `<path>.tmp` then renamed to `<path>` on success.
+
+> [!IMPORTANT]
+> File format version 5: `DocumentIndex` gained a `TermIndex` (full-text
+> search postings) appended after the pre-existing index sections. There is
+> no migration path — a store written by an older `mq-db` (version 4 or
+> earlier) is rejected with a clear "unsupported file version" error; run
+> `mq-db index` again to recreate it.
 
 ## License
 

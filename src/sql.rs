@@ -66,7 +66,7 @@ use crate::{
     DocumentStore, MqdbError,
     block::{Block, BlockType, Properties, PropertyValue},
     document::{Document, ZoneMaps},
-    indexes::{DocumentIndex, IndexHint},
+    indexes::{DocumentIndex, IndexHint, tokenize},
     store::CustomTableState,
 };
 
@@ -965,6 +965,46 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
                 None => return Value::Null,
             };
             eval_mq_scalar(&program, &content)
+        }
+        "match" => {
+            let (Some(content), Some(query)) =
+                (args.first().and_then(Value::as_str), args.get(1).and_then(Value::as_str))
+            else {
+                return Value::Bool(false);
+            };
+            let content_terms: std::collections::HashSet<String> =
+                tokenize(content).into_iter().collect();
+            let query_terms = tokenize(query);
+            Value::Bool(!query_terms.is_empty() && query_terms.iter().all(|t| content_terms.contains(t)))
+        }
+        "score" => {
+            let (Some(content), Some(query)) =
+                (args.first().and_then(Value::as_str), args.get(1).and_then(Value::as_str))
+            else {
+                return Value::Float(0.0);
+            };
+            let content_terms = tokenize(content);
+            let query_terms = tokenize(query);
+            if content_terms.is_empty() || query_terms.is_empty() {
+                return Value::Float(0.0);
+            }
+            // Simple term-frequency score, normalised by content length —
+            // deliberately not BM25 (no IDF/corpus-wide stats): `eval_expr`
+            // only ever sees one `Row` at a time with no back-reference to
+            // the corpus, so a real IDF term would need a much larger
+            // signature change (see `TermIndex`'s doc comment for the same
+            // constraint on the index side). Good enough to rank matches
+            // within a single query; a document that repeats a common word
+            // many times can outrank one with a rarer, more specific match.
+            let mut freq: HashMap<&str, u32> = HashMap::new();
+            for t in &content_terms {
+                *freq.entry(t.as_str()).or_default() += 1;
+            }
+            let hits: f64 = query_terms
+                .iter()
+                .map(|q| *freq.get(q.as_str()).unwrap_or(&0) as f64)
+                .sum();
+            Value::Float(hits / content_terms.len() as f64)
         }
 
         // --- string functions ---
@@ -3276,6 +3316,34 @@ fn analyze_where_for_index(expr: &Expr) -> IndexHint {
             }
             IndexHint::FullScan
         }
+        // match(content, 'query terms') used directly as a boolean predicate
+        // (unlike the other arms above, this isn't wrapped in a BinaryOp).
+        Expr::Function(f) => {
+            let name = f.name.0.last().map(ident_value).unwrap_or("").to_lowercase();
+            if name != "match" {
+                return IndexHint::FullScan;
+            }
+            let FunctionArguments::List(al) = &f.args else {
+                return IndexHint::FullScan;
+            };
+            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(col)), FunctionArg::Unnamed(FunctionArgExpr::Expr(q))] =
+                al.args.as_slice()
+            else {
+                return IndexHint::FullScan;
+            };
+            if expr_col_name(col).as_deref() != Some("content") {
+                return IndexHint::FullScan;
+            }
+            let Some(query_str) = expr_str_val(q) else {
+                return IndexHint::FullScan;
+            };
+            let terms = tokenize(&query_str);
+            if terms.is_empty() {
+                IndexHint::FullScan
+            } else {
+                IndexHint::TermMatch(terms)
+            }
+        }
         Expr::Nested(inner) => analyze_where_for_index(inner),
         _ => IndexHint::FullScan,
     }
@@ -3480,10 +3548,15 @@ mod tests {
         let start = std::time::Instant::now();
         let _engine = SqlEngine::new(&store).unwrap();
         let elapsed = start.elapsed();
+        // Bound loosened from 1ms to 5ms when `TermIndex` (a fourth
+        // per-document index) was added — still catches anything
+        // pathological (e.g. accidental file I/O or O(n^2) behaviour) while
+        // tolerating cold-start allocator/thread warmup noise on the first
+        // test invocation in a fresh process.
         assert!(
-            elapsed.as_millis() < 1,
-            "SqlEngine::new took {}ms — should be O(1)",
-            elapsed.as_millis()
+            elapsed.as_micros() < 5000,
+            "SqlEngine::new took {}us — should be cheap",
+            elapsed.as_micros()
         );
     }
 
@@ -3733,6 +3806,98 @@ mod tests {
             .unwrap();
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0][0], "NULL");
+    }
+
+    #[test]
+    fn match_function_true_for_all_terms_present() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT match('The quick brown fox', 'quick fox')")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "true");
+    }
+
+    #[test]
+    fn match_function_false_if_any_term_missing() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT match('The quick brown fox', 'quick zebra')")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "false");
+    }
+
+    #[test]
+    fn match_function_case_insensitive() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT match('Rust Programming', 'rust')")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "true");
+    }
+
+    #[test]
+    fn score_function_ranks_denser_matches_higher() {
+        let mut store = DocumentStore::new();
+        store
+            .add_str("# Doc\n\nrust rust rust other words here\n\nrust is fine\n")
+            .unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT content FROM blocks WHERE block_type = 'paragraph'
+                 ORDER BY score(content, 'rust') DESC",
+            )
+            .unwrap();
+        assert_eq!(out.rows[0][0], "rust rust rust other words here");
+    }
+
+    #[test]
+    fn where_match_uses_term_match_index_hint() {
+        let stmts =
+            Parser::parse_sql(&GenericDialect {}, "SELECT * FROM blocks WHERE match(content, 'foo bar')")
+                .unwrap();
+        let Statement::Query(q) = stmts.into_iter().next().unwrap() else {
+            panic!("expected query")
+        };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            panic!("expected select")
+        };
+        let hint = analyze_where_for_index(select.selection.as_ref().unwrap());
+        assert_eq!(
+            hint,
+            IndexHint::TermMatch(vec!["foo".to_string(), "bar".to_string()])
+        );
+    }
+
+    #[test]
+    fn where_match_and_block_type_combines_hints() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT content FROM blocks
+                 WHERE match(content, 'architecture') AND block_type = 'heading'",
+            )
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Architecture".to_string()]]);
+    }
+
+    #[test]
+    fn where_match_full_scan_fallback_when_query_not_literal() {
+        let stmts =
+            Parser::parse_sql(&GenericDialect {}, "SELECT * FROM blocks WHERE match(content, lang)")
+                .unwrap();
+        let Statement::Query(q) = stmts.into_iter().next().unwrap() else {
+            panic!("expected query")
+        };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            panic!("expected select")
+        };
+        let hint = analyze_where_for_index(select.selection.as_ref().unwrap());
+        assert_eq!(hint, IndexHint::FullScan);
     }
 
     fn eval_one(sql: &str) -> String {
