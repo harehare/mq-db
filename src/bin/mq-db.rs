@@ -960,13 +960,8 @@ fn md_block_to_html(s: &str) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Crude prefix check used to gate write-back before even attempting a
-/// parse — mirrors the DESC/SHOW TABLES prefix check in `SqlEngine::execute`.
-///
-/// `INSERT INTO <custom table>` is deliberately *not* flagged here — it
-/// never writes back to a Markdown file and works without `--write-back`.
-/// Only `INSERT INTO blocks` does; real enforcement of that distinction
-/// lives in `DocumentStore::execute_sql_mut` (dispatch by parsed table
-/// name), this is just a friendlier pre-parse error message.
+/// parse. Only `INSERT INTO blocks` requires `--write-back`; custom tables
+/// don't touch Markdown files.
 fn is_write_statement(sql: &str) -> bool {
     let trimmed = sql.trim().trim_end_matches(';');
     let upper = trimmed.to_ascii_uppercase();

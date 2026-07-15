@@ -46,6 +46,7 @@
 
 use std::collections::HashMap;
 
+use rustc_hash::FxHashMap;
 use sqlparser::{
     ast::{
         AssignmentTarget, BinaryOperator, CaseWhen, CeilFloorKind, CreateTable, DateTimeField,
@@ -1441,17 +1442,10 @@ pub struct SqlEngine<'a> {
     store: &'a DocumentStore,
     /// One `DocumentIndex` per document, in the same order as `store.documents()`.
     indexes: Vec<DocumentIndex>,
-    /// Stack of CTE scopes introduced by `WITH` clauses currently "in scope"
-    /// on the call stack — one frame per nested `exec_query` call whose
-    /// `Query.with` is `Some`. Looked up innermost-first by
-    /// `table_rows_with_hint` so a nested subquery's own `WITH` shadows an
-    /// outer CTE of the same name. A `RefCell` (not `RwLock`, unlike
-    /// `DocumentStore::custom_tables`) is enough here because a single
-    /// `SqlEngine` lives entirely within one `execute()`/`exec_query()` call
-    /// tree on one thread — there is no cross-thread sharing to guard
-    /// against, unlike `custom_tables`, which is shared across `serve`'s
-    /// concurrent HTTP handlers.
-    cte_scopes: std::cell::RefCell<Vec<HashMap<String, std::rc::Rc<QueryOutput>>>>,
+    /// Stack of CTE scopes from `WITH` clauses, one frame per nested
+    /// `exec_query` call. Looked up innermost-first so a nested subquery's
+    /// own `WITH` shadows an outer CTE of the same name.
+    cte_scopes: std::cell::RefCell<Vec<FxHashMap<String, std::rc::Rc<QueryOutput>>>>,
 }
 
 impl<'a> SqlEngine<'a> {
@@ -1775,11 +1769,8 @@ impl<'a> SqlEngine<'a> {
         })
     }
 
-    /// Executes `query`, first materialising any `WITH` clause's CTEs into a
-    /// new scope frame (visible to `exec_query_body` and any subqueries it
-    /// evaluates, via `self.cte_scopes`) before delegating to
-    /// [`Self::exec_query_body`]. Plain queries with no `WITH` clause skip
-    /// straight to `exec_query_body`.
+    /// Materialises any `WITH` clause's CTEs into a new scope frame, then
+    /// delegates to [`Self::exec_query_body`].
     fn exec_query(&self, query: &Query) -> Result<QueryOutput, MqdbError> {
         let Some(with) = &query.with else {
             return self.exec_query_body(query);
@@ -1788,7 +1779,7 @@ impl<'a> SqlEngine<'a> {
             return Err(MqdbError::SqlExec("WITH RECURSIVE is not supported".into()));
         }
 
-        self.cte_scopes.borrow_mut().push(HashMap::new());
+        self.cte_scopes.borrow_mut().push(FxHashMap::default());
         let result = (|| {
             for cte in &with.cte_tables {
                 if !cte.alias.columns.is_empty() {
@@ -1797,10 +1788,7 @@ impl<'a> SqlEngine<'a> {
                     ));
                 }
                 let name = cte.alias.name.value.to_lowercase();
-                // Evaluated with the current (not-yet-populated-with-`name`)
-                // scope frame already pushed, so an *earlier* CTE in this
-                // same `WITH` is visible here but `name` itself is not yet
-                // (no self-reference — that's what WITH RECURSIVE is for).
+                // `name` isn't in scope yet, so no self-reference (WITH RECURSIVE only).
                 let out = self.exec_query(&cte.query)?;
                 self.cte_scopes
                     .borrow_mut()
@@ -1982,11 +1970,8 @@ impl<'a> SqlEngine<'a> {
             _ => return Err(MqdbError::SqlExec("unsupported FROM clause".into())),
         };
 
-        // CTEs take priority over `blocks`/`documents`/custom tables — a
-        // `WITH x AS (...)` shadows a real table named `x` for the duration
-        // of its scope, matching standard SQL CTE semantics. Search
-        // innermost-to-outermost so a nested subquery's own `WITH` shadows
-        // an outer CTE of the same name.
+        // A `WITH x AS (...)` shadows a real table named `x`; search
+        // innermost-to-outermost so nested `WITH`s shadow outer ones.
         for scope in self.cte_scopes.borrow().iter().rev() {
             if let Some(out) = scope.get(&table_name) {
                 let prefix = alias.as_deref().unwrap_or(&table_name);
@@ -2270,14 +2255,9 @@ fn collect_matched_edits(
         .collect()
 }
 
-/// Renders Markdown source text for a `Heading`/`Paragraph` block from its
-/// (possibly new) content — shared by `UPDATE ... SET content` write-back
-/// and `INSERT INTO blocks` write-back, since both ultimately need to turn
-/// plain content into valid Markdown to splice into the source file.
-///
-/// Only `Heading`/`Paragraph` are supported in this version — anything else
-/// (tables, code, lists, ...) would need real structural re-rendering to
-/// stay valid Markdown, which is out of scope here.
+/// Renders Markdown source text for a `Heading`/`Paragraph` block. Shared by
+/// `UPDATE`/`INSERT INTO blocks` write-back. Other block types (tables,
+/// code, lists, ...) aren't supported.
 fn render_markdown_for(
     block_type: &BlockType,
     depth: Option<u8>,
@@ -2410,20 +2390,17 @@ fn apply_matched_edits(
     Ok(affected)
 }
 
-/// A new block to insert into an existing document via `INSERT INTO blocks
-/// (...) VALUES (...)` with write-back. Mirrors [`MatchedBlockEdit`] but for
-/// insertion rather than editing an existing block.
+/// A new block to insert via `INSERT INTO blocks (...) VALUES (...)`.
+/// Mirrors [`MatchedBlockEdit`] but for insertion.
 struct NewBlockSpec {
     document_id: u32,
     block_type: BlockType,
     content: String,
-    /// Required (1-6) iff `block_type` is `Heading`; must be absent otherwise.
+    /// Required (1-6) iff `block_type` is `Heading`.
     depth: Option<u8>,
-    /// `pre` of the block to insert after, within the same document.
-    /// `None` appends at the end of the document.
+    /// `pre` of the block to insert after; `None` appends at document end.
     after_pre: Option<u32>,
-    /// Position within the statement's `VALUES` list — used to keep
-    /// declared order when multiple rows share the same `after_pre` anchor.
+    /// Position within `VALUES`, to preserve order among same-anchor rows.
     row_index: usize,
 }
 
@@ -2431,13 +2408,8 @@ const INSERT_BLOCKS_COLUMNS: [&str; 5] =
     ["document_id", "block_type", "content", "depth", "after_pre"];
 
 /// Parses an `INSERT INTO blocks (...) VALUES (...)` statement into
-/// [`NewBlockSpec`]s.
-///
-/// Only an explicit column list drawn from `document_id`/`block_type`/
-/// `content`/`depth`/`after_pre` and a literal `VALUES` source are
-/// supported — write-back only knows how to render `heading`/`paragraph`
-/// Markdown (see [`render_markdown_for`]), so unsupported shapes are
-/// rejected up front rather than failing later during file patching.
+/// [`NewBlockSpec`]s. Only an explicit column list and a literal `VALUES`
+/// source are supported (no `INSERT ... SELECT`).
 fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
     if ins.columns.is_empty() {
         return Err(MqdbError::SqlExec(
@@ -2580,18 +2552,15 @@ fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
 }
 
 /// Applies `specs` (grouped by document) by splicing rendered Markdown text
-/// into the source file at each spec's anchor position, writing the patched
-/// file, then calling [`DocumentStore::replace_document`] to re-parse it in
-/// place — the same source-text-patch strategy as [`apply_matched_edits`],
-/// which is what makes `pre`/`post` recomputation automatic (no manual
-/// interval-index math needed here).
+/// into the source file at each spec's anchor position, then reparsing via
+/// [`DocumentStore::replace_document`], same as [`apply_matched_edits`].
 ///
 /// Returns the number of blocks inserted.
 fn apply_new_blocks(
     store: &mut DocumentStore,
     specs: Vec<NewBlockSpec>,
 ) -> Result<usize, MqdbError> {
-    let mut by_doc: HashMap<u32, Vec<NewBlockSpec>> = HashMap::new();
+    let mut by_doc: FxHashMap<u32, Vec<NewBlockSpec>> = FxHashMap::default();
     for spec in specs {
         by_doc.entry(spec.document_id).or_default().push(spec);
     }
@@ -2599,9 +2568,8 @@ fn apply_new_blocks(
     let mut inserted = 0usize;
     for (doc_id, doc_specs) in by_doc {
         struct Insertion {
-            /// 0-indexed line to insert before (`lines.splice(at..at, ...)`).
-            /// `usize::MAX` is a placeholder meaning "end of file", resolved
-            /// once the file's line count is known, below.
+            /// 0-indexed line to insert before. `usize::MAX` means "end of
+            /// file", resolved once the line count is known, below.
             at: usize,
             row_index: usize,
             rendered: String,
@@ -2656,9 +2624,8 @@ fn apply_new_blocks(
             }
         }
 
-        // Bottom-up so earlier insertions don't shift later (already-resolved)
-        // line numbers; ties (same anchor) broken by declared VALUES order so
-        // multiple rows anchored to the same block land in the order given.
+        // Bottom-up so earlier insertions don't shift later line numbers;
+        // ties broken by declared VALUES order.
         insertions.sort_by_key(|ins| (std::cmp::Reverse(ins.at), std::cmp::Reverse(ins.row_index)));
 
         for insertion in &insertions {
