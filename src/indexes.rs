@@ -41,9 +41,7 @@ use crate::{
     error::MqdbError,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 // BitmapIndex — block_type → sorted Vec of block positions
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Bitmap-style inverted index on `block_type`.
 ///
@@ -91,9 +89,7 @@ impl BitmapIndex {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // BTreeIndex — pre/post → block position
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// B-Tree index on `pre` (and a secondary one on `post`).
 ///
@@ -145,9 +141,7 @@ impl BTreeIndex {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // HashIndex — content / lang / depth → block positions
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Hash index for point-equality lookups on string/integer columns.
 ///
@@ -296,9 +290,7 @@ impl TermIndex {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // DocumentIndex — all four indexes bundled for one document
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// All secondary indexes for a single [`crate::document::Document`].
 ///
@@ -592,9 +584,7 @@ fn block_type_from_ord(v: u8) -> Result<BlockType, MqdbError> {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // IndexHint — what the SQL planner decided to use
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// The access plan chosen by the simple predicate pushdown analyser.
 #[derive(Debug, Clone, PartialEq)]
@@ -635,9 +625,7 @@ impl IndexHint {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

@@ -18,9 +18,7 @@ use ratatui::{
 
 use crate::{DocumentStore, MqEngine, MqdbError, SqlEngine, block::BlockType};
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Theme — mirrors the warm paper/ink/accent palette of docs/index.html
-// ─────────────────────────────────────────────────────────────────────────────
 
 mod theme {
     use ratatui::style::Color;
@@ -40,9 +38,7 @@ mod theme {
     pub const DUSK: Color = Color::Rgb(140, 150, 191);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // State
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryMode {
@@ -349,9 +345,7 @@ fn block_display(bt: &BlockType, depth: Option<u8>) -> (&'static str, String, Co
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Entry point
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Launch the TUI. Blocks until the user quits.
 pub fn run(store: DocumentStore) -> Result<(), MqdbError> {
@@ -430,9 +424,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Rendering
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();

@@ -590,9 +590,7 @@ impl DocumentStore {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Lazy loading
-    // ─────────────────────────────────────────────────────────────────────────
 
     /// Load blocks for every document that has not yet been loaded.
     ///
@@ -739,9 +737,7 @@ impl DocumentStore {
         let _ = storage.flush_catalog(&entries, &custom, &self.content_hash_pairs());
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Persistence
-    // ─────────────────────────────────────────────────────────────────────────
 
     /// Persist all in-memory documents to a `.mq-db` file, including secondary
     /// indexes. Writes atomically: writes to `path.tmp` then renames to `path`.

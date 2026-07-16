@@ -4233,7 +4233,7 @@ mod tests {
         assert_eq!(contents, vec!["Doc", "Other"]);
     }
 
-    // ── UPDATE/DELETE write-back ────────────────────────────────────────────
+    // UPDATE/DELETE write-back
 
     fn write_md(dir: &tempfile::TempDir, name: &str, content: &str) -> std::path::PathBuf {
         let path = dir.path().join(name);
