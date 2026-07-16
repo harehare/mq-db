@@ -44,8 +44,6 @@
 //! assert!(!out.rows.is_empty());
 //! ```
 
-use std::collections::HashMap;
-
 use rustc_hash::FxHashMap;
 use sqlparser::{
     ast::{
@@ -552,7 +550,7 @@ fn hash_equi_join(
     right_key_expr: &Expr,
     full_predicate: &Expr,
 ) -> Vec<Row> {
-    let mut buckets: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+    let mut buckets: FxHashMap<JoinKey, Vec<usize>> = FxHashMap::default();
     for (i, r) in right.iter().enumerate() {
         if let Some(key) = value_join_key(&eval_expr(right_key_expr, r)) {
             buckets.entry(key).or_default().push(i);
@@ -1000,7 +998,7 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             // constraint on the index side). Good enough to rank matches
             // within a single query; a document that repeats a common word
             // many times can outrank one with a rarer, more specific match.
-            let mut freq: HashMap<&str, u32> = HashMap::new();
+            let mut freq: FxHashMap<&str, u32> = FxHashMap::default();
             for t in &content_terms {
                 *freq.entry(t.as_str()).or_default() += 1;
             }
@@ -1011,7 +1009,6 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             Value::Float(hits / content_terms.len() as f64)
         }
 
-        // --- string functions ---
         "lower" => str_fn(args, |s| s.to_lowercase()),
         "upper" => str_fn(args, |s| s.to_uppercase()),
         "length" | "len" | "char_length" | "character_length" => args
@@ -1144,7 +1141,6 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             }
         }
 
-        // --- numeric functions ---
         "abs" => num_fn(args, |n| n.abs(), |n| n.abs()),
         "round" => {
             let n = match args.first().and_then(|v| v.as_f64()) {
@@ -1235,7 +1231,6 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             .min_by(|a, b| a.cmp_val(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or(Value::Null),
 
-        // --- null handling ---
         "coalesce" | "ifnull" => args
             .iter()
             .find(|v| !matches!(v, Value::Null))
@@ -1252,7 +1247,6 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             }
         }
 
-        // --- misc ---
         "typeof" => Value::Str(
             match args.first() {
                 Some(Value::Str(_)) => "text",
@@ -2183,7 +2177,7 @@ impl<'a> SqlEngine<'a> {
 
         // Group
         let mut groups: Vec<(Vec<Value>, Vec<&Row>)> = Vec::new();
-        let mut key_index: HashMap<Vec<String>, usize> = HashMap::new();
+        let mut key_index: FxHashMap<Vec<String>, usize> = FxHashMap::default();
 
         // We need owned rows to reference; collect first
         let owned: Vec<Row> = rows;
@@ -2338,7 +2332,7 @@ fn apply_matched_edits(
     store: &mut DocumentStore,
     edits: Vec<MatchedBlockEdit>,
 ) -> Result<usize, MqdbError> {
-    let mut by_doc: HashMap<u32, Vec<MatchedBlockEdit>> = HashMap::new();
+    let mut by_doc: FxHashMap<u32, Vec<MatchedBlockEdit>> = FxHashMap::default();
     for edit in edits {
         by_doc.entry(edit.document_id).or_default().push(edit);
     }

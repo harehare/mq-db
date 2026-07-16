@@ -32,7 +32,9 @@
 //! `src/sql.rs`) for `lang =` / `depth =` / heading `content =` conjuncts,
 //! but only for a single, non-`JOIN`ed `FROM blocks`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+
+use rustc_hash::FxHashMap;
 
 use crate::{
     block::{Block, BlockType},
@@ -53,12 +55,12 @@ use crate::{
 /// Complexity: build O(n), lookup O(1) key + O(k) iterate
 #[derive(Debug, Default, Clone)]
 pub struct BitmapIndex {
-    map: HashMap<BlockType, Vec<u32>>,
+    map: FxHashMap<BlockType, Vec<u32>>,
 }
 
 impl BitmapIndex {
     pub fn build(blocks: &[Block]) -> Self {
-        let mut map: HashMap<BlockType, Vec<u32>> = HashMap::new();
+        let mut map: FxHashMap<BlockType, Vec<u32>> = FxHashMap::default();
         for (idx, block) in blocks.iter().enumerate() {
             map.entry(block.block_type.clone())
                 .or_default()
@@ -157,18 +159,18 @@ impl BTreeIndex {
 #[derive(Debug, Default, Clone)]
 pub struct HashIndex {
     /// content (exact lowercase) → block indices
-    pub by_content: HashMap<String, Vec<u32>>,
+    pub by_content: FxHashMap<String, Vec<u32>>,
     /// lang tag → block indices (code blocks only)
-    pub by_lang: HashMap<String, Vec<u32>>,
+    pub by_lang: FxHashMap<String, Vec<u32>>,
     /// heading depth → block indices
-    pub by_depth: HashMap<u8, Vec<u32>>,
+    pub by_depth: FxHashMap<u8, Vec<u32>>,
 }
 
 impl HashIndex {
     pub fn build(blocks: &[Block]) -> Self {
-        let mut by_content: HashMap<String, Vec<u32>> = HashMap::new();
-        let mut by_lang: HashMap<String, Vec<u32>> = HashMap::new();
-        let mut by_depth: HashMap<u8, Vec<u32>> = HashMap::new();
+        let mut by_content: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+        let mut by_lang: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+        let mut by_depth: FxHashMap<u8, Vec<u32>> = FxHashMap::default();
 
         for (idx, block) in blocks.iter().enumerate() {
             let i = idx as u32;
@@ -243,12 +245,12 @@ pub fn tokenize(text: &str) -> Vec<String> {
 /// term's postings length.
 #[derive(Debug, Default, Clone)]
 pub struct TermIndex {
-    postings: HashMap<String, Vec<u32>>,
+    postings: FxHashMap<String, Vec<u32>>,
 }
 
 impl TermIndex {
     pub fn build(blocks: &[Block]) -> Self {
-        let mut postings: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut postings: FxHashMap<String, Vec<u32>> = FxHashMap::default();
         for (idx, block) in blocks.iter().enumerate() {
             // Sort + dedup the token list itself rather than allocating a
             // side `HashSet` per block — cheaper for the small token counts
@@ -452,7 +454,7 @@ impl DocumentIndex {
 
         // BitmapIndex
         let num_bitmap = read_u32!() as usize;
-        let mut bitmap_map: HashMap<BlockType, Vec<u32>> = HashMap::new();
+        let mut bitmap_map: FxHashMap<BlockType, Vec<u32>> = FxHashMap::default();
         for _ in 0..num_bitmap {
             let bt = block_type_from_ord(read_u8!())?;
             let count = read_u32!() as usize;
@@ -483,7 +485,7 @@ impl DocumentIndex {
 
         // HashIndex by_content
         let num_content = read_u32!() as usize;
-        let mut by_content: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut by_content: FxHashMap<String, Vec<u32>> = FxHashMap::default();
         for _ in 0..num_content {
             let key_len = read_u32!() as usize;
             let key = read_str!(key_len);
@@ -497,7 +499,7 @@ impl DocumentIndex {
 
         // HashIndex by_lang
         let num_lang = read_u32!() as usize;
-        let mut by_lang: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut by_lang: FxHashMap<String, Vec<u32>> = FxHashMap::default();
         for _ in 0..num_lang {
             let key_len = read_u32!() as usize;
             let key = read_str!(key_len);
@@ -511,7 +513,7 @@ impl DocumentIndex {
 
         // HashIndex by_depth
         let num_depth = read_u32!() as usize;
-        let mut by_depth: HashMap<u8, Vec<u32>> = HashMap::new();
+        let mut by_depth: FxHashMap<u8, Vec<u32>> = FxHashMap::default();
         for _ in 0..num_depth {
             let depth = read_u8!();
             let count = read_u32!() as usize;
@@ -524,7 +526,7 @@ impl DocumentIndex {
 
         // TermIndex postings
         let num_terms = read_u32!() as usize;
-        let mut postings: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut postings: FxHashMap<String, Vec<u32>> = FxHashMap::default();
         for _ in 0..num_terms {
             let term_len = read_u32!() as usize;
             let term = read_str!(term_len);

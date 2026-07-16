@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Unique identifier for a block within a document.
 pub type BlockId = u32;
@@ -175,7 +175,7 @@ impl From<bool> for PropertyValue {
 /// Open-record property bag – acts like extra virtual columns in a
 /// row-polymorphic schema. Keyed by string name, typed by [`PropertyValue`].
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Properties(HashMap<String, PropertyValue>);
+pub struct Properties(FxHashMap<String, PropertyValue>);
 
 impl Properties {
     pub fn new() -> Self {
