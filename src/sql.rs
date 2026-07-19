@@ -44,8 +44,6 @@
 //! assert!(!out.rows.is_empty());
 //! ```
 
-use std::collections::HashMap;
-
 use rustc_hash::FxHashMap;
 use sqlparser::{
     ast::{
@@ -66,7 +64,7 @@ use crate::{
     DocumentStore, MqdbError,
     block::{Block, BlockType, Properties, PropertyValue},
     document::{Document, ZoneMaps},
-    indexes::{DocumentIndex, IndexHint},
+    indexes::{DocumentIndex, IndexHint, tokenize},
     store::CustomTableState,
 };
 
@@ -552,7 +550,7 @@ fn hash_equi_join(
     right_key_expr: &Expr,
     full_predicate: &Expr,
 ) -> Vec<Row> {
-    let mut buckets: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+    let mut buckets: FxHashMap<JoinKey, Vec<usize>> = FxHashMap::default();
     for (i, r) in right.iter().enumerate() {
         if let Some(key) = value_join_key(&eval_expr(right_key_expr, r)) {
             buckets.entry(key).or_default().push(i);
@@ -966,8 +964,51 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             };
             eval_mq_scalar(&program, &content)
         }
+        "match" => {
+            let (Some(content), Some(query)) = (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+            ) else {
+                return Value::Bool(false);
+            };
+            let content_terms: std::collections::HashSet<String> =
+                tokenize(content).into_iter().collect();
+            let query_terms = tokenize(query);
+            Value::Bool(
+                !query_terms.is_empty() && query_terms.iter().all(|t| content_terms.contains(t)),
+            )
+        }
+        "score" => {
+            let (Some(content), Some(query)) = (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+            ) else {
+                return Value::Float(0.0);
+            };
+            let content_terms = tokenize(content);
+            let query_terms = tokenize(query);
+            if content_terms.is_empty() || query_terms.is_empty() {
+                return Value::Float(0.0);
+            }
+            // Simple term-frequency score, normalised by content length —
+            // deliberately not BM25 (no IDF/corpus-wide stats): `eval_expr`
+            // only ever sees one `Row` at a time with no back-reference to
+            // the corpus, so a real IDF term would need a much larger
+            // signature change (see `TermIndex`'s doc comment for the same
+            // constraint on the index side). Good enough to rank matches
+            // within a single query; a document that repeats a common word
+            // many times can outrank one with a rarer, more specific match.
+            let mut freq: FxHashMap<&str, u32> = FxHashMap::default();
+            for t in &content_terms {
+                *freq.entry(t.as_str()).or_default() += 1;
+            }
+            let hits: f64 = query_terms
+                .iter()
+                .map(|q| *freq.get(q.as_str()).unwrap_or(&0) as f64)
+                .sum();
+            Value::Float(hits / content_terms.len() as f64)
+        }
 
-        // --- string functions ---
         "lower" => str_fn(args, |s| s.to_lowercase()),
         "upper" => str_fn(args, |s| s.to_uppercase()),
         "length" | "len" | "char_length" | "character_length" => args
@@ -1100,7 +1141,6 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             }
         }
 
-        // --- numeric functions ---
         "abs" => num_fn(args, |n| n.abs(), |n| n.abs()),
         "round" => {
             let n = match args.first().and_then(|v| v.as_f64()) {
@@ -1191,7 +1231,6 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             .min_by(|a, b| a.cmp_val(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or(Value::Null),
 
-        // --- null handling ---
         "coalesce" | "ifnull" => args
             .iter()
             .find(|v| !matches!(v, Value::Null))
@@ -1208,7 +1247,6 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             }
         }
 
-        // --- misc ---
         "typeof" => Value::Str(
             match args.first() {
                 Some(Value::Str(_)) => "text",
@@ -1829,12 +1867,24 @@ impl<'a> SqlEngine<'a> {
             .unwrap_or(IndexHint::FullScan);
         // Unlike `hint`, a skip has no later row-by-row recheck, so only
         // allow it for a single un-joined FROM table (no alias ambiguity).
-        let zone_filter =
-            where_expr.filter(|_| select.from.len() == 1 && select.from[0].joins.is_empty());
+        let single_unjoined_from = select.from.len() == 1 && select.from[0].joins.is_empty();
+        let zone_filter = where_expr.filter(|_| single_unjoined_from);
         let mut rows = self.materialise_from_with_hint(&select.from, &hint, zone_filter)?;
 
         // 2. WHERE (full predicate evaluation; index only pre-filtered)
-        if let Some(where_expr) = &select.selection {
+        //
+        // Exception: `WHERE match(content, 'q')` with nothing else ANDed in,
+        // against a plain (un-shadowed, un-joined) `blocks` table, is already
+        // an *exact* result — `TermIndex::intersect` and `match()` share the
+        // same `tokenize()` (see its doc comment), so there's no false
+        // positive to filter out. Re-tokenizing every matched block's
+        // content here would be pure waste, and for a common query term that
+        // can mean re-scanning most of the table.
+        let where_fully_indexed = matches!(hint, IndexHint::TermMatch(_))
+            && single_unjoined_from
+            && matches!(where_expr.map(unwrap_nested), Some(Expr::Function(_)))
+            && from_names_unshadowed_blocks(&select.from[0], &self.cte_scopes.borrow());
+        if !where_fully_indexed && let Some(where_expr) = &select.selection {
             let resolved = self.resolve_subqueries(where_expr)?;
             rows.retain(|row| eval_expr(&resolved, row).is_truthy());
         }
@@ -2139,7 +2189,7 @@ impl<'a> SqlEngine<'a> {
 
         // Group
         let mut groups: Vec<(Vec<Value>, Vec<&Row>)> = Vec::new();
-        let mut key_index: HashMap<Vec<String>, usize> = HashMap::new();
+        let mut key_index: FxHashMap<Vec<String>, usize> = FxHashMap::default();
 
         // We need owned rows to reference; collect first
         let owned: Vec<Row> = rows;
@@ -2294,7 +2344,7 @@ fn apply_matched_edits(
     store: &mut DocumentStore,
     edits: Vec<MatchedBlockEdit>,
 ) -> Result<usize, MqdbError> {
-    let mut by_doc: HashMap<u32, Vec<MatchedBlockEdit>> = HashMap::new();
+    let mut by_doc: FxHashMap<u32, Vec<MatchedBlockEdit>> = FxHashMap::default();
     for edit in edits {
         by_doc.entry(edit.document_id).or_default().push(edit);
     }
@@ -3166,6 +3216,32 @@ fn zone_map_skip(zone_maps: &ZoneMaps, where_expr: &Expr) -> bool {
     false
 }
 
+/// Strips redundant `(...)` wrappers so callers can pattern-match the inner
+/// expression directly.
+fn unwrap_nested(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Nested(inner) => unwrap_nested(inner),
+        other => other,
+    }
+}
+
+/// True if `twj`'s relation is the real `blocks` table — not a `WITH`-clause
+/// CTE of the same name shadowing it — which is what `table_rows_with_hint`
+/// actually applies [`IndexHint`]s to. Used to gate skipping the WHERE
+/// row-by-row recheck: that's only sound when the index was truly consulted.
+fn from_names_unshadowed_blocks(
+    twj: &TableWithJoins,
+    cte_scopes: &[FxHashMap<String, std::rc::Rc<QueryOutput>>],
+) -> bool {
+    let TableFactor::Table { name, .. } = &twj.relation else {
+        return false;
+    };
+    if name.0.last().map(ident_value).unwrap_or("").to_lowercase() != "blocks" {
+        return false;
+    }
+    !cte_scopes.iter().any(|scope| scope.contains_key("blocks"))
+}
+
 /// Inspect the WHERE expression and return the best [`IndexHint`].
 ///
 /// Only analyses the *outermost* conjunct that can be served by an index.
@@ -3276,9 +3352,53 @@ fn analyze_where_for_index(expr: &Expr) -> IndexHint {
             }
             IndexHint::FullScan
         }
+        // match(content, 'query terms') used directly as a boolean predicate
+        // (unlike the other arms above, this isn't wrapped in a BinaryOp).
+        Expr::Function(_) => match match_terms_from_expr(expr) {
+            Some(terms) => IndexHint::TermMatch(terms),
+            None => IndexHint::FullScan,
+        },
         Expr::Nested(inner) => analyze_where_for_index(inner),
         _ => IndexHint::FullScan,
     }
+}
+
+/// Recognises `match(content, 'query terms')` and returns its tokenized
+/// query terms, or `None` if `expr` isn't that exact shape (wrong function
+/// name, wrong column, or a non-literal query argument). Shared by
+/// [`analyze_where_for_index`] (to build the [`IndexHint::TermMatch`] hint)
+/// and [`zone_map_skip`] (to rule out whole documents via the term bloom
+/// filter) so the two stay in lockstep.
+fn match_terms_from_expr(expr: &Expr) -> Option<Vec<String>> {
+    let Expr::Function(f) = expr else {
+        return None;
+    };
+    let name = f
+        .name
+        .0
+        .last()
+        .map(ident_value)
+        .unwrap_or("")
+        .to_lowercase();
+    if name != "match" {
+        return None;
+    }
+    let FunctionArguments::List(al) = &f.args else {
+        return None;
+    };
+    let [
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(col)),
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(q)),
+    ] = al.args.as_slice()
+    else {
+        return None;
+    };
+    if expr_col_name(col).as_deref() != Some("content") {
+        return None;
+    }
+    let query_str = expr_str_val(q)?;
+    let terms = tokenize(&query_str);
+    if terms.is_empty() { None } else { Some(terms) }
 }
 
 /// Returns the column name if the expression is a bare identifier or `alias.col`.
@@ -3480,10 +3600,15 @@ mod tests {
         let start = std::time::Instant::now();
         let _engine = SqlEngine::new(&store).unwrap();
         let elapsed = start.elapsed();
+        // Bound loosened from 1ms to 5ms when `TermIndex` (a fourth
+        // per-document index) was added — still catches anything
+        // pathological (e.g. accidental file I/O or O(n^2) behaviour) while
+        // tolerating cold-start allocator/thread warmup noise on the first
+        // test invocation in a fresh process.
         assert!(
-            elapsed.as_millis() < 1,
-            "SqlEngine::new took {}ms — should be O(1)",
-            elapsed.as_millis()
+            elapsed.as_micros() < 5000,
+            "SqlEngine::new took {}us — should be cheap",
+            elapsed.as_micros()
         );
     }
 
@@ -3733,6 +3858,132 @@ mod tests {
             .unwrap();
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0][0], "NULL");
+    }
+
+    #[test]
+    fn match_function_true_for_all_terms_present() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT match('The quick brown fox', 'quick fox')")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "true");
+    }
+
+    #[test]
+    fn match_function_false_if_any_term_missing() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT match('The quick brown fox', 'quick zebra')")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "false");
+    }
+
+    #[test]
+    fn match_function_case_insensitive() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT match('Rust Programming', 'rust')")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "true");
+    }
+
+    #[test]
+    fn score_function_ranks_denser_matches_higher() {
+        let mut store = DocumentStore::new();
+        store
+            .add_str("# Doc\n\nrust rust rust other words here\n\nrust is fine\n")
+            .unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT content FROM blocks WHERE block_type = 'paragraph'
+                 ORDER BY score(content, 'rust') DESC",
+            )
+            .unwrap();
+        assert_eq!(out.rows[0][0], "rust rust rust other words here");
+    }
+
+    #[test]
+    fn where_match_uses_term_match_index_hint() {
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT * FROM blocks WHERE match(content, 'foo bar')",
+        )
+        .unwrap();
+        let Statement::Query(q) = stmts.into_iter().next().unwrap() else {
+            panic!("expected query")
+        };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            panic!("expected select")
+        };
+        let hint = analyze_where_for_index(select.selection.as_ref().unwrap());
+        assert_eq!(
+            hint,
+            IndexHint::TermMatch(vec!["foo".to_string(), "bar".to_string()])
+        );
+    }
+
+    #[test]
+    fn where_match_and_block_type_combines_hints() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT content FROM blocks
+                 WHERE match(content, 'architecture') AND block_type = 'heading'",
+            )
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Architecture".to_string()]]);
+    }
+
+    #[test]
+    fn where_bare_match_skips_recheck_but_result_is_still_correct() {
+        // "architecture" only tokenizes out of the heading block, so if the
+        // recheck-skip path (bare `match()` fully covering WHERE) somehow
+        // returned a false positive, this would catch it.
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT content FROM blocks WHERE match(content, 'architecture')")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Architecture".to_string()]]);
+    }
+
+    #[test]
+    fn where_bare_match_still_rechecked_when_blocks_shadowed_by_cte() {
+        // A CTE named `blocks` shadows the real table, so `table_rows_with_hint`
+        // never consults the TermIndex for it — the recheck-skip path must
+        // not fire here, or a CTE that fabricates non-matching content would
+        // slip through uncaught.
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "WITH blocks AS (SELECT 'no match here' AS content)
+                 SELECT content FROM blocks WHERE match(content, 'architecture')",
+            )
+            .unwrap();
+        assert!(out.rows.is_empty());
+    }
+
+    #[test]
+    fn where_match_full_scan_fallback_when_query_not_literal() {
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT * FROM blocks WHERE match(content, lang)",
+        )
+        .unwrap();
+        let Statement::Query(q) = stmts.into_iter().next().unwrap() else {
+            panic!("expected query")
+        };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            panic!("expected select")
+        };
+        let hint = analyze_where_for_index(select.selection.as_ref().unwrap());
+        assert_eq!(hint, IndexHint::FullScan);
     }
 
     fn eval_one(sql: &str) -> String {
@@ -4058,7 +4309,7 @@ mod tests {
         assert_eq!(contents, vec!["Doc", "Other"]);
     }
 
-    // ── UPDATE/DELETE write-back ────────────────────────────────────────────
+    // UPDATE/DELETE write-back
 
     fn write_md(dir: &tempfile::TempDir, name: &str, content: &str) -> std::path::PathBuf {
         let path = dir.path().join(name);

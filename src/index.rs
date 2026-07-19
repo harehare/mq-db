@@ -2,9 +2,7 @@ use mq_markdown::Node;
 
 use crate::block::{Block, BlockId, BlockType, DocumentId, Properties, PropertyValue, Span};
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Helper: extract span from a node's position
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn node_to_span(node: &Node) -> Option<Span> {
     node.position().map(|p| Span {
@@ -15,9 +13,7 @@ fn node_to_span(node: &Node) -> Option<Span> {
     })
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Helper: if a node is a Heading, return its depth
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn heading_depth(node: &Node) -> Option<u8> {
     if let Node::Heading(h) = node {
@@ -27,9 +23,7 @@ fn heading_depth(node: &Node) -> Option<u8> {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Helper: convert a serde_yaml Value to a PropertyValue
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn yaml_value_to_property(v: serde_yaml::Value) -> PropertyValue {
     match v {
@@ -53,10 +47,8 @@ fn yaml_value_to_property(v: serde_yaml::Value) -> PropertyValue {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Core conversion: Node → (BlockType, content, Properties)
 // Returns None for nodes that should be skipped (Fragment, Empty).
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn node_to_parts(node: &Node) -> Option<(BlockType, String, Properties)> {
     let mut props = Properties::new();
@@ -190,9 +182,7 @@ fn node_to_parts(node: &Node) -> Option<(BlockType, String, Properties)> {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Public API: build_blocks
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Converts a flat mq-markdown node list into a [`Vec<Block>`] with
 /// **Nested Set / Pre-Post Order** interval indexing.
@@ -220,7 +210,7 @@ pub fn build_blocks(doc_id: DocumentId, nodes: &[Node]) -> Vec<Block> {
         return Vec::new();
     }
 
-    // ── Phase 1: build section tree ──────────────────────────────────────────
+    // Phase 1: build section tree
     //
     // `children[slot]` holds the tree-slot indices of slot's direct children.
     // Slot 0 is the virtual document root; nodes start at slot 1.
@@ -257,7 +247,7 @@ pub fn build_blocks(doc_id: DocumentId, nodes: &[Node]) -> Vec<Block> {
         }
     }
 
-    // ── Phase 2: iterative DFS to assign pre/post numbers ────────────────────
+    // Phase 2: iterative DFS to assign pre/post numbers
 
     let num_slots = children.len();
     let mut pre = vec![0u32; num_slots];
@@ -287,7 +277,7 @@ pub fn build_blocks(doc_id: DocumentId, nodes: &[Node]) -> Vec<Block> {
         }
     }
 
-    // ── Phase 3: construct Block objects ─────────────────────────────────────
+    // Phase 3: construct Block objects
 
     let mut blocks: Vec<Block> = Vec::with_capacity(n);
     let mut next_id: BlockId = 0;
@@ -312,9 +302,7 @@ pub fn build_blocks(doc_id: DocumentId, nodes: &[Node]) -> Vec<Block> {
     blocks
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Tests
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

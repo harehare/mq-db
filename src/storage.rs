@@ -641,6 +641,66 @@ mod tests {
     }
 
     #[test]
+    fn save_then_open_round_trips_term_index_for_match_and_score() {
+        use crate::SqlEngine;
+
+        let path = test_file_path("term-index-round-trip");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store
+            .add_str("# Doc\n\nThe quick brown fox jumps over the lazy dog\n")
+            .unwrap();
+        store.save(&path).unwrap();
+
+        let mut opened = DocumentStore::open(&path).unwrap();
+        opened.load_all_blocks().unwrap();
+        opened.load_all_indexes().unwrap();
+
+        let engine = SqlEngine::new(&opened).unwrap();
+        let out = engine
+            .execute("SELECT content FROM blocks WHERE match(content, 'fox dog')")
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn opening_old_version_file_fails_with_clear_error() {
+        use crate::storage::page::{PAGE_HEADER_SIZE, PAGE_SIZE, compute_checksum};
+
+        let path = test_file_path("old-version-header");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store.add_str("# Hello\n\nBody\n").unwrap();
+        store.save(&path).unwrap();
+
+        // Patch the file header's version field (body offset 4..8, i.e.
+        // absolute page offset PAGE_HEADER_SIZE+4..+8) down to the
+        // pre-TermIndex version, then recompute the header checksum so the
+        // file is otherwise well-formed — isolating the version check.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let version_offset = PAGE_HEADER_SIZE + 4;
+        bytes[version_offset..version_offset + 4].copy_from_slice(&4u32.to_le_bytes());
+
+        let mut page = [0u8; PAGE_SIZE];
+        page.copy_from_slice(&bytes[0..PAGE_SIZE]);
+        let checksum = compute_checksum(&page);
+        bytes[4..8].copy_from_slice(&checksum.to_le_bytes());
+
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = DocumentStore::open(&path)
+            .err()
+            .expect("expected version rejection");
+        assert!(err.to_string().contains("unsupported file version"));
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn persisted_index_round_trip_large_block_content() {
         use crate::indexes::DocumentIndex;
 

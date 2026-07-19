@@ -19,7 +19,11 @@ pub(crate) const PAGE_TYPE_INDEX: u32 = 5;
 pub(crate) const PAGE_TYPE_TABLE_DATA: u32 = 6;
 
 const FILE_MAGIC: u32 = 0x4D51_4442;
-const FILE_VERSION: u32 = 4;
+// v5: DocumentIndex gained a TermIndex (full-text search postings), appended
+// after the pre-existing four index sections. Files written by v4 or
+// earlier lack that section and are rejected outright below — there is no
+// migration path, `mq-db index` must be re-run to recreate the store.
+const FILE_VERSION: u32 = 5;
 const CATALOG_START_PAGE: u32 = 1;
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {

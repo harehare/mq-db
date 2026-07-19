@@ -21,9 +21,7 @@ use serde::Deserialize;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-// ─────────────────────────────────────────────────────────────────────────────
 // CLI structure
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(
@@ -211,9 +209,7 @@ impl std::fmt::Display for ReplMode {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
     if !db.exists() {
@@ -282,16 +278,14 @@ fn block_type_icon(bt: &BlockType) -> &'static str {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Main
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        // ── index ────────────────────────────────────────────────────────────
+        // index
         Commands::Index {
             paths,
             output,
@@ -354,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
-        // ── list ─────────────────────────────────────────────────────────────
+        // list
         Commands::List { db, format } => {
             // Catalog-only: skip deserialising all block data for a listing.
             let store = load_catalog_store(&db)?;
@@ -460,7 +454,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // ── mq ───────────────────────────────────────────────────────────────
+        // mq
         Commands::Mq { code, db, format } => {
             let store = load_store(&db)?;
             let results =
@@ -518,7 +512,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // ── sql ──────────────────────────────────────────────────────────────
+        // sql
         Commands::Sql {
             query,
             db,
@@ -558,7 +552,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // ── repl ─────────────────────────────────────────────────────────────
+        // repl
         Commands::Repl {
             db,
             mode,
@@ -568,7 +562,7 @@ async fn main() -> anyhow::Result<()> {
             run_repl(store, mode, write_back)?;
         }
 
-        // ── lint ─────────────────────────────────────────────────────────────
+        // lint
         Commands::Lint { db, depth } => {
             let store = load_store(&db)?;
             let q = store.query();
@@ -605,7 +599,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // ── stats ─────────────────────────────────────────────────────────────
+        // stats
         Commands::Stats { db } => {
             let store = load_store(&db)?;
             let stats = store.stats();
@@ -649,7 +643,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // ── show ─────────────────────────────────────────────────────────────
+        // show
         Commands::Show { doc_id, db } => {
             let store = load_store(&db)?;
             let doc = store
@@ -738,7 +732,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // ── tui ──────────────────────────────────────────────────────────────
+        // tui
         Commands::Tui { db } => {
             let store = if db.exists() {
                 DocumentStore::load(&db).map_err(|e| anyhow::anyhow!("{}", e))?
@@ -752,7 +746,7 @@ async fn main() -> anyhow::Result<()> {
             mq_db::tui::run(store).map_err(|e| anyhow::anyhow!("{}", e))?;
         }
 
-        // ── serve ─────────────────────────────────────────────────────────────
+        // serve
         Commands::Serve { db, host, port } => {
             let store = Arc::new(load_store(&db)?);
             let addr = format!("{}:{}", host, port);
@@ -776,9 +770,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // HTTP server handlers
-// ─────────────────────────────────────────────────────────────────────────────
 
 type SharedStore = Arc<DocumentStore>;
 
@@ -955,9 +947,7 @@ fn md_block_to_html(s: &str) -> String {
     format!("<p>{}</p>", html_escape(trimmed))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // REPL
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Crude prefix check used to gate write-back before even attempting a
 /// parse. Only `INSERT INTO blocks` requires `--write-back`; custom tables

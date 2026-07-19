@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Mutex, RwLock},
@@ -44,7 +44,7 @@ use crate::{
 /// append (see [`DocumentStore::try_append_table_rows_to_storage`]).
 fn persist_unsaved_table_rows(
     storage: &mut Storage,
-    custom_tables: &RwLock<HashMap<String, CustomTableState>>,
+    custom_tables: &RwLock<FxHashMap<String, CustomTableState>>,
 ) -> Result<Vec<CustomTableEntry>, MqdbError> {
     let mut guard = custom_tables.write().unwrap();
     for state in guard.values_mut() {
@@ -140,14 +140,14 @@ pub struct DocumentStore {
     /// User-registered virtual tables: name → (columns, rows).
     /// Uses `RwLock` for interior mutability so `SqlEngine` can execute DDL
     /// (`CREATE TABLE`, `INSERT INTO`, `DROP TABLE`) with only `&DocumentStore`.
-    pub(crate) custom_tables: RwLock<HashMap<String, CustomTableState>>,
+    pub(crate) custom_tables: RwLock<FxHashMap<String, CustomTableState>>,
     /// Content hash of each document's source, keyed by `DocumentId`. Used by
     /// [`reindex_paths`](DocumentStore::reindex_paths) to skip re-parsing
     /// files whose content hasn't changed since the last index run. Absent
     /// entries (e.g. documents added via `add_str`, or loaded from an older
     /// `.mq-db` file predating this feature) are treated as "unknown, always
     /// reindex".
-    content_hashes: HashMap<DocumentId, u64>,
+    content_hashes: FxHashMap<DocumentId, u64>,
 }
 
 impl Default for DocumentStore {
@@ -158,8 +158,8 @@ impl Default for DocumentStore {
             store_spans: true,
             storage: Mutex::new(None),
             doc_indexes: Vec::new(),
-            custom_tables: RwLock::new(HashMap::new()),
-            content_hashes: HashMap::new(),
+            custom_tables: RwLock::new(FxHashMap::default()),
+            content_hashes: FxHashMap::default(),
         }
     }
 }
@@ -561,8 +561,8 @@ impl DocumentStore {
     /// Aggregate block-type / code-language statistics across every
     /// document currently loaded in memory.
     pub fn stats(&self) -> StoreStats {
-        let mut type_counts: HashMap<BlockType, usize> = HashMap::new();
-        let mut lang_counts: HashMap<String, usize> = HashMap::new();
+        let mut type_counts: FxHashMap<BlockType, usize> = FxHashMap::default();
+        let mut lang_counts: FxHashMap<String, usize> = FxHashMap::default();
         let mut total_blocks = 0usize;
 
         for doc in &self.documents {
@@ -590,9 +590,7 @@ impl DocumentStore {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Lazy loading
-    // ─────────────────────────────────────────────────────────────────────────
 
     /// Load blocks for every document that has not yet been loaded.
     ///
@@ -739,9 +737,7 @@ impl DocumentStore {
         let _ = storage.flush_catalog(&entries, &custom, &self.content_hash_pairs());
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     // Persistence
-    // ─────────────────────────────────────────────────────────────────────────
 
     /// Persist all in-memory documents to a `.mq-db` file, including secondary
     /// indexes. Writes atomically: writes to `path.tmp` then renames to `path`.
@@ -840,7 +836,7 @@ impl DocumentStore {
                 Some(max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)));
         }
 
-        let mut custom_tables = HashMap::new();
+        let mut custom_tables = FxHashMap::default();
         for ct in custom_table_entries {
             let rows = storage.read_table_rows(ct.first_row_page, ct.num_rows, ct.columns.len())?;
             custom_tables.insert(
@@ -888,7 +884,7 @@ impl DocumentStore {
                 Some(max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)));
         }
 
-        let mut custom_tables = HashMap::new();
+        let mut custom_tables = FxHashMap::default();
         for ct in custom_table_entries {
             let rows = storage.read_table_rows(ct.first_row_page, ct.num_rows, ct.columns.len())?;
             custom_tables.insert(
@@ -945,7 +941,7 @@ impl DocumentStore {
             store_spans: true,
             storage: Mutex::new(None),
             doc_indexes: vec![None; cap],
-            custom_tables: RwLock::new(HashMap::new()),
+            custom_tables: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
         })
     }
