@@ -1867,12 +1867,24 @@ impl<'a> SqlEngine<'a> {
             .unwrap_or(IndexHint::FullScan);
         // Unlike `hint`, a skip has no later row-by-row recheck, so only
         // allow it for a single un-joined FROM table (no alias ambiguity).
-        let zone_filter =
-            where_expr.filter(|_| select.from.len() == 1 && select.from[0].joins.is_empty());
+        let single_unjoined_from = select.from.len() == 1 && select.from[0].joins.is_empty();
+        let zone_filter = where_expr.filter(|_| single_unjoined_from);
         let mut rows = self.materialise_from_with_hint(&select.from, &hint, zone_filter)?;
 
         // 2. WHERE (full predicate evaluation; index only pre-filtered)
-        if let Some(where_expr) = &select.selection {
+        //
+        // Exception: `WHERE match(content, 'q')` with nothing else ANDed in,
+        // against a plain (un-shadowed, un-joined) `blocks` table, is already
+        // an *exact* result — `TermIndex::intersect` and `match()` share the
+        // same `tokenize()` (see its doc comment), so there's no false
+        // positive to filter out. Re-tokenizing every matched block's
+        // content here would be pure waste, and for a common query term that
+        // can mean re-scanning most of the table.
+        let where_fully_indexed = matches!(hint, IndexHint::TermMatch(_))
+            && single_unjoined_from
+            && matches!(where_expr.map(unwrap_nested), Some(Expr::Function(_)))
+            && from_names_unshadowed_blocks(&select.from[0], &self.cte_scopes.borrow());
+        if !where_fully_indexed && let Some(where_expr) = &select.selection {
             let resolved = self.resolve_subqueries(where_expr)?;
             rows.retain(|row| eval_expr(&resolved, row).is_truthy());
         }
@@ -3204,6 +3216,32 @@ fn zone_map_skip(zone_maps: &ZoneMaps, where_expr: &Expr) -> bool {
     false
 }
 
+/// Strips redundant `(...)` wrappers so callers can pattern-match the inner
+/// expression directly.
+fn unwrap_nested(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Nested(inner) => unwrap_nested(inner),
+        other => other,
+    }
+}
+
+/// True if `twj`'s relation is the real `blocks` table — not a `WITH`-clause
+/// CTE of the same name shadowing it — which is what `table_rows_with_hint`
+/// actually applies [`IndexHint`]s to. Used to gate skipping the WHERE
+/// row-by-row recheck: that's only sound when the index was truly consulted.
+fn from_names_unshadowed_blocks(
+    twj: &TableWithJoins,
+    cte_scopes: &[FxHashMap<String, std::rc::Rc<QueryOutput>>],
+) -> bool {
+    let TableFactor::Table { name, .. } = &twj.relation else {
+        return false;
+    };
+    if name.0.last().map(ident_value).unwrap_or("").to_lowercase() != "blocks" {
+        return false;
+    }
+    !cte_scopes.iter().any(|scope| scope.contains_key("blocks"))
+}
+
 /// Inspect the WHERE expression and return the best [`IndexHint`].
 ///
 /// Only analyses the *outermost* conjunct that can be served by an index.
@@ -3316,43 +3354,51 @@ fn analyze_where_for_index(expr: &Expr) -> IndexHint {
         }
         // match(content, 'query terms') used directly as a boolean predicate
         // (unlike the other arms above, this isn't wrapped in a BinaryOp).
-        Expr::Function(f) => {
-            let name = f
-                .name
-                .0
-                .last()
-                .map(ident_value)
-                .unwrap_or("")
-                .to_lowercase();
-            if name != "match" {
-                return IndexHint::FullScan;
-            }
-            let FunctionArguments::List(al) = &f.args else {
-                return IndexHint::FullScan;
-            };
-            let [
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(col)),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(q)),
-            ] = al.args.as_slice()
-            else {
-                return IndexHint::FullScan;
-            };
-            if expr_col_name(col).as_deref() != Some("content") {
-                return IndexHint::FullScan;
-            }
-            let Some(query_str) = expr_str_val(q) else {
-                return IndexHint::FullScan;
-            };
-            let terms = tokenize(&query_str);
-            if terms.is_empty() {
-                IndexHint::FullScan
-            } else {
-                IndexHint::TermMatch(terms)
-            }
-        }
+        Expr::Function(_) => match match_terms_from_expr(expr) {
+            Some(terms) => IndexHint::TermMatch(terms),
+            None => IndexHint::FullScan,
+        },
         Expr::Nested(inner) => analyze_where_for_index(inner),
         _ => IndexHint::FullScan,
     }
+}
+
+/// Recognises `match(content, 'query terms')` and returns its tokenized
+/// query terms, or `None` if `expr` isn't that exact shape (wrong function
+/// name, wrong column, or a non-literal query argument). Shared by
+/// [`analyze_where_for_index`] (to build the [`IndexHint::TermMatch`] hint)
+/// and [`zone_map_skip`] (to rule out whole documents via the term bloom
+/// filter) so the two stay in lockstep.
+fn match_terms_from_expr(expr: &Expr) -> Option<Vec<String>> {
+    let Expr::Function(f) = expr else {
+        return None;
+    };
+    let name = f
+        .name
+        .0
+        .last()
+        .map(ident_value)
+        .unwrap_or("")
+        .to_lowercase();
+    if name != "match" {
+        return None;
+    }
+    let FunctionArguments::List(al) = &f.args else {
+        return None;
+    };
+    let [
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(col)),
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(q)),
+    ] = al.args.as_slice()
+    else {
+        return None;
+    };
+    if expr_col_name(col).as_deref() != Some("content") {
+        return None;
+    }
+    let query_str = expr_str_val(q)?;
+    let terms = tokenize(&query_str);
+    if terms.is_empty() { None } else { Some(terms) }
 }
 
 /// Returns the column name if the expression is a bare identifier or `alias.col`.
@@ -3891,6 +3937,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.rows, vec![vec!["Architecture".to_string()]]);
+    }
+
+    #[test]
+    fn where_bare_match_skips_recheck_but_result_is_still_correct() {
+        // "architecture" only tokenizes out of the heading block, so if the
+        // recheck-skip path (bare `match()` fully covering WHERE) somehow
+        // returned a false positive, this would catch it.
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT content FROM blocks WHERE match(content, 'architecture')")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Architecture".to_string()]]);
+    }
+
+    #[test]
+    fn where_bare_match_still_rechecked_when_blocks_shadowed_by_cte() {
+        // A CTE named `blocks` shadows the real table, so `table_rows_with_hint`
+        // never consults the TermIndex for it — the recheck-skip path must
+        // not fire here, or a CTE that fabricates non-matching content would
+        // slip through uncaught.
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "WITH blocks AS (SELECT 'no match here' AS content)
+                 SELECT content FROM blocks WHERE match(content, 'architecture')",
+            )
+            .unwrap();
+        assert!(out.rows.is_empty());
     }
 
     #[test]

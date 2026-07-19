@@ -261,33 +261,53 @@ impl TermIndex {
 
     /// AND-intersection of postings for `terms`. Empty `terms` → empty
     /// result (mirrors `match()`'s "no terms → no match" semantics).
+    ///
+    /// Each per-term postings list is already sorted ascending and deduped
+    /// (see `build`), so this intersects them with a plain sorted merge —
+    /// no hashing, no per-call `BTreeSet`/`HashSet` allocation. Terms are
+    /// processed shortest-postings-first so the accumulator shrinks as fast
+    /// as possible and a term with an empty postings list short-circuits
+    /// immediately.
     pub fn intersect(&self, terms: &[String]) -> Vec<u32> {
-        let mut iter = terms.iter();
-        let Some(first) = iter.next() else {
+        if terms.is_empty() {
             return Vec::new();
-        };
-        let mut acc: std::collections::BTreeSet<u32> = self
-            .postings
-            .get(first)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect();
-        for term in iter {
+        }
+        let mut lists: Vec<&[u32]> = Vec::with_capacity(terms.len());
+        for term in terms {
+            match self.postings.get(term) {
+                Some(list) if !list.is_empty() => lists.push(list),
+                _ => return Vec::new(),
+            }
+        }
+        lists.sort_unstable_by_key(|l| l.len());
+
+        let mut acc: Vec<u32> = lists[0].to_vec();
+        for list in &lists[1..] {
             if acc.is_empty() {
                 break;
             }
-            let set: std::collections::HashSet<u32> = self
-                .postings
-                .get(term)
-                .into_iter()
-                .flatten()
-                .copied()
-                .collect();
-            acc.retain(|idx| set.contains(idx));
+            acc = merge_intersect(&acc, list);
         }
-        acc.into_iter().collect()
+        acc
     }
+}
+
+/// Two-pointer intersection of two sorted, deduped slices. O(a.len() + b.len()).
+fn merge_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
 }
 
 // DocumentIndex — all four indexes bundled for one document
