@@ -288,6 +288,26 @@ mq-db serve --db store.mq-db --port 8080  # custom port
 mq-db serve --db store.mq-db --host 0.0.0.0 --port 8080
 ```
 
+`--host 0.0.0.0` exposes the query endpoints beyond localhost. When doing so, secure the server with an API key or Basic auth, and consider TLS and a rate limit:
+
+```bash
+mq-db serve --db store.mq-db --host 0.0.0.0 \
+  --api-key "$MQ_DB_API_KEY" \
+  --rate-limit 20 \
+  --timeout 10 \
+  --tls-cert cert.pem --tls-key key.pem
+```
+
+| Option                     | Description                                                                    |
+| -------------------------- | -------------------------------------------------------------------------------- |
+| `--timeout <SECS>`         | Abort a request and return `408` if it runs longer than this many seconds        |
+| `--rate-limit <N>`         | Max requests per second per client IP; excess requests get `429`                 |
+| `--api-key <KEY>`          | Require `Api-Key: <KEY>` or `Authorization: Bearer <KEY>` (env `MQ_DB_API_KEY`)   |
+| `--basic-auth <USER:PASS>` | Require HTTP Basic auth (env `MQ_DB_BASIC_AUTH`)                                 |
+| `--tls-cert` / `--tls-key` | PEM certificate/key pair to serve over HTTPS instead of plain HTTP               |
+
+If both `--api-key` and `--basic-auth` are set, either credential grants access. `--tls-cert` and `--tls-key` must be provided together.
+
 Three endpoints are available:
 
 | Method | Path      | Body                   | Description                                          |
