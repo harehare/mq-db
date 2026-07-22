@@ -1,18 +1,23 @@
 //! mq-db CLI – Markdown-specialised embedded database command-line tool.
 
 use std::{
+    collections::HashMap,
     io::{BufRead, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use axum::{
     Router,
-    extract::State,
-    http::StatusCode,
-    response::Json,
+    extract::{ConnectInfo, Request, State},
+    http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
 use mq_db::{DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape};
 use serde::Deserialize;
@@ -174,6 +179,30 @@ enum Commands {
         /// Port to listen on
         #[arg(short, long, default_value_t = 7878)]
         port: u16,
+
+        /// Request timeout in seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+
+        /// Rate limit: max requests per second per IP
+        #[arg(long)]
+        rate_limit: Option<u32>,
+
+        /// Required API key (via Api-Key header or Authorization: Bearer <key>)
+        #[arg(long, env = "MQ_DB_API_KEY")]
+        api_key: Option<String>,
+
+        /// Required Basic auth credentials in user:password format
+        #[arg(long, env = "MQ_DB_BASIC_AUTH")]
+        basic_auth: Option<String>,
+
+        /// Path to TLS certificate file (PEM); requires --tls-key
+        #[arg(long, requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+
+        /// Path to TLS private key file (PEM); requires --tls-cert
+        #[arg(long, requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
     },
 }
 
@@ -747,27 +776,203 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // serve
-        Commands::Serve { db, host, port } => {
+        Commands::Serve {
+            db,
+            host,
+            port,
+            timeout,
+            rate_limit,
+            api_key,
+            basic_auth,
+            tls_cert,
+            tls_key,
+        } => {
             let store = Arc::new(load_store(&db)?);
-            let addr = format!("{}:{}", host, port);
+            let addr: SocketAddr = format!("{}:{}", host, port)
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid address {}:{}: {}", host, port, e))?;
+
+            let security = Arc::new(ServeSecurity {
+                api_key,
+                basic_auth,
+                rate_limiter: rate_limit.map(RateLimiter::new),
+                timeout: timeout.map(Duration::from_secs),
+            });
 
             let app = Router::new()
                 .route("/sql", post(serve_sql))
                 .route("/mq", post(serve_mq))
                 .route("/health", get(serve_health))
-                .with_state(store);
+                .with_state(store)
+                .layer(middleware::from_fn_with_state(security, serve_security));
 
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("Cannot bind {}: {}", addr, e))?;
-            println!("mq-db listening on http://{}", addr);
-            axum::serve(listener, app)
+            if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+                let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to load TLS certificate/key: {}", e))?;
+                println!("mq-db listening on https://{}", addr);
+                axum_server::bind_rustls(addr, tls_config)
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            } else {
+                let listener = tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Cannot bind {}: {}", addr, e))?;
+                println!("mq-db listening on http://{}", addr);
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
+            }
         }
     }
 
     Ok(())
+}
+
+// HTTP server security: auth, rate limiting, and request timeout
+
+struct ServeSecurity {
+    api_key: Option<String>,
+    basic_auth: Option<String>,
+    rate_limiter: Option<RateLimiter>,
+    timeout: Option<Duration>,
+}
+
+/// Fixed-window per-IP rate limiter (1-second windows).
+struct RateLimiter {
+    windows: Mutex<HashMap<String, (u32, Instant)>>,
+    limit_per_second: u32,
+}
+
+impl RateLimiter {
+    fn new(limit_per_second: u32) -> Self {
+        Self {
+            windows: Mutex::new(HashMap::new()),
+            limit_per_second,
+        }
+    }
+
+    fn allow(&self, ip: &str) -> bool {
+        let mut map = self.windows.lock().unwrap();
+        let now = Instant::now();
+
+        // Prune stale entries when the table grows large to prevent unbounded memory use.
+        if map.len() > 10_000 {
+            map.retain(|_, (_, ts)| now.duration_since(*ts) < Duration::from_secs(2));
+        }
+
+        let entry = map.entry(ip.to_string()).or_insert((0, now));
+
+        if now.duration_since(entry.1) >= Duration::from_secs(1) {
+            *entry = (1, now);
+            true
+        } else if entry.0 < self.limit_per_second {
+            entry.0 += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+async fn serve_security(
+    State(security): State<Arc<ServeSecurity>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(limiter) = &security.rate_limiter
+        && !limiter.allow(&addr.ip().to_string())
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, HeaderValue::from_static("1"))],
+            "Too Many Requests",
+        )
+            .into_response();
+    }
+
+    if (security.api_key.is_some() || security.basic_auth.is_some())
+        && !check_auth(&security, &request)
+    {
+        return auth_error_response(&security);
+    }
+
+    match security.timeout {
+        Some(d) => match tokio::time::timeout(d, next.run(request)).await {
+            Ok(resp) => resp,
+            Err(_) => (StatusCode::REQUEST_TIMEOUT, "Request timed out").into_response(),
+        },
+        None => next.run(request).await,
+    }
+}
+
+fn check_auth(security: &ServeSecurity, request: &Request) -> bool {
+    if let Some(expected) = &security.api_key {
+        if request
+            .headers()
+            .get("api-key")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|k| k == expected)
+        {
+            return true;
+        }
+
+        if bearer_token(request)
+            .as_deref()
+            .is_some_and(|k| k == expected)
+        {
+            return true;
+        }
+
+        // API key configured but not matched; only continue to basic-auth if it is also set.
+        if security.basic_auth.is_none() {
+            return false;
+        }
+    }
+
+    if let Some(expected) = &security.basic_auth {
+        let provided = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Basic "))
+            .and_then(|encoded| STANDARD.decode(encoded).ok())
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+
+        return provided.as_deref() == Some(expected.as_str());
+    }
+
+    true
+}
+
+fn bearer_token(request: &Request) -> Option<String> {
+    request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
+fn auth_error_response(security: &ServeSecurity) -> Response {
+    if security.basic_auth.is_some() {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(r#"Basic realm="mq-db""#),
+            )],
+            "Unauthorized",
+        )
+            .into_response()
+    } else {
+        (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+    }
 }
 
 // HTTP server handlers
@@ -1069,4 +1274,146 @@ fn print_repl_help() {
     select(.block_type == "heading")
 "#
     );
+}
+
+#[cfg(test)]
+mod serve_security_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use rstest::rstest;
+
+    fn security(api_key: Option<&str>, basic_auth: Option<&str>) -> ServeSecurity {
+        ServeSecurity {
+            api_key: api_key.map(str::to_owned),
+            basic_auth: basic_auth.map(str::to_owned),
+            rate_limiter: None,
+            timeout: None,
+        }
+    }
+
+    fn basic_header(user: &str, pass: &str) -> String {
+        format!("Basic {}", STANDARD.encode(format!("{user}:{pass}")))
+    }
+
+    #[test]
+    fn auth_disabled_always_passes() {
+        let sec = security(None, None);
+        let req = HttpRequest::builder().body(Body::empty()).unwrap();
+        assert!(check_auth(&sec, &req));
+    }
+
+    #[rstest]
+    #[case(Some("api-key"), "secret", true)]
+    #[case(Some("api-key"), "wrong", false)]
+    #[case(None, "", false)]
+    fn api_key_via_header(
+        #[case] header_name: Option<&str>,
+        #[case] header_value: &str,
+        #[case] expected: bool,
+    ) {
+        let sec = security(Some("secret"), None);
+        let mut builder = HttpRequest::builder();
+        if let Some(name) = header_name {
+            builder = builder.header(name, header_value);
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        assert_eq!(check_auth(&sec, &req), expected);
+    }
+
+    #[rstest]
+    #[case("secret", true)]
+    #[case("wrong", false)]
+    fn api_key_via_bearer(#[case] token: &str, #[case] expected: bool) {
+        let sec = security(Some("secret"), None);
+        let req = HttpRequest::builder()
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(check_auth(&sec, &req), expected);
+    }
+
+    #[rstest]
+    #[case("admin", "pass", true)]
+    #[case("admin", "wrong", false)]
+    #[case("other", "pass", false)]
+    fn basic_auth(#[case] user: &str, #[case] pass: &str, #[case] expected: bool) {
+        let sec = security(None, Some("admin:pass"));
+        let req = HttpRequest::builder()
+            .header("authorization", basic_header(user, pass))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(check_auth(&sec, &req), expected);
+    }
+
+    #[test]
+    fn basic_auth_no_header_rejected() {
+        let sec = security(None, Some("admin:pass"));
+        let req = HttpRequest::builder().body(Body::empty()).unwrap();
+        assert!(!check_auth(&sec, &req));
+    }
+
+    #[test]
+    fn api_key_and_basic_auth_either_grants_access() {
+        let sec = security(Some("secret"), Some("admin:pass"));
+
+        let via_key = HttpRequest::builder()
+            .header("api-key", "secret")
+            .body(Body::empty())
+            .unwrap();
+        assert!(check_auth(&sec, &via_key));
+
+        let via_basic = HttpRequest::builder()
+            .header("authorization", basic_header("admin", "pass"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(check_auth(&sec, &via_basic));
+
+        let neither = HttpRequest::builder().body(Body::empty()).unwrap();
+        assert!(!check_auth(&sec, &neither));
+    }
+
+    #[rstest]
+    #[case(5, 5, 0)]
+    #[case(5, 10, 5)]
+    #[case(1, 3, 2)]
+    #[case(10, 3, 0)]
+    fn rate_limiter_same_window(
+        #[case] limit: u32,
+        #[case] requests: u32,
+        #[case] expected_rejections: u32,
+    ) {
+        let limiter = RateLimiter::new(limit);
+        let rejections = (0..requests)
+            .filter(|_| !limiter.allow("127.0.0.1"))
+            .count() as u32;
+        assert_eq!(rejections, expected_rejections);
+    }
+
+    #[test]
+    fn rate_limiter_different_ips_are_independent() {
+        let limiter = RateLimiter::new(2);
+        assert!(limiter.allow("1.2.3.4"));
+        assert!(limiter.allow("1.2.3.4"));
+        assert!(!limiter.allow("1.2.3.4"));
+
+        assert!(limiter.allow("5.6.7.8"));
+        assert!(limiter.allow("5.6.7.8"));
+        assert!(!limiter.allow("5.6.7.8"));
+    }
+
+    #[test]
+    fn rate_limiter_window_resets_after_one_second() {
+        let limiter = RateLimiter::new(1);
+        assert!(limiter.allow("127.0.0.1"));
+        assert!(!limiter.allow("127.0.0.1"));
+
+        {
+            let mut map = limiter.windows.lock().unwrap();
+            if let Some(entry) = map.get_mut("127.0.0.1") {
+                entry.1 = Instant::now() - Duration::from_secs(2);
+            }
+        }
+        assert!(limiter.allow("127.0.0.1"));
+    }
 }
