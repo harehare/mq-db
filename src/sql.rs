@@ -2180,6 +2180,8 @@ impl<'a> SqlEngine<'a> {
         limit: Option<&Expr>,
         group_by_exprs: &[Expr],
     ) -> Result<QueryOutput, MqdbError> {
+        validate_agg_projection(&select.projection, group_by_exprs)?;
+
         let columns: Vec<String> = select
             .projection
             .iter()
@@ -2910,6 +2912,29 @@ fn is_aggregate_name(name: &str) -> bool {
     )
 }
 
+/// Rejects non-aggregate columns not covered by GROUP BY (PostgreSQL-style), instead of silently picking a row.
+fn validate_agg_projection(
+    projection: &[SelectItem],
+    group_by_exprs: &[Expr],
+) -> Result<(), MqdbError> {
+    for item in projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+            _ => continue,
+        };
+        if is_agg_expr(expr) || matches!(expr, Expr::Value(_)) {
+            continue;
+        }
+        if group_by_exprs.iter().any(|g| expr_structurally_eq(g, expr)) {
+            continue;
+        }
+        return Err(MqdbError::SqlExec(format!(
+            "column \"{expr}\" must appear in the GROUP BY clause or be used in an aggregate function"
+        )));
+    }
+    Ok(())
+}
+
 fn eval_agg_row(
     projection: &[SelectItem],
     group_by_exprs: &[Expr],
@@ -3038,7 +3063,7 @@ fn agg_separator(f: &Function) -> String {
 }
 
 fn expr_structurally_eq(a: &Expr, b: &Expr) -> bool {
-    format!("{:?}", a) == format!("{:?}", b)
+    a == b
 }
 
 fn apply_order_by(rows: &mut [(Row, Vec<String>)], kind: &OrderByKind) {
@@ -3559,6 +3584,26 @@ mod tests {
             .unwrap();
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0][0], "3");
+    }
+
+    #[test]
+    fn test_sql_count_with_grouped_column() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT block_type, count(*) FROM blocks GROUP BY block_type")
+            .unwrap();
+        assert!(!out.rows.is_empty());
+    }
+
+    #[test]
+    fn test_sql_count_with_ungrouped_column_errors() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute("SELECT count(*), content FROM blocks")
+            .unwrap_err();
+        assert!(err.to_string().contains("GROUP BY"));
     }
 
     #[test]
