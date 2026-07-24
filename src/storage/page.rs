@@ -20,10 +20,16 @@ pub(crate) const PAGE_TYPE_TABLE_DATA: u32 = 6;
 
 const FILE_MAGIC: u32 = 0x4D51_4442;
 // v5: DocumentIndex gained a TermIndex (full-text search postings), appended
-// after the pre-existing four index sections. Files written by v4 or
-// earlier lack that section and are rejected outright below — there is no
-// migration path, `mq-db index` must be re-run to recreate the store.
-const FILE_VERSION: u32 = 5;
+// after the pre-existing four index sections. Files written by v4 lack that
+// section; `PageFile::open` accepts them anyway (see `LEGACY_VERSIONS`) and
+// callers rebuild the in-memory index from block data instead of trusting
+// the persisted (pre-TermIndex) index bytes — see `Storage::file_version`.
+pub const FILE_VERSION: u32 = 5;
+/// Older on-disk versions that `PageFile::open` still accepts. The page,
+/// catalog, and block encodings are unchanged across these versions — only
+/// the persisted secondary-index bytes differ — so callers that don't trust
+/// old index chains can read these files without a dedicated converter.
+const LEGACY_VERSIONS: &[u32] = &[4];
 const CATALOG_START_PAGE: u32 = 1;
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {
@@ -84,6 +90,10 @@ pub struct PageFile {
     /// `true` if `num_pages` has advanced since the header page was last
     /// written to disk; `append_page` no longer writes it eagerly.
     header_dirty: bool,
+    /// File-format version read from the header. `FILE_VERSION` for files
+    /// created by this build; an older value if `open` accepted a legacy
+    /// version (see `LEGACY_VERSIONS`).
+    pub version: u32,
 }
 
 impl PageFile {
@@ -98,6 +108,7 @@ impl PageFile {
             file,
             num_pages: 1,
             header_dirty: false,
+            version: FILE_VERSION,
         };
         page_file.write_file_header()?;
         Ok(page_file)
@@ -128,7 +139,7 @@ impl PageFile {
         if magic != FILE_MAGIC {
             return Err(invalid_data("invalid MQDB magic number"));
         }
-        if version != FILE_VERSION {
+        if version != FILE_VERSION && !LEGACY_VERSIONS.contains(&version) {
             return Err(invalid_data(format!(
                 "unsupported file version {version} (expected {FILE_VERSION}); run `mq-db index` to recreate the store"
             )));
@@ -161,6 +172,7 @@ impl PageFile {
             file,
             num_pages,
             header_dirty: false,
+            version,
         })
     }
 

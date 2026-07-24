@@ -47,10 +47,21 @@ impl Storage {
     }
 
     /// Open an existing database file. Validates magic + version.
+    ///
+    /// Accepts both the current file format and older, still-recognised
+    /// versions (see `page::LEGACY_VERSIONS`) — check [`Storage::file_version`]
+    /// to tell which one was actually read.
     pub fn open(path: &Path) -> Result<Self, MqdbError> {
         Ok(Self {
             page_file: PageFile::open(path)?,
         })
+    }
+
+    /// The file-format version this store was read from. `page::FILE_VERSION`
+    /// for stores created by this build; an older value for a legacy file
+    /// that was opened for read/migration.
+    pub fn file_version(&self) -> u32 {
+        self.page_file.version
     }
 
     /// Write one document's blocks to the page file. Returns the first_block_page.
@@ -666,36 +677,121 @@ mod tests {
         cleanup(&path);
     }
 
-    #[test]
-    fn opening_old_version_file_fails_with_clear_error() {
+    /// Patches a saved file's header version field down to `version` and
+    /// recomputes the header checksum, so the file is otherwise well-formed —
+    /// isolating the version check for the tests below.
+    fn patch_version(path: &Path, version: u32) {
         use crate::storage::page::{PAGE_HEADER_SIZE, PAGE_SIZE, compute_checksum};
 
-        let path = test_file_path("old-version-header");
-        cleanup(&path);
-
-        let mut store = DocumentStore::new();
-        store.add_str("# Hello\n\nBody\n").unwrap();
-        store.save(&path).unwrap();
-
-        // Patch the file header's version field (body offset 4..8, i.e.
-        // absolute page offset PAGE_HEADER_SIZE+4..+8) down to the
-        // pre-TermIndex version, then recompute the header checksum so the
-        // file is otherwise well-formed — isolating the version check.
-        let mut bytes = std::fs::read(&path).unwrap();
+        let mut bytes = std::fs::read(path).unwrap();
         let version_offset = PAGE_HEADER_SIZE + 4;
-        bytes[version_offset..version_offset + 4].copy_from_slice(&4u32.to_le_bytes());
+        bytes[version_offset..version_offset + 4].copy_from_slice(&version.to_le_bytes());
 
         let mut page = [0u8; PAGE_SIZE];
         page.copy_from_slice(&bytes[0..PAGE_SIZE]);
         let checksum = compute_checksum(&page);
         bytes[4..8].copy_from_slice(&checksum.to_le_bytes());
 
-        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(path, &bytes).unwrap();
+    }
 
-        let err = DocumentStore::open(&path)
+    #[test]
+    fn opening_unrecognised_version_file_fails_with_clear_error() {
+        let path = test_file_path("unrecognised-version-header");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store.add_str("# Hello\n\nBody\n").unwrap();
+        store.save(&path).unwrap();
+        // Not in `page::LEGACY_VERSIONS` — neither the strict `open` path nor
+        // the tolerant `load` path should accept it.
+        patch_version(&path, 2);
+
+        let err = DocumentStore::load(&path)
             .err()
             .expect("expected version rejection");
         assert!(err.to_string().contains("unsupported file version"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_rejects_legacy_version_and_points_to_migrate() {
+        let path = test_file_path("legacy-version-open");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store.add_str("# Hello\n\nBody\n").unwrap();
+        store.save(&path).unwrap();
+        patch_version(&path, 4);
+
+        let err = DocumentStore::open(&path)
+            .err()
+            .expect("open() must not silently mix legacy and current index bytes");
+        assert!(err.to_string().contains("migrate"));
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn load_reads_legacy_version_file_and_rebuilds_term_index() {
+        use crate::SqlEngine;
+
+        let path = test_file_path("legacy-version-load");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store
+            .add_str("# Doc\n\nThe quick brown fox jumps over the lazy dog\n")
+            .unwrap();
+        store.save(&path).unwrap();
+        patch_version(&path, 4);
+
+        assert_eq!(DocumentStore::file_version(&path).unwrap(), 4);
+
+        // `load` never trusts persisted index bytes (see `build_or_load_index_at`),
+        // so it can read a legacy file straight away — including full-text
+        // search, which requires the TermIndex that v4 files don't have on disk.
+        let mut opened = DocumentStore::load(&path).unwrap();
+        opened.load_all_indexes().unwrap();
+        let engine = SqlEngine::new(&opened).unwrap();
+        let out = engine
+            .execute("SELECT content FROM blocks WHERE match(content, 'fox dog')")
+            .unwrap();
+        assert_eq!(out.rows.len(), 1);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn migrate_rewrites_legacy_file_to_current_version() {
+        let path = test_file_path("legacy-version-migrate");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store
+            .add_str("# Doc\n\nThe quick brown fox jumps over the lazy dog\n")
+            .unwrap();
+        store.save(&path).unwrap();
+        patch_version(&path, 4);
+
+        let old_version = DocumentStore::migrate(&path).unwrap();
+        assert_eq!(old_version, 4);
+        assert_eq!(
+            DocumentStore::file_version(&path).unwrap(),
+            crate::storage::page::FILE_VERSION
+        );
+
+        // Now current, so the strict `open` path (used for in-place writes)
+        // accepts it too.
+        DocumentStore::open(&path).unwrap();
+
+        // A second migrate() call on an already-current file is a no-op that
+        // reports its own (current) version rather than erroring.
+        assert_eq!(
+            DocumentStore::migrate(&path).unwrap(),
+            crate::storage::page::FILE_VERSION
+        );
 
         cleanup(&path);
     }
