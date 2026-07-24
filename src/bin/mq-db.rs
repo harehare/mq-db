@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    io::{BufRead, Write},
+    io::{BufRead, IsTerminal, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -240,6 +240,63 @@ impl std::fmt::Display for ReplMode {
 
 // Helpers
 
+/// If `db` was written by an older but still-readable `mq-db` file format,
+/// offers to migrate it in place before any command opens it.
+///
+/// Only prompts on an interactive terminal — non-interactive runs (scripts,
+/// `serve`) are left alone so they never block waiting on stdin; the current
+/// store file formats stay readable without migrating (see
+/// `DocumentStore::open`'s doc comment for the one mode that still requires
+/// it: in-place writes to an existing store).
+fn maybe_migrate(db: &Path) -> anyhow::Result<()> {
+    let version = match DocumentStore::file_version(db) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // let the real loader below surface the error
+    };
+    if version == mq_db::storage::page::FILE_VERSION || !std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+
+    eprint!(
+        "'{}' uses mq-db file format v{version}; the current format is v{}.\n\
+         Migrate it now? Secondary indexes will be rebuilt and the original \
+         file backed up. [y/N] ",
+        db.display(),
+        mq_db::storage::page::FILE_VERSION
+    );
+    std::io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(());
+    }
+
+    let backup = PathBuf::from(format!("{}.v{version}.bak", db.display()));
+    if backup.exists() {
+        anyhow::bail!(
+            "Refusing to migrate: backup path already exists: {}",
+            backup.display()
+        );
+    }
+    std::fs::copy(db, &backup)?;
+
+    match DocumentStore::migrate(db) {
+        Ok(_) => {
+            eprintln!(
+                "Migrated '{}' to v{}. Backup kept at '{}'.",
+                db.display(),
+                mq_db::storage::page::FILE_VERSION,
+                backup.display()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&backup);
+            anyhow::bail!("Migration failed: {e}");
+        }
+    }
+}
+
 fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
     if !db.exists() {
         anyhow::bail!(
@@ -247,6 +304,7 @@ fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
             db.display()
         );
     }
+    maybe_migrate(db)?;
     DocumentStore::load(db).map_err(|e| anyhow::anyhow!("Failed to load store: {}", e))
 }
 
@@ -258,6 +316,7 @@ fn open_store_for_sql(db: &Path) -> anyhow::Result<DocumentStore> {
             db.display()
         );
     }
+    maybe_migrate(db)?;
     let mut store =
         DocumentStore::open(db).map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?;
     store
@@ -278,6 +337,7 @@ fn load_catalog_store(db: &Path) -> anyhow::Result<DocumentStore> {
             db.display()
         );
     }
+    maybe_migrate(db)?;
     DocumentStore::load_catalog_only(db).map_err(|e| anyhow::anyhow!("Failed to load store: {}", e))
 }
 
@@ -335,6 +395,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 store
             } else {
+                maybe_migrate(&output)?;
                 DocumentStore::open(&output)
                     .map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?
             };
@@ -764,6 +825,7 @@ async fn main() -> anyhow::Result<()> {
         // tui
         Commands::Tui { db } => {
             let store = if db.exists() {
+                maybe_migrate(&db)?;
                 DocumentStore::load(&db).map_err(|e| anyhow::anyhow!("{}", e))?
             } else {
                 eprintln!(

@@ -33,6 +33,7 @@ use crate::{
         Storage,
         catalog::{CatalogEntry, CustomTableEntry},
         codec::{decode_zone_map, encode_zone_map},
+        page::FILE_VERSION,
     },
 };
 
@@ -815,6 +816,17 @@ impl DocumentStore {
     /// [`load_all_indexes`](DocumentStore::load_all_indexes).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open(path.as_ref())?;
+        // Unlike `load`/`load_catalog_only` (read-only, always rebuild
+        // indexes from blocks), this mode keeps `storage` open for later
+        // in-place writes, which only emit current-format index bytes —
+        // mixed with a legacy file's untouched ones, that would corrupt it.
+        if storage.file_version() != FILE_VERSION {
+            return Err(MqdbError::Storage(format!(
+                "store file is version {} (expected {FILE_VERSION}); run `DocumentStore::migrate` \
+                 (or open it once via an interactive `mq-db` command, which offers to migrate) before opening it for writes",
+                storage.file_version()
+            )));
+        }
         let (entries, custom_table_entries, content_hashes) = storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
@@ -944,6 +956,35 @@ impl DocumentStore {
             custom_tables: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
         })
+    }
+
+    /// The on-disk file-format version at `path`, without loading the
+    /// catalog. Use this to decide whether [`DocumentStore::migrate`] is
+    /// needed before calling [`DocumentStore::open`].
+    pub fn file_version(path: impl AsRef<Path>) -> Result<u32, MqdbError> {
+        Ok(Storage::open(path.as_ref())?.file_version())
+    }
+
+    /// Rewrites a store written by an older but still-recognised file
+    /// format (see `storage::page`) in the current format, rebuilding every
+    /// document's secondary index (including any index sections added since
+    /// that version) from its stored blocks. Returns the version the file
+    /// was in before migrating; a no-op if it was already current.
+    ///
+    /// This does not touch the original bytes in place — like [`Self::save`],
+    /// it writes a new file to `<path>.tmp` and renames it over `path`, so a
+    /// failure or interruption midway leaves the original file untouched.
+    /// Callers that want a backup of the pre-migration file should copy it
+    /// before calling this.
+    pub fn migrate(path: impl AsRef<Path>) -> Result<u32, MqdbError> {
+        let path = path.as_ref();
+        let old_version = Self::file_version(path)?;
+        if old_version == FILE_VERSION {
+            return Ok(old_version);
+        }
+        let store = Self::load(path)?;
+        store.save(path)?;
+        Ok(old_version)
     }
 }
 
