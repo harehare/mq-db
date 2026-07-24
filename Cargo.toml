@@ -1,6 +1,6 @@
 [package]
 name = "mq-db"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "Markdown-specialized embedded database with interval-indexed block storage and hierarchical query support"
 keywords = ["markdown", "jq", "query", "database"]
