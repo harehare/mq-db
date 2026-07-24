@@ -739,19 +739,6 @@ graph TD
 
 Writes are atomic: data goes to `<path>.tmp` then renamed to `<path>` on success.
 
-> [!IMPORTANT]
-> File format version 5: `DocumentIndex` gained a `TermIndex` (full-text
-> search postings) appended after the pre-existing index sections. Stores
-> written by `mq-db` version 4 are still readable and are migrated
-> automatically: when a CLI command opens a v4 store from an interactive
-> terminal, it prompts to rebuild the indexes and upgrade the file in place
-> (backing up the original as `<path>.v4.bak` first). Non-interactive runs
-> (scripts, `serve`) skip the prompt and read the v4 file as-is without
-> upgrading it. Files older than version 4, or opened programmatically via
-> [`DocumentStore::open`] for in-place writes, still get a clear
-> "unsupported file version" / "run `DocumentStore::migrate`" error — use
-> [`DocumentStore::migrate`] to upgrade a file explicitly.
-
 ## License
 
 [MIT](LICENSE)
