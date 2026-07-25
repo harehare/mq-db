@@ -7,6 +7,7 @@
 
 [![ci](https://img.shields.io/github/actions/workflow/status/harehare/mq-db/ci.yml?logo=github-actions&label=ci)](https://github.com/harehare/mq-db/actions/workflows/ci.yml)
 [![audit](https://img.shields.io/github/actions/workflow/status/harehare/mq-db/audit.yml?logo=shield&label=audit)](https://github.com/harehare/mq-db/actions/workflows/audit.yml)
+[![crates.io](https://img.shields.io/crates/v/mq-db?logo=rust)](https://crates.io/crates/mq-db)
 [![license](https://img.shields.io/badge/license-MIT-b3402c)](LICENSE)
 
 ![demo](./assets/demo.gif)
@@ -739,6 +740,17 @@ graph TD
 
 Writes are atomic: data goes to `<path>.tmp` then renamed to `<path>` on success.
 
+## Support
+
+- 🐛 [Report bugs](https://github.com/harehare/mq-db/issues/new)
+- 💡 [Request features](https://github.com/harehare/mq-db/issues/new)
+- ⭐ [Star the project](https://github.com/harehare/mq-db) if you find it useful!
+
+## Contributing
+
+Contributions are welcome! Feel free to open an issue or submit a pull request.
+
 ## License
 
 [MIT](LICENSE)
+
