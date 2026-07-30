@@ -32,17 +32,18 @@
     margin: 0; padding: 0;
     width: 1200px; height: 630px;
     background-color: var(--c-paper);
-    /* matches docs/index.html body: radial-gradient(rgb(var(--c-ink) / 0.035) 1px, transparent 1.2px) / 3px 3px */
-    background-image: radial-gradient(rgba(236, 228, 216, 0.035) 1px, transparent 1.2px);
-    background-size: 3px 3px;
     font-family: "Inter", sans-serif;
     color: var(--c-ink);
     overflow: hidden;
   }
+  /* Social platforms crop og:image to varying aspect ratios (2:1, 1.91:1, and
+     square thumbnails on some unfurlers) before display, trimming from every
+     edge. Keep all content inside a safe area well clear of the 1200x630
+     bounds so nothing load-bearing (logo, headline) gets clipped. */
   .card {
     width: 1200px;
     height: 630px;
-    padding: 56px 64px 48px;
+    padding: 64px 76px 56px;
     display: flex;
     flex-direction: column;
     position: relative;
@@ -50,7 +51,6 @@
   .topbar {
     display: flex;
     align-items: center;
-    justify-content: space-between;
   }
   .brand {
     display: flex;
@@ -64,21 +64,13 @@
     letter-spacing: -0.02em;
     color: var(--c-ink);
   }
-  .eyebrow {
-    font-family: "Inter", sans-serif;
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--c-accent);
-  }
   h1 {
     font-family: "Space Grotesk", sans-serif;
     font-weight: 700;
     font-size: 56px;
     line-height: 1.1;
     letter-spacing: -0.025em;
-    margin: 36px 0 22px;
+    margin: 30px 0 20px;
     max-width: 920px;
   }
   h1 em {
@@ -91,7 +83,7 @@
     line-height: 1.55;
     color: var(--c-ink-dim);
     max-width: 780px;
-    margin: 0 0 34px;
+    margin: 0 0 28px;
   }
   p.tagline b {
     color: var(--c-ink);
@@ -154,7 +146,6 @@
         </svg>
         <span>mq-db</span>
       </div>
-      <div class="eyebrow">A Markdown-specialized embedded database, in Rust</div>
     </div>
 
     <h1>Your Markdown is<br />already <em>a database.</em></h1>
@@ -167,15 +158,13 @@
     <div class="panel">
       <div class="panel-head">
         <div class="dots"><span></span><span></span><span></span></div>
-        <div class="label">sql&gt; everything nested under a heading</div>
+        <div class="label">sql&gt; every block nested under a heading, in one comparison</div>
         <div class="tag">under()</div>
       </div>
-      <pre><span class="cm">-- all text/code nested under the "Architecture" heading</span>
-<span class="kw">SELECT</span> b.block_type, b.content <span class="kw">FROM</span> blocks b
-<span class="kw">WHERE</span> under(b.pre, b.post,
-  (<span class="kw">SELECT</span> pre  <span class="kw">FROM</span> blocks <span class="kw">WHERE</span> block_type = <span class="str">'heading'</span> <span class="kw">AND</span> content = <span class="str">'Architecture'</span>),
-  (<span class="kw">SELECT</span> post <span class="kw">FROM</span> blocks <span class="kw">WHERE</span> block_type = <span class="str">'heading'</span> <span class="kw">AND</span> content = <span class="str">'Architecture'</span>))
-<span class="kw">ORDER BY</span> b.pre;</pre>
+      <pre><span class="cm">-- all blocks nested under the "Architecture" heading</span>
+<span class="kw">SELECT</span> block_type, content <span class="kw">FROM</span> blocks
+<span class="kw">WHERE</span> under(pre, post, arch.pre, arch.post)
+<span class="kw">ORDER BY</span> pre;</pre>
     </div>
   </div>
 </body>
