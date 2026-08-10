@@ -1,6 +1,6 @@
 [package]
 name = "mq-db"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 description = "Markdown-specialized embedded database with interval-indexed block storage and hierarchical query support"
 keywords = ["markdown", "jq", "query", "database"]
@@ -10,8 +10,8 @@ repository = "https://github.com/harehare/mq-db"
 license = "MIT"
 
 [dependencies]
-mq-markdown = "0.8.1"
-mq-lang = "0.8.1"
+mq-markdown = "0.8.2"
+mq-lang = "0.8.2"
 serde_yaml = "0.9"
 thiserror = "2.0"
 sqlparser = "0.62"
