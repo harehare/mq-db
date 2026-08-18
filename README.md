@@ -48,6 +48,7 @@ flowchart TD
 - **`CREATE VIEW`** — persisted, live (non-materialized) named queries, re-run on every reference
 - **Comprehensive SQL function library** — string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
 - **`mq()` scalar function** — run an mq program against Markdown content inline in SQL
+- **`read_csv()` / `read_json()` table functions** — query external CSV/JSON Lines files directly in `FROM`, no import step
 - **Custom page-file persistence** — 8 KB fixed pages, checksums, atomic writes
 - **CLI + interactive REPL + TUI** — full terminal experience
 
@@ -249,6 +250,20 @@ mq-db sql "EXPLAIN ANALYZE SELECT * FROM blocks WHERE match(content, 'error hand
 ```
 
 `WITH` CTEs are described separately (`cte:<name>:...` steps) before the outer query; `JOIN`s report whether they resolve to a hash join (equi-join `ON`) or a nested loop. Only `SELECT` queries are supported — `EXPLAIN` on other statements is rejected.
+
+### Reading external CSV / JSON Lines
+
+`read_csv(path)` and `read_json(path)` are table functions — use them anywhere a table name goes (`FROM`, `JOIN`, `CREATE TABLE ... AS SELECT`) to query an external file alongside `blocks`, no separate import step:
+
+```bash
+mq-db sql "SELECT name, age FROM read_csv('people.csv') WHERE age > 26" --db store.mq-db
+mq-db sql "SELECT name FROM read_json('people.jsonl') WHERE active = true" --db store.mq-db
+
+# Persist as a custom table
+mq-db sql "CREATE TABLE people AS SELECT * FROM read_csv('people.csv')" --db store.mq-db
+```
+
+`read_csv` parses RFC 4180 (quoted fields, embedded commas/quotes/newlines); the first row is the header. `read_json` expects one JSON object per line (JSON Lines) — the column set is the union of every line's keys, in first-seen order. In both, numeric-looking values support arithmetic/comparison (`WHERE age > 26`), and a short/missing cell becomes `NULL` rather than erroring. Parquet is not supported (would need a large `parquet`/Arrow dependency); an unrecognized table function name (including `read_parquet`) is rejected with a clear error rather than silently misparsed.
 
 ### INSERT / UPDATE / DELETE with write-back
 

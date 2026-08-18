@@ -51,8 +51,8 @@ use sqlparser::{
         DateTimeField, DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
         FunctionArguments, GroupByExpr, Insert, JoinConstraint, JoinOperator, LimitClause,
         ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select,
-        SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TableObject,
-        TableWithJoins, TrimWhereField, UnaryOperator, Value as SqlValue, Values,
+        SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TableFunctionArgs,
+        TableObject, TableWithJoins, TrimWhereField, UnaryOperator, Value as SqlValue, Values,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -2601,14 +2601,21 @@ impl<'a> SqlEngine<'a> {
         hint: &IndexHint,
         zone_filter: Option<&Expr>,
     ) -> Result<Vec<Row>, MqdbError> {
-        let (table_name, alias) = match factor {
-            TableFactor::Table { name, alias, .. } => {
+        let (table_name, alias, func_args) = match factor {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
                 let n = name.0.last().map(ident_value).unwrap_or("").to_lowercase();
                 let a = alias.as_ref().map(|a| a.name.value.clone());
-                (n, a)
+                (n, a, args.clone())
             }
             _ => return Err(MqdbError::SqlExec("unsupported FROM clause".into())),
         };
+
+        if let Some(func_args) = &func_args {
+            let prefix = alias.as_deref().unwrap_or(&table_name).to_string();
+            return resolve_table_function(&table_name, func_args, &prefix);
+        }
 
         // A `WITH x AS (...)` shadows a real table named `x`; search
         // innermost-to-outermost so nested `WITH`s shadow outer ones.
@@ -3884,6 +3891,163 @@ fn table_factor_ident(factor: &TableFactor) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn resolve_table_function(
+    name: &str,
+    args: &TableFunctionArgs,
+    prefix: &str,
+) -> Result<Vec<Row>, MqdbError> {
+    let path = table_function_path_arg(name, args)?;
+    match name {
+        "read_csv" => read_csv_rows(&path, prefix),
+        "read_json" => read_json_rows(&path, prefix),
+        _ => Err(MqdbError::SqlExec(format!(
+            "unknown table function: {name}"
+        ))),
+    }
+}
+
+fn table_function_path_arg(name: &str, args: &TableFunctionArgs) -> Result<String, MqdbError> {
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))] = args.args.as_slice() else {
+        return Err(MqdbError::SqlExec(format!(
+            "{name}(path) expects exactly one string-literal argument"
+        )));
+    };
+    expr_str_val(e)
+        .ok_or_else(|| MqdbError::SqlExec(format!("{name}(path): path must be a string literal")))
+}
+
+fn parse_csv(text: &str) -> Vec<Vec<String>> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => in_quotes = true,
+            ',' => record.push(std::mem::take(&mut field)),
+            '\r' => {}
+            '\n' => {
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+            }
+            _ => field.push(c),
+        }
+    }
+    if !field.is_empty() || !record.is_empty() {
+        record.push(field);
+        records.push(record);
+    }
+    records
+}
+
+fn read_csv_rows(path: &str, prefix: &str) -> Result<Vec<Row>, MqdbError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| MqdbError::SqlExec(format!("read_csv('{path}'): {e}")))?;
+    let mut records = parse_csv(&text).into_iter();
+    let header = records.next().unwrap_or_default();
+    let rows = records
+        .map(|record| {
+            let values = header
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    record
+                        .get(i)
+                        .map(|v| parse_display_value(v))
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+            qualify_row(
+                Row {
+                    columns: header.clone(),
+                    values,
+                },
+                prefix,
+            )
+        })
+        .collect();
+    Ok(rows)
+}
+
+fn json_to_value(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f)
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        other => Value::Str(other.to_string()),
+    }
+}
+
+fn read_json_rows(path: &str, prefix: &str) -> Result<Vec<Row>, MqdbError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| MqdbError::SqlExec(format!("read_json('{path}'): {e}")))?;
+
+    let mut columns: Vec<String> = Vec::new();
+    let mut objects: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| MqdbError::SqlExec(format!("read_json('{path}'): line {}: {e}", i + 1)))?;
+        let serde_json::Value::Object(obj) = value else {
+            return Err(MqdbError::SqlExec(format!(
+                "read_json('{path}'): line {}: expected a JSON object per line",
+                i + 1
+            )));
+        };
+        for key in obj.keys() {
+            if !columns.iter().any(|c| c == key) {
+                columns.push(key.clone());
+            }
+        }
+        objects.push(obj);
+    }
+
+    let rows = objects
+        .into_iter()
+        .map(|obj| {
+            let values = columns
+                .iter()
+                .map(|c| obj.get(c).map(json_to_value).unwrap_or(Value::Null))
+                .collect();
+            qualify_row(
+                Row {
+                    columns: columns.clone(),
+                    values,
+                },
+                prefix,
+            )
+        })
+        .collect();
+    Ok(rows)
 }
 
 const MAX_RECURSIVE_CTE_ITERATIONS: usize = 10_000;
@@ -6045,5 +6209,167 @@ mod tests {
             .unwrap();
         let out = store.execute_sql_mut("SELECT content FROM v").unwrap();
         assert_eq!(out.rows, vec![vec!["Title".to_string()]]);
+    }
+
+    // read_csv() / read_json() table functions
+
+    #[test]
+    fn read_csv_selects_rows_with_header_as_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(
+            &dir,
+            "people.csv",
+            "name,age\n\"Ann, B\",30\n\"She said \"\"hi\"\"\",25\n",
+        );
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(&format!(
+                "SELECT name, age FROM read_csv('{}') ORDER BY age",
+                path.display()
+            ))
+            .unwrap();
+        assert_eq!(
+            out.rows,
+            vec![
+                vec!["She said \"hi\"".to_string(), "25".to_string()],
+                vec!["Ann, B".to_string(), "30".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn read_csv_supports_numeric_where_and_arithmetic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "people.csv", "name,age\nAnn,30\nCarl,25\n");
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(&format!(
+                "SELECT name, age + 1 FROM read_csv('{}') WHERE age > 26",
+                path.display()
+            ))
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Ann".to_string(), "31".to_string()]]);
+    }
+
+    #[test]
+    fn read_csv_pads_ragged_rows_with_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "ragged.csv", "a,b,c\n1,2,3\n4\n");
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(&format!(
+                "SELECT a, b, c FROM read_csv('{}') ORDER BY a",
+                path.display()
+            ))
+            .unwrap();
+        assert_eq!(
+            out.rows,
+            vec![
+                vec!["1".to_string(), "2".to_string(), "3".to_string()],
+                vec!["4".to_string(), "NULL".to_string(), "NULL".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn read_csv_rejects_missing_file_with_clear_error() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute("SELECT * FROM read_csv('/no/such/file.csv')")
+            .unwrap_err();
+        assert!(err.to_string().contains("read_csv"));
+    }
+
+    #[test]
+    fn read_json_selects_rows_from_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(
+            &dir,
+            "people.jsonl",
+            "{\"name\":\"Ann\",\"age\":30,\"active\":true}\n{\"name\":\"Carl\",\"age\":25,\"active\":false}\n",
+        );
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(&format!(
+                "SELECT name, age, active FROM read_json('{}') WHERE age > 26",
+                path.display()
+            ))
+            .unwrap();
+        assert_eq!(
+            out.rows,
+            vec![vec![
+                "Ann".to_string(),
+                "30".to_string(),
+                "true".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn read_json_unions_columns_across_varying_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(
+            &dir,
+            "mixed.jsonl",
+            "{\"name\":\"Ann\",\"age\":30}\n{\"name\":\"Carl\",\"city\":\"NYC\"}\n",
+        );
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(&format!(
+                "SELECT name, age, city FROM read_json('{}') ORDER BY name",
+                path.display()
+            ))
+            .unwrap();
+        assert_eq!(
+            out.rows,
+            vec![
+                vec!["Ann".to_string(), "30".to_string(), "NULL".to_string()],
+                vec!["Carl".to_string(), "NULL".to_string(), "NYC".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn read_json_rejects_non_object_line_with_line_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "bad.jsonl", "{\"a\":1}\n[1,2,3]\n");
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute(&format!("SELECT * FROM read_json('{}')", path.display()))
+            .unwrap_err();
+        assert!(err.to_string().contains("line 2"));
+    }
+
+    #[test]
+    fn read_csv_works_inside_create_table_as_select() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "people.csv", "name,age\nAnn,30\n");
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "CREATE TABLE people AS SELECT * FROM read_csv('{}')",
+                path.display()
+            ))
+            .unwrap();
+        let out = engine.execute("SELECT name FROM people").unwrap();
+        assert_eq!(out.rows, vec![vec!["Ann".to_string()]]);
+    }
+
+    #[test]
+    fn read_table_function_rejects_unknown_name() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute("SELECT * FROM read_parquet('/tmp/x.parquet')")
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown table function"));
     }
 }
