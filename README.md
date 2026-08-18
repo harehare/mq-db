@@ -50,6 +50,7 @@ flowchart TD
 - **`mq()` scalar function** — run an mq program against Markdown content inline in SQL
 - **`read_csv()` / `read_json()` table functions** — query external CSV/JSON Lines files directly in `FROM`, no import step
 - **Custom page-file persistence** — 8 KB fixed pages, checksums, atomic writes
+- **`vacuum`** — reclaim dead page chains left by write-back edits, `DROP TABLE`/`DROP VIEW`, and re-indexing changed files
 - **CLI + interactive REPL + TUI** — full terminal experience
 
 ## Installation
@@ -467,6 +468,22 @@ mq-db stats --db store.mq-db
   {}  python       ██████████░░░░░░░░░░░░░░    18  (25%)
   {}  bash         ███████░░░░░░░░░░░░░░░░░    14  (19%)
 ```
+
+### Compaction (VACUUM)
+
+`UPDATE`/`DELETE` write-back, `DROP TABLE`/`DROP VIEW`, and re-indexing a changed file all replace or remove data by writing a fresh page chain and abandoning the old one — the `.mq-db` file only grows. `vacuum` rewrites the file from scratch (same compaction `save`/`index` already do for a brand-new file) and reclaims that dead space:
+
+```bash
+mq-db vacuum --db store.mq-db
+```
+
+```
+  Pages before   190
+  Pages after    123
+  Reclaimed      536.0 KB
+```
+
+`VACUUM` as a SQL statement is recognized but redirects to this command rather than doing something different or silently failing — mq-db's compaction operates on the whole store file, not per-table, so it doesn't fit the `--write-back`/`execute_sql_mut` path the way `UPDATE`/`DELETE` do.
 
 ### Show document structure
 
