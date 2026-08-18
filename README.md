@@ -39,7 +39,7 @@ flowchart TD
 - **Four-layer secondary indexes** — `BitmapIndex` (block type), `BTreeIndex` (pre/post), `HashIndex` (content/lang/depth), `TermIndex` (tokenized content, full-text) for fast SQL predicate pushdown
 - **Zone Maps** — per-document statistics skip irrelevant files before scanning any blocks
 - **Dual query engines** — SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
-- **`WITH` (CTE) support** — non-recursive common table expressions, usable in `FROM`, `JOIN`, and subqueries
+- **`WITH` / `WITH RECURSIVE` support** — common table expressions, usable in `FROM`, `JOIN`, and subqueries; recursive CTEs via iterative fixed-point evaluation
 - **Full-text search** — `match()`/`score()` SQL functions backed by a persisted per-document inverted index
 - **`EXPLAIN` / `EXPLAIN ANALYZE`** — see the zone-map/index/join plan a query resolves to, with actual row/timing stats under `ANALYZE`
 - **Incremental re-indexing** — re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
@@ -179,9 +179,41 @@ mq-db sql "
 " --db store.mq-db
 ```
 
-`WITH RECURSIVE` is not supported. A CTE name identical to `blocks`,
-`documents`, or a custom table shadows it for the duration of the `WITH`
-clause's scope.
+A CTE's (and a view's — see below) output columns are recovered from their
+rendered text, so arithmetic/numeric comparisons on them (`WHERE pre < 10`
+above) work as expected, but this is a heuristic, not a real type system: a
+value that merely *looks* numeric (e.g. a text cell containing `"007"`)
+round-trips as a number, and a float's trailing zeros aren't preserved.
+
+**`WITH RECURSIVE`** — the standard `<anchor> UNION [ALL] <recursive term>` shape, evaluated by iterative fixed-point: the anchor runs once, then the recursive term re-runs against only the *previous iteration's new rows* until it produces none. `UNION` (not `ALL`) dedupes against every row produced so far, which is also what makes a query that would otherwise cycle forever terminate. A hard cap of 10,000 iterations guards against a recursive term with no terminating condition. The recursive term must reference the CTE by name exactly once in its `FROM`; the anchor must not reference it at all.
+
+```bash
+# Number sequence — the canonical minimal recursive CTE
+mq-db sql "
+  WITH RECURSIVE seq AS (
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1 FROM seq WHERE n < 10
+  )
+  SELECT n FROM seq ORDER BY n
+" --db store.mq-db
+
+# Heading ancestor chain via interval containment — walk up from a block's
+# pre/post to every heading whose interval contains it
+mq-db sql "
+  WITH RECURSIVE ancestors AS (
+    SELECT pre, post, content FROM blocks WHERE pre = 24
+    UNION
+    SELECT b.pre, b.post, b.content
+    FROM blocks b, ancestors
+    WHERE b.pre < ancestors.pre AND ancestors.post < b.post
+      AND b.block_type = 'heading'
+  )
+  SELECT content FROM ancestors ORDER BY pre
+" --db store.mq-db
+```
+
+A plain top-level `SELECT ... UNION SELECT ...` outside a recursive CTE is not supported. A CTE name identical to `blocks`, `documents`, or a custom table shadows it for the duration of the `WITH` clause's scope.
 
 **Full-text search with `match()`/`score()`** — index-accelerated term matching and simple TF-based ranking:
 
@@ -288,10 +320,8 @@ Limitations in this version:
 
 - `CREATE VIEW v (a, b) AS ...` (explicit column list) is not supported
 - A view and a custom table can't share a name
-- A view's `WHERE`/`JOIN` output columns are string-typed (same as `WITH` CTEs)
-  — filtering a view's result on a numeric column (e.g. `WHERE depth = 1`
-  against `SELECT * FROM a_view`) will not match; filter inside the view's own
-  `SELECT` instead
+- A view's output columns are recovered from their rendered text, same as
+  `WITH` CTEs (see the CTE section above for the trade-off this implies)
 
 ### mq queries
 

@@ -51,8 +51,8 @@ use sqlparser::{
         DateTimeField, DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
         FunctionArguments, GroupByExpr, Insert, JoinConstraint, JoinOperator, LimitClause,
         ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select,
-        SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, TrimWhereField,
-        UnaryOperator, Value as SqlValue, Values,
+        SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TableObject,
+        TableWithJoins, TrimWhereField, UnaryOperator, Value as SqlValue, Values,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -522,6 +522,16 @@ fn qualify_row(row: Row, prefix: &str) -> Row {
     }
 }
 
+fn parse_display_value(s: &str) -> Value {
+    if let Ok(n) = s.parse::<i64>() {
+        Value::Int(n)
+    } else if let Ok(f) = s.parse::<f64>() {
+        Value::Float(f)
+    } else {
+        Value::Str(s.to_string())
+    }
+}
+
 fn output_to_rows(out: &QueryOutput, prefix: &str) -> Vec<Row> {
     out.rows
         .iter()
@@ -529,7 +539,7 @@ fn output_to_rows(out: &QueryOutput, prefix: &str) -> Vec<Row> {
             qualify_row(
                 Row {
                     columns: out.columns.clone(),
-                    values: r.iter().map(|v| Value::Str(v.clone())).collect(),
+                    values: r.iter().map(|v| parse_display_value(v)).collect(),
                 },
                 prefix,
             )
@@ -2287,9 +2297,6 @@ impl<'a> SqlEngine<'a> {
         let Some(with) = &query.with else {
             return self.exec_query_body(query);
         };
-        if with.recursive {
-            return Err(MqdbError::SqlExec("WITH RECURSIVE is not supported".into()));
-        }
 
         self.cte_scopes.borrow_mut().push(FxHashMap::default());
         let result = (|| {
@@ -2300,8 +2307,9 @@ impl<'a> SqlEngine<'a> {
                     ));
                 }
                 let name = cte.alias.name.value.to_lowercase();
-                // `name` isn't in scope yet, so no self-reference (WITH RECURSIVE only).
-                let out = self.exec_query(&cte.query)?;
+                // `name` isn't in scope yet, so no self-reference outside
+                // `exec_cte_body`'s own recursive-CTE handling.
+                let out = self.exec_cte_body(&name, &cte.query, with.recursive)?;
                 self.cte_scopes
                     .borrow_mut()
                     .last_mut()
@@ -2312,6 +2320,110 @@ impl<'a> SqlEngine<'a> {
         })();
         self.cte_scopes.borrow_mut().pop();
         result
+    }
+
+    /// Dispatches a `WITH [RECURSIVE]` CTE body: the recursive fixed-point
+    /// driver ([`Self::exec_recursive_cte`]) if `recursive` is set and
+    /// `query.body` has the standard `<anchor> UNION [ALL] <term
+    /// referencing name>` shape, otherwise the plain evaluate-once path
+    /// (also covers a `WITH RECURSIVE` block containing a CTE that doesn't
+    /// actually self-reference).
+    fn exec_cte_body(
+        &self,
+        name: &str,
+        query: &Query,
+        recursive: bool,
+    ) -> Result<QueryOutput, MqdbError> {
+        if recursive
+            && let SetExpr::SetOperation {
+                left,
+                op: SetOperator::Union,
+                set_quantifier,
+                right,
+            } = query.body.as_ref()
+            && let (SetExpr::Select(anchor), SetExpr::Select(term)) =
+                (left.as_ref(), right.as_ref())
+            && select_references_table(term, name)
+        {
+            if select_references_table(anchor, name) {
+                return Err(MqdbError::SqlExec(format!(
+                    "recursive CTE '{name}': the anchor (first) branch must not reference '{name}' itself"
+                )));
+            }
+            let all = matches!(set_quantifier, SetQuantifier::All);
+            return self.exec_recursive_cte(name, anchor, term, all);
+        }
+        self.exec_query(query)
+    }
+
+    /// Iterative fixed-point evaluation of a recursive CTE: run `anchor`
+    /// once to seed the result, then repeatedly bind `name` to only the
+    /// *previous iteration's new rows* (not the whole accumulated result —
+    /// standard recursive-CTE semantics) and run `recursive` again, until it
+    /// produces no new rows. `all` selects `UNION ALL` (no dedup) vs. `UNION`
+    /// (dedup against everything produced so far, which is also what drives
+    /// termination for a query that would otherwise cycle).
+    fn exec_recursive_cte(
+        &self,
+        name: &str,
+        anchor: &Select,
+        recursive: &Select,
+        all: bool,
+    ) -> Result<QueryOutput, MqdbError> {
+        let anchor_out = self.exec_select(anchor, &None, None)?;
+        let columns = anchor_out.columns.clone();
+        let mut result_rows = anchor_out.rows.clone();
+        let mut working = anchor_out.rows;
+        let mut seen: std::collections::HashSet<Vec<String>> = if all {
+            std::collections::HashSet::new()
+        } else {
+            result_rows.iter().cloned().collect()
+        };
+
+        let mut iterations = 0usize;
+        while !working.is_empty() {
+            iterations += 1;
+            if iterations > MAX_RECURSIVE_CTE_ITERATIONS {
+                return Err(MqdbError::SqlExec(format!(
+                    "recursive CTE '{name}' exceeded {MAX_RECURSIVE_CTE_ITERATIONS} iterations \
+                     — check that the recursive branch's WHERE clause terminates"
+                )));
+            }
+
+            self.cte_scopes.borrow_mut().push(
+                [(
+                    name.to_string(),
+                    std::rc::Rc::new(QueryOutput {
+                        columns: columns.clone(),
+                        rows: working.clone(),
+                    }),
+                )]
+                .into_iter()
+                .collect(),
+            );
+            let step = self.exec_select(recursive, &None, None);
+            self.cte_scopes.borrow_mut().pop();
+            let step_out = step?;
+
+            if step_out.columns.len() != columns.len() {
+                return Err(MqdbError::SqlExec(format!(
+                    "recursive CTE '{name}': anchor and recursive branch select \
+                     different numbers of columns"
+                )));
+            }
+
+            working = step_out
+                .rows
+                .into_iter()
+                .filter(|row| all || seen.insert(row.clone()))
+                .collect();
+            result_rows.extend(working.iter().cloned());
+        }
+
+        Ok(QueryOutput {
+            columns,
+            rows: result_rows,
+        })
     }
 
     fn exec_query_body(&self, query: &Query) -> Result<QueryOutput, MqdbError> {
@@ -2333,7 +2445,16 @@ impl<'a> SqlEngine<'a> {
             }
             _ => return Err(MqdbError::SqlExec("unsupported query type".into())),
         };
+        let limit_expr = limit_expr_of(query);
+        self.exec_select(select, &query.order_by, limit_expr.as_ref())
+    }
 
+    fn exec_select(
+        &self,
+        select: &Select,
+        order_by: &Option<sqlparser::ast::OrderBy>,
+        limit: Option<&Expr>,
+    ) -> Result<QueryOutput, MqdbError> {
         // 1. Materialise FROM — with cost-based index predicate pushdown
         let where_expr = select.selection.as_ref();
         let hint = where_expr
@@ -2364,9 +2485,7 @@ impl<'a> SqlEngine<'a> {
         }
 
         // 3. PROJECT / GROUP / ORDER / LIMIT
-        let limit_expr = limit_expr_of(query);
-
-        self.project_and_aggregate(select, rows, &query.order_by, limit_expr.as_ref())
+        self.project_and_aggregate(select, rows, order_by, limit)
     }
 
     fn resolve_subqueries(&self, expr: &Expr) -> Result<Expr, MqdbError> {
@@ -3767,6 +3886,18 @@ fn table_factor_ident(factor: &TableFactor) -> Option<String> {
     }
 }
 
+const MAX_RECURSIVE_CTE_ITERATIONS: usize = 10_000;
+
+fn select_references_table(select: &Select, name: &str) -> bool {
+    select.from.iter().any(|twj| {
+        table_factor_ident(&twj.relation).as_deref() == Some(name)
+            || twj
+                .joins
+                .iter()
+                .any(|j| table_factor_ident(&j.relation).as_deref() == Some(name))
+    })
+}
+
 fn describe_hint(hint: &IndexHint) -> String {
     match hint {
         IndexHint::BlockType(types) => format!(
@@ -4931,13 +5062,132 @@ mod tests {
     }
 
     #[test]
-    fn cte_recursive_rejected_with_clear_error() {
+    fn with_recursive_generates_number_sequence() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "WITH RECURSIVE seq AS (
+                   SELECT 1 AS n
+                   UNION ALL
+                   SELECT n + 1 FROM seq WHERE n < 5
+                 )
+                 SELECT n FROM seq ORDER BY n",
+            )
+            .unwrap();
+        assert_eq!(
+            out.rows,
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["3".to_string()],
+                vec!["4".to_string()],
+                vec!["5".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn with_recursive_union_dedupes_across_iterations() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        // Without dedup this would cycle between 1 and 2 forever; plain
+        // UNION must drop the repeat and terminate.
+        let out = engine
+            .execute(
+                "WITH RECURSIVE cyc AS (
+                   SELECT 1 AS n
+                   UNION
+                   SELECT mod(n, 2) + 1 FROM cyc
+                 )
+                 SELECT n FROM cyc ORDER BY n",
+            )
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["1".to_string()], vec!["2".to_string()]]);
+    }
+
+    #[test]
+    fn with_recursive_walks_heading_ancestors_via_interval_containment() {
+        let mut store = DocumentStore::new();
+        store.add_str("# A\n\n## B\n\n### C\n\nLeaf\n").unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "WITH RECURSIVE ancestors AS (
+                   SELECT pre, post, content FROM blocks
+                   WHERE block_type = 'heading' AND content = 'C'
+                   UNION
+                   SELECT b.pre, b.post, b.content
+                   FROM blocks b, ancestors
+                   WHERE b.pre < ancestors.pre AND ancestors.post < b.post
+                     AND b.block_type = 'heading'
+                 )
+                 SELECT content FROM ancestors ORDER BY pre",
+            )
+            .unwrap();
+        let contents: Vec<&str> = out.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(contents, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn with_recursive_rejects_anchor_self_reference() {
         let store = make_store();
         let engine = SqlEngine::new(&store).unwrap();
         let err = engine
-            .execute("WITH RECURSIVE r AS (SELECT content FROM blocks) SELECT content FROM r")
+            .execute(
+                "WITH RECURSIVE r AS (
+                   SELECT n FROM r
+                   UNION ALL
+                   SELECT n FROM r
+                 )
+                 SELECT n FROM r",
+            )
             .unwrap_err();
-        assert!(err.to_string().contains("RECURSIVE"));
+        assert!(err.to_string().contains("anchor"));
+    }
+
+    #[test]
+    fn with_recursive_rejects_mismatched_column_counts() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute(
+                "WITH RECURSIVE r AS (
+                   SELECT 1 AS n
+                   UNION ALL
+                   SELECT n, n FROM r WHERE n < 5
+                 )
+                 SELECT n FROM r",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("different numbers of columns"));
+    }
+
+    #[test]
+    fn with_recursive_hits_iteration_cap_with_clear_error() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute(
+                "WITH RECURSIVE r AS (
+                   SELECT 1 AS n
+                   UNION ALL
+                   SELECT n + 1 FROM r
+                 )
+                 SELECT n FROM r",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("iterations"));
+    }
+
+    #[test]
+    fn with_recursive_non_self_referencing_cte_still_works() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("WITH RECURSIVE r AS (SELECT content FROM blocks) SELECT content FROM r")
+            .unwrap();
+        assert!(!out.rows.is_empty());
     }
 
     #[test]
