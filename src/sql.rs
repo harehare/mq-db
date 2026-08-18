@@ -1532,6 +1532,30 @@ impl<'a> SqlEngine<'a> {
         self.store.documents().iter().zip(self.indexes.iter())
     }
 
+    /// Sum of `hint`'s predicted matching-block count across every document,
+    /// read directly from each document's already-built secondary index —
+    /// no scanning. Shared by [`Self::choose_best_hint`] and `EXPLAIN`'s plan
+    /// describer, so both report the same numbers.
+    fn estimate_hint_cost(&self, hint: &IndexHint) -> u64 {
+        self.documents_with_indexes()
+            .map(|(doc, idx)| {
+                hint.resolve(idx)
+                    .map(|v| v.len() as u64)
+                    .unwrap_or(doc.blocks.len() as u64)
+            })
+            .sum()
+    }
+
+    /// Cheapest of several [`IndexHint`] candidates for the same WHERE
+    /// clause, by [`Self::estimate_hint_cost`] (ties keep the first
+    /// candidate, for deterministic output). `FullScan` if there are none.
+    fn choose_best_hint(&self, candidates: Vec<IndexHint>) -> IndexHint {
+        candidates
+            .into_iter()
+            .min_by_key(|h| self.estimate_hint_cost(h))
+            .unwrap_or(IndexHint::FullScan)
+    }
+
     /// Execute a SQL statement against the store.
     ///
     /// Supports `SELECT`, `CREATE TABLE`, `INSERT INTO`, `DROP TABLE`,
@@ -1690,11 +1714,34 @@ impl<'a> SqlEngine<'a> {
 
                     match select.selection.as_ref() {
                         Some(we) if is_plain_blocks => {
-                            let hint = analyze_where_for_index(we);
-                            out.push((
-                                format!("{label}:where"),
-                                format!("{} used", describe_hint(&hint)),
-                            ));
+                            let candidates = candidate_hints_for_where(we);
+                            let hint = self.choose_best_hint(candidates.clone());
+                            if candidates.len() <= 1 {
+                                out.push((
+                                    format!("{label}:where"),
+                                    format!("{} used", describe_hint(&hint)),
+                                ));
+                            } else {
+                                let mut costed: Vec<(u64, &IndexHint)> = candidates
+                                    .iter()
+                                    .map(|h| (self.estimate_hint_cost(h), h))
+                                    .collect();
+                                costed.sort_by_key(|(cost, _)| *cost);
+                                let others: Vec<String> = costed
+                                    .iter()
+                                    .filter(|(_, h)| **h != hint)
+                                    .map(|(cost, h)| format!("{} [est. {cost}]", describe_hint(h)))
+                                    .collect();
+                                out.push((
+                                    format!("{label}:where"),
+                                    format!(
+                                        "{} used (est. {} row(s); also considered: {})",
+                                        describe_hint(&hint),
+                                        self.estimate_hint_cost(&hint),
+                                        others.join(", ")
+                                    ),
+                                ));
+                            }
 
                             if single_unjoined_from {
                                 let fields = zone_map_candidate_fields(we);
@@ -1831,7 +1878,7 @@ impl<'a> SqlEngine<'a> {
 
         let where_expr = select.selection.as_ref();
         let hint = where_expr
-            .map(analyze_where_for_index)
+            .map(|we| self.choose_best_hint(candidate_hints_for_where(we)))
             .unwrap_or(IndexHint::FullScan);
 
         let (mut docs_total, mut docs_skipped, mut candidate_rows, mut total_rows) =
@@ -2287,10 +2334,10 @@ impl<'a> SqlEngine<'a> {
             _ => return Err(MqdbError::SqlExec("unsupported query type".into())),
         };
 
-        // 1. Materialise FROM — with index-based predicate pushdown
+        // 1. Materialise FROM — with cost-based index predicate pushdown
         let where_expr = select.selection.as_ref();
         let hint = where_expr
-            .map(analyze_where_for_index)
+            .map(|we| self.choose_best_hint(candidate_hints_for_where(we)))
             .unwrap_or(IndexHint::FullScan);
         // Unlike `hint`, a skip has no later row-by-row recheck, so only
         // allow it for a single un-joined FROM table (no alias ambiguity).
@@ -3824,11 +3871,11 @@ fn from_names_unshadowed_blocks(
     !cte_scopes.iter().any(|scope| scope.contains_key("blocks"))
 }
 
-/// Inspect the WHERE expression and return the best [`IndexHint`].
-///
-/// Only analyses the *outermost* conjunct that can be served by an index.
-/// The full WHERE predicate is still evaluated row-by-row after pre-filtering,
-/// so false positives from index lookups are harmless (but there shouldn't be any).
+/// Recognises a single conjunct's index-hint shape — no `AND` handling (see
+/// [`candidate_hints_for_where`] for combining multiple conjuncts). The full
+/// WHERE predicate is still evaluated row-by-row after pre-filtering, so a
+/// false positive from an index lookup is harmless (but there shouldn't be
+/// any).
 ///
 /// Patterns recognised:
 /// - `block_type = 'X'` → [`IndexHint::BlockType`]
@@ -3838,19 +3885,9 @@ fn from_names_unshadowed_blocks(
 /// - `content = 'X'` → [`IndexHint::ContentExact`]
 /// - `lang = 'X'` → [`IndexHint::LangExact`]
 /// - `depth = N` → [`IndexHint::DepthExact`]
-/// - `A AND B` → picks the better hint from A or B
-fn analyze_where_for_index(expr: &Expr) -> IndexHint {
+/// - `match(content, 'terms')` → [`IndexHint::TermMatch`]
+fn hint_for_conjunct(expr: &Expr) -> IndexHint {
     match expr {
-        // A AND B — try both sides, prefer more selective
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            let lh = analyze_where_for_index(left);
-            let rh = analyze_where_for_index(right);
-            pick_better_hint(lh, rh)
-        }
         // col = 'value'
         Expr::BinaryOp {
             left,
@@ -3940,15 +3977,26 @@ fn analyze_where_for_index(expr: &Expr) -> IndexHint {
             Some(terms) => IndexHint::TermMatch(terms),
             None => IndexHint::FullScan,
         },
-        Expr::Nested(inner) => analyze_where_for_index(inner),
+        Expr::Nested(inner) => hint_for_conjunct(inner),
         _ => IndexHint::FullScan,
     }
+}
+
+/// Every viable (non-[`IndexHint::FullScan`]) index-hint candidate for
+/// `expr`'s conjuncts. The actual choice among them is cost-based — see
+/// [`SqlEngine::choose_best_hint`].
+fn candidate_hints_for_where(expr: &Expr) -> Vec<IndexHint> {
+    flatten_and_conjuncts(expr)
+        .into_iter()
+        .map(hint_for_conjunct)
+        .filter(|h| !matches!(h, IndexHint::FullScan))
+        .collect()
 }
 
 /// Recognises `match(content, 'query terms')` and returns its tokenized
 /// query terms, or `None` if `expr` isn't that exact shape (wrong function
 /// name, wrong column, or a non-literal query argument). Shared by
-/// [`analyze_where_for_index`] (to build the [`IndexHint::TermMatch`] hint)
+/// [`hint_for_conjunct`] (to build the [`IndexHint::TermMatch`] hint)
 /// and [`zone_map_skip`] (to rule out whole documents via the term bloom
 /// filter) so the two stay in lockstep.
 fn match_terms_from_expr(expr: &Expr) -> Option<Vec<String>> {
@@ -4013,26 +4061,6 @@ fn expr_int_val(expr: &Expr) -> Option<i64> {
 }
 
 /// Pick the more selective of two hints (prefer specific types over FullScan).
-fn pick_better_hint(a: IndexHint, b: IndexHint) -> IndexHint {
-    match (&a, &b) {
-        (IndexHint::FullScan, _) => b,
-        (_, IndexHint::FullScan) => a,
-        // Both have hints — prefer the one that narrows more
-        // BlockType with fewer types is more selective
-        (IndexHint::BlockType(ta), IndexHint::BlockType(tb)) => {
-            if ta.len() <= tb.len() {
-                a
-            } else {
-                b
-            }
-        }
-        // Exact lookups beat range
-        (IndexHint::PreExact(_), _) => a,
-        (_, IndexHint::PreExact(_)) => b,
-        _ => a,
-    }
-}
-
 impl BlockType {
     fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -4521,10 +4549,13 @@ mod tests {
         let SetExpr::Select(select) = q.body.as_ref() else {
             panic!("expected select")
         };
-        let hint = analyze_where_for_index(select.selection.as_ref().unwrap());
+        let candidates = candidate_hints_for_where(select.selection.as_ref().unwrap());
         assert_eq!(
-            hint,
-            IndexHint::TermMatch(vec!["foo".to_string(), "bar".to_string()])
+            candidates,
+            vec![IndexHint::TermMatch(vec![
+                "foo".to_string(),
+                "bar".to_string()
+            ])]
         );
     }
 
@@ -4572,6 +4603,62 @@ mod tests {
     }
 
     #[test]
+    fn cost_based_planner_picks_cheaper_of_two_candidates() {
+        let mut store = DocumentStore::new();
+        store
+            .add_str("# Doc\n\nP1\n\nP2\n\nP3\n\nP4\n\n```rust\nfn main(){}\n```\n")
+            .unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT * FROM blocks WHERE block_type = 'paragraph' AND lang = 'rust'",
+        )
+        .unwrap();
+        let Statement::Query(q) = stmts.into_iter().next().unwrap() else {
+            panic!("expected query")
+        };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            panic!("expected select")
+        };
+        let candidates = candidate_hints_for_where(select.selection.as_ref().unwrap());
+        assert_eq!(candidates.len(), 2);
+
+        // 4 paragraphs vs. 1 rust code block — the lang lookup is cheaper.
+        let chosen = engine.choose_best_hint(candidates);
+        assert_eq!(chosen, IndexHint::LangExact("rust".to_string()));
+    }
+
+    #[test]
+    fn cost_based_planner_tie_breaks_deterministically() {
+        let mut store = DocumentStore::new();
+        store.add_str("# Title\n\nBody\n").unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+
+        let stmts = Parser::parse_sql(
+            &GenericDialect {},
+            "SELECT * FROM blocks WHERE block_type = 'heading' AND depth = 1",
+        )
+        .unwrap();
+        let Statement::Query(q) = stmts.into_iter().next().unwrap() else {
+            panic!("expected query")
+        };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            panic!("expected select")
+        };
+        let candidates = candidate_hints_for_where(select.selection.as_ref().unwrap());
+        assert_eq!(candidates.len(), 2);
+
+        // Both candidates match exactly one block (the single H1) — equal
+        // cost, so the first-encountered candidate (BlockType) must win,
+        // consistently across repeated calls.
+        let first = engine.choose_best_hint(candidates.clone());
+        let second = engine.choose_best_hint(candidates);
+        assert_eq!(first, second);
+        assert_eq!(first, IndexHint::BlockType(vec![BlockType::Heading]));
+    }
+
+    #[test]
     fn where_match_full_scan_fallback_when_query_not_literal() {
         let stmts = Parser::parse_sql(
             &GenericDialect {},
@@ -4584,8 +4671,8 @@ mod tests {
         let SetExpr::Select(select) = q.body.as_ref() else {
             panic!("expected select")
         };
-        let hint = analyze_where_for_index(select.selection.as_ref().unwrap());
-        assert_eq!(hint, IndexHint::FullScan);
+        let candidates = candidate_hints_for_where(select.selection.as_ref().unwrap());
+        assert_eq!(candidates, Vec::<IndexHint>::new());
     }
 
     fn eval_one(sql: &str) -> String {
@@ -5368,6 +5455,24 @@ mod tests {
             .execute("EXPLAIN SELECT content FROM blocks WHERE content LIKE '%foo%'")
             .unwrap();
         assert!(explain_detail(&out, "query:where").contains("full scan"));
+    }
+
+    #[test]
+    fn explain_reports_multiple_candidates_with_costs() {
+        let mut store = DocumentStore::new();
+        store
+            .add_str("# Doc\n\nP1\n\nP2\n\nP3\n\nP4\n\n```rust\nfn main(){}\n```\n")
+            .unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "EXPLAIN SELECT * FROM blocks WHERE block_type = 'paragraph' AND lang = 'rust'",
+            )
+            .unwrap();
+        let detail = explain_detail(&out, "query:where");
+        assert!(detail.contains("est."));
+        assert!(detail.contains("also considered"));
+        assert!(detail.contains("HashIndex(lang = 'rust') used"));
     }
 
     #[test]

@@ -606,7 +606,9 @@ fn block_type_from_ord(v: u8) -> Result<BlockType, MqdbError> {
 
 // IndexHint — what the SQL planner decided to use
 
-/// The access plan chosen by the simple predicate pushdown analyser.
+/// A candidate (or chosen) access plan for a WHERE clause. Multiple viable
+/// candidates for the same query are cost-compared — see
+/// `SqlEngine::choose_best_hint` — rather than picked by syntax alone.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IndexHint {
     /// Use the bitmap index: `WHERE block_type = 'X'` or `IN (...)`.

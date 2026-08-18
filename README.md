@@ -194,21 +194,22 @@ mq-db sql "
 " --db store.mq-db
 ```
 
-**`EXPLAIN` / `EXPLAIN ANALYZE`** — see which index (zone map, `BitmapIndex`, `BTreeIndex`, `HashIndex`, `TermIndex`, or full scan) a query's `WHERE`/`JOIN` resolves to, without running it. Add `ANALYZE` to also run the query and report actual row counts, document-skip counts, and timing:
+**`EXPLAIN` / `EXPLAIN ANALYZE`** — see which index (zone map, `BitmapIndex`, `BTreeIndex`, `HashIndex`, `TermIndex`, or full scan) a query's `WHERE`/`JOIN` resolves to, without running it. When more than one index is viable for the same `WHERE` clause, the choice is **cost-based** — each candidate's real matching-block count is read from its index, and the cheapest wins; `EXPLAIN` shows every candidate considered. Add `ANALYZE` to also run the query and report actual row counts, document-skip counts, and timing:
 
 ```bash
-mq-db sql "EXPLAIN SELECT content FROM blocks WHERE block_type = 'heading' AND lang = 'rust'" --db store.mq-db
+mq-db sql "EXPLAIN SELECT content FROM blocks WHERE block_type = 'code' AND lang = 'json'" --db store.mq-db
 ```
 
 ```
-┌──────────────────────┬─────────────────────────────────────────────────────┐
-│ step                 │ detail                                              │
-├──────────────────────┼─────────────────────────────────────────────────────┤
-│ query:from           │ blocks (blocks)                                     │
-│ query:where          │ BitmapIndex(block_type IN (heading)) used           │
-│ query:zone-map       │ eligible via lang                                   │
-│ query:where-recheck  │ row-by-row (full predicate re-evaluated after scan) │
-└──────────────────────┴─────────────────────────────────────────────────────┘
+┌──────────────────────┬────────────────────────────────────────────────────────────────────────┐
+│ step                 │ detail                                                                 │
+├──────────────────────┼────────────────────────────────────────────────────────────────────────┤
+│ query:from           │ blocks (blocks)                                                        │
+│ query:where          │ HashIndex(lang = 'json') used (est. 2 row(s); also considered:          │
+│                       │   BitmapIndex(block_type IN (code)) [est. 289])                        │
+│ query:zone-map       │ eligible via lang                                                       │
+│ query:where-recheck  │ row-by-row (full predicate re-evaluated after scan)                     │
+└──────────────────────┴────────────────────────────────────────────────────────────────────────┘
 ```
 
 ```bash
@@ -764,7 +765,8 @@ graph TD
 | `BTreeIndex`  | `pre`, `post`              | `BTreeMap`             | O(log n) point, O(log n + k) range |
 | `HashIndex`   | `content`, `lang`, `depth` | `HashMap`              | O(1) average                       |
 
-SQL predicate pushdown picks an `IndexHint`:
+SQL predicate pushdown recognizes one `IndexHint` candidate per indexable
+`WHERE` conjunct:
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#f2ebdb','primaryTextColor':'#2a2420','primaryBorderColor':'#b3402c','lineColor':'#b3402c','secondaryColor':'#e3c3b7','tertiaryColor':'#faf6ef','background':'#faf6ef','fontFamily':'JetBrains Mono, monospace'}}}%%
@@ -777,6 +779,16 @@ flowchart TD
     P -->|"lang = '...'"| H2["HashIndex"]
     P -->|"depth = N"| H3["HashIndex"]
     P -->|"other"| FS["Full Scan"]
+```
+
+When a `WHERE` clause has more than one viable candidate (e.g. `block_type =
+'code' AND lang = 'json'` matches both `BitmapIndex` and `HashIndex`), the
+choice between them is **cost-based**: each candidate's real matching-block
+count is read directly from its already-built index (no scanning), and the
+cheapest wins. `EXPLAIN` shows the full comparison:
+
+```
+query:where   HashIndex(lang = 'json') used (est. 2 row(s); also considered: BitmapIndex(block_type IN (code)) [est. 289])
 ```
 
 ### Storage format
