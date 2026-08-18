@@ -41,6 +41,7 @@ flowchart TD
 - **Dual query engines** — SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
 - **`WITH` (CTE) support** — non-recursive common table expressions, usable in `FROM`, `JOIN`, and subqueries
 - **Full-text search** — `match()`/`score()` SQL functions backed by a persisted per-document inverted index
+- **`EXPLAIN` / `EXPLAIN ANALYZE`** — see the zone-map/index/join plan a query resolves to, with actual row/timing stats under `ANALYZE`
 - **Incremental re-indexing** — re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
 - **SQL `INSERT`/`UPDATE`/`DELETE` with write-back** — add, edit, or remove `blocks` and push the change back to the source Markdown file, opt-in via `--write-back`
 - **DDL support** — `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
@@ -191,6 +192,29 @@ mq-db sql "
   ORDER BY relevance DESC
 " --db store.mq-db
 ```
+
+**`EXPLAIN` / `EXPLAIN ANALYZE`** — see which index (zone map, `BitmapIndex`, `BTreeIndex`, `HashIndex`, `TermIndex`, or full scan) a query's `WHERE`/`JOIN` resolves to, without running it. Add `ANALYZE` to also run the query and report actual row counts, document-skip counts, and timing:
+
+```bash
+mq-db sql "EXPLAIN SELECT content FROM blocks WHERE block_type = 'heading' AND lang = 'rust'" --db store.mq-db
+```
+
+```
+┌──────────────────────┬─────────────────────────────────────────────────────┐
+│ step                 │ detail                                              │
+├──────────────────────┼─────────────────────────────────────────────────────┤
+│ query:from           │ blocks (blocks)                                     │
+│ query:where          │ BitmapIndex(block_type IN (heading)) used           │
+│ query:zone-map       │ eligible via lang                                   │
+│ query:where-recheck  │ row-by-row (full predicate re-evaluated after scan) │
+└──────────────────────┴─────────────────────────────────────────────────────┘
+```
+
+```bash
+mq-db sql "EXPLAIN ANALYZE SELECT * FROM blocks WHERE match(content, 'error handling')" --db store.mq-db
+```
+
+`WITH` CTEs are described separately (`cte:<name>:...` steps) before the outer query; `JOIN`s report whether they resolve to a hash join (equi-join `ON`) or a nested loop. Only `SELECT` queries are supported — `EXPLAIN` on other statements is rejected.
 
 ### INSERT / UPDATE / DELETE with write-back
 
