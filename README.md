@@ -45,6 +45,7 @@ flowchart TD
 - **Incremental re-indexing** — re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
 - **SQL `INSERT`/`UPDATE`/`DELETE` with write-back** — add, edit, or remove `blocks` and push the change back to the source Markdown file, opt-in via `--write-back`
 - **DDL support** — `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
+- **`CREATE VIEW`** — persisted, live (non-materialized) named queries, re-run on every reference
 - **Comprehensive SQL function library** — string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
 - **`mq()` scalar function** — run an mq program against Markdown content inline in SQL
 - **Custom page-file persistence** — 8 KB fixed pages, checksums, atomic writes
@@ -263,6 +264,33 @@ mq-db sql "DESC notes"  --db store.mq-db
 # Drop
 mq-db sql "DROP TABLE notes" --db store.mq-db
 ```
+
+### Views
+
+Unlike `CREATE TABLE name AS SELECT ...` (a frozen snapshot), a view is **not
+materialized** — its `SELECT` re-runs on every reference, so it always
+reflects current data, including `--write-back` edits and re-indexing. View
+definitions persist to the `.mq-db` file, same as custom tables.
+
+```bash
+mq-db sql "CREATE VIEW headings AS SELECT content, depth FROM blocks WHERE block_type = 'heading'" --db store.mq-db
+mq-db sql "SELECT * FROM headings WHERE depth = 1" --db store.mq-db
+
+mq-db sql "SHOW TABLES" --db store.mq-db   # views are listed with kind = "view"
+mq-db sql "DESC headings" --db store.mq-db
+
+mq-db sql "CREATE OR REPLACE VIEW headings AS SELECT content FROM blocks WHERE block_type = 'heading'" --db store.mq-db
+mq-db sql "DROP VIEW headings" --db store.mq-db
+```
+
+Limitations in this version:
+
+- `CREATE VIEW v (a, b) AS ...` (explicit column list) is not supported
+- A view and a custom table can't share a name
+- A view's `WHERE`/`JOIN` output columns are string-typed (same as `WITH` CTEs)
+  — filtering a view's result on a numeric column (e.g. `WHERE depth = 1`
+  against `SELECT * FROM a_view`) will not match; filter inside the view's own
+  `SELECT` instead
 
 ### mq queries
 
@@ -587,8 +615,11 @@ Aggregates (usable with `GROUP BY`):
 | `CREATE TABLE name (col TYPE, …)` | Create an empty custom table with explicit schema |
 | `INSERT INTO name VALUES (…)`     | Insert a row into a custom table                  |
 | `DROP TABLE name`                 | Drop a custom table                               |
-| `SHOW TABLES`                     | List all custom tables                            |
-| `DESC name`                       | Show schema of a custom table                     |
+| `CREATE VIEW name AS SELECT …`    | Create a live (non-materialized) view             |
+| `CREATE OR REPLACE VIEW name AS …`| Overwrite an existing view's definition           |
+| `DROP VIEW name`                  | Drop a view                                       |
+| `SHOW TABLES`                     | List all tables and views                         |
+| `DESC name`                       | Show schema of a table or view                    |
 
 ### Example queries
 

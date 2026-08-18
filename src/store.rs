@@ -31,7 +31,7 @@ use crate::{
     query::Query,
     storage::{
         Storage,
-        catalog::{CatalogEntry, CustomTableEntry},
+        catalog::{CatalogEntry, CustomTableEntry, ViewEntry},
         codec::{decode_zone_map, encode_zone_map},
         page::FILE_VERSION,
     },
@@ -142,6 +142,9 @@ pub struct DocumentStore {
     /// Uses `RwLock` for interior mutability so `SqlEngine` can execute DDL
     /// (`CREATE TABLE`, `INSERT INTO`, `DROP TABLE`) with only `&DocumentStore`.
     pub(crate) custom_tables: RwLock<FxHashMap<String, CustomTableState>>,
+    /// `CREATE VIEW` definitions: name → `SELECT` SQL text, re-executed live
+    /// on every reference rather than materialized.
+    pub(crate) views: RwLock<FxHashMap<String, String>>,
     /// Content hash of each document's source, keyed by `DocumentId`. Used by
     /// [`reindex_paths`](DocumentStore::reindex_paths) to skip re-parsing
     /// files whose content hasn't changed since the last index run. Absent
@@ -160,6 +163,7 @@ impl Default for DocumentStore {
             storage: Mutex::new(None),
             doc_indexes: Vec::new(),
             custom_tables: RwLock::new(FxHashMap::default()),
+            views: RwLock::new(FxHashMap::default()),
             content_hashes: FxHashMap::default(),
         }
     }
@@ -666,6 +670,19 @@ impl DocumentStore {
         self.content_hashes.iter().map(|(k, v)| (*k, *v)).collect()
     }
 
+    /// Builds the `CREATE VIEW` entries to persist alongside the catalog.
+    fn views_entries(&self) -> Vec<ViewEntry> {
+        self.views
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(name, sql)| ViewEntry {
+                name: name.clone(),
+                sql: sql.clone(),
+            })
+            .collect()
+    }
+
     /// Flush the catalog (including custom tables) to the backing storage file,
     /// if one is open. Called automatically after DDL operations such as
     /// `CREATE TABLE` and `DROP TABLE`. No-op for in-memory stores.
@@ -680,7 +697,12 @@ impl DocumentStore {
         if let Some(storage) = guard.as_mut() {
             let entries = self.catalog_entries();
             if let Ok(custom) = persist_unsaved_table_rows(storage, &self.custom_tables) {
-                let _ = storage.flush_catalog(&entries, &custom, &self.content_hash_pairs());
+                let _ = storage.flush_catalog(
+                    &entries,
+                    &custom,
+                    &self.content_hash_pairs(),
+                    &self.views_entries(),
+                );
             }
         }
     }
@@ -735,7 +757,12 @@ impl DocumentStore {
             })
             .collect();
         drop(ct_guard);
-        let _ = storage.flush_catalog(&entries, &custom, &self.content_hash_pairs());
+        let _ = storage.flush_catalog(
+            &entries,
+            &custom,
+            &self.content_hash_pairs(),
+            &self.views_entries(),
+        );
     }
 
     // Persistence
@@ -795,7 +822,12 @@ impl DocumentStore {
             }
             drop(ct_guard);
 
-            storage.flush_catalog(&entries, &custom, &self.content_hash_pairs())?;
+            storage.flush_catalog(
+                &entries,
+                &custom,
+                &self.content_hash_pairs(),
+                &self.views_entries(),
+            )?;
             Ok(())
         })();
 
@@ -827,7 +859,8 @@ impl DocumentStore {
                 storage.file_version()
             )));
         }
-        let (entries, custom_table_entries, content_hashes) = storage.load_catalog()?;
+        let (entries, custom_table_entries, content_hashes, view_entries) =
+            storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
@@ -861,6 +894,10 @@ impl DocumentStore {
                 },
             );
         }
+        let views: FxHashMap<String, String> = view_entries
+            .into_iter()
+            .map(|v| (v.name, v.sql))
+            .collect();
 
         Ok(Self {
             documents,
@@ -869,6 +906,7 @@ impl DocumentStore {
             storage: Mutex::new(Some(storage)),
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(custom_tables),
+            views: RwLock::new(views),
             content_hashes: content_hashes.into_iter().collect(),
         })
     }
@@ -879,7 +917,8 @@ impl DocumentStore {
     /// here — [`crate::SqlEngine`] builds them lazily on construction.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open(path.as_ref())?;
-        let (entries, custom_table_entries, content_hashes) = storage.load_catalog()?;
+        let (entries, custom_table_entries, content_hashes, view_entries) =
+            storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
@@ -909,6 +948,10 @@ impl DocumentStore {
                 },
             );
         }
+        let views: FxHashMap<String, String> = view_entries
+            .into_iter()
+            .map(|v| (v.name, v.sql))
+            .collect();
 
         Ok(Self {
             documents,
@@ -917,6 +960,7 @@ impl DocumentStore {
             storage: Mutex::new(None),
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(custom_tables),
+            views: RwLock::new(views),
             content_hashes: content_hashes.into_iter().collect(),
         })
     }
@@ -928,7 +972,8 @@ impl DocumentStore {
     /// `list`), avoiding the cost of deserialising all block data.
     pub fn load_catalog_only(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open(path.as_ref())?;
-        let (entries, _custom_table_entries, content_hashes) = storage.load_catalog()?;
+        let (entries, _custom_table_entries, content_hashes, _view_entries) =
+            storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
@@ -954,6 +999,7 @@ impl DocumentStore {
             storage: Mutex::new(None),
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(FxHashMap::default()),
+            views: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
         })
     }

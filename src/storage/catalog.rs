@@ -35,8 +35,21 @@ pub struct CustomTableEntry {
     pub num_rows: u32,
 }
 
-/// Catalog entries, custom tables, and content hashes read from a page file.
-pub type CatalogData = (Vec<CatalogEntry>, Vec<CustomTableEntry>, Vec<(u32, u64)>);
+/// A persisted `CREATE VIEW` definition: just a name and its `SELECT` text,
+/// re-executed against live data on every reference (never materialized).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewEntry {
+    pub name: String,
+    pub sql: String,
+}
+
+/// Catalog entries, custom tables, content hashes, and views read from a page file.
+pub type CatalogData = (
+    Vec<CatalogEntry>,
+    Vec<CustomTableEntry>,
+    Vec<(u32, u64)>,
+    Vec<ViewEntry>,
+);
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {
     MqdbError::Storage(message.into())
@@ -117,6 +130,7 @@ fn serialize_catalog(
     entries: &[CatalogEntry],
     custom_tables: &[CustomTableEntry],
     content_hashes: &[(u32, u64)],
+    views: &[ViewEntry],
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&as_u32(entries.len(), "catalog entry count").to_le_bytes());
@@ -152,14 +166,24 @@ fn serialize_catalog(
         out.extend_from_slice(&ct.num_rows.to_le_bytes());
     }
 
-    // Trailing optional section (added after custom tables so older catalog
-    // blobs without it still parse — `read_catalog` only reads this if bytes
-    // remain). Maps `document_id` -> content hash, used to skip re-parsing
-    // unchanged files on `reindex_paths`.
+    // Trailing optional sections (added after custom tables so older catalog
+    // blobs without them still parse — `read_catalog` only reads a section if
+    // bytes remain). Maps `document_id` -> content hash, used to skip
+    // re-parsing unchanged files on `reindex_paths`.
     out.extend_from_slice(&as_u32(content_hashes.len(), "content hash count").to_le_bytes());
     for (document_id, hash) in content_hashes {
         out.extend_from_slice(&document_id.to_le_bytes());
         out.extend_from_slice(&hash.to_le_bytes());
+    }
+
+    // `CREATE VIEW` definitions: name -> SELECT text, re-executed live on
+    // every reference (see `SqlEngine::resolve_view`), so no row data here.
+    out.extend_from_slice(&as_u32(views.len(), "view count").to_le_bytes());
+    for view in views {
+        out.extend_from_slice(&as_u16(view.name.len(), "view name length").to_le_bytes());
+        out.extend_from_slice(view.name.as_bytes());
+        out.extend_from_slice(&as_u16(view.sql.len(), "view sql length").to_le_bytes());
+        out.extend_from_slice(view.sql.as_bytes());
     }
 
     out
@@ -170,12 +194,13 @@ pub fn write_catalog(
     entries: &[CatalogEntry],
     custom_tables: &[CustomTableEntry],
     content_hashes: &[(u32, u64)],
+    views: &[ViewEntry],
 ) -> Result<(), MqdbError> {
     if pf.num_pages < 2 {
         return Err(invalid_data("catalog start page is missing"));
     }
 
-    let bytes = serialize_catalog(entries, custom_tables, content_hashes);
+    let bytes = serialize_catalog(entries, custom_tables, content_hashes, views);
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
         vec![&[]]
     } else {
@@ -306,7 +331,21 @@ pub fn read_catalog(pf: &mut PageFile) -> Result<CatalogData, MqdbError> {
         vec![]
     };
 
-    Ok((entries, custom_tables, content_hashes))
+    let views = if decoder.remaining() >= 4 {
+        let count = usize::try_from(decoder.read_u32()?)
+            .map_err(|_| invalid_data("view count exceeds usize range"))?;
+        let mut views = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = decoder.read_string_u16()?;
+            let sql = decoder.read_string_u16()?;
+            views.push(ViewEntry { name, sql });
+        }
+        views
+    } else {
+        vec![]
+    };
+
+    Ok((entries, custom_tables, content_hashes, views))
 }
 
 #[cfg(test)]
@@ -383,11 +422,12 @@ mod tests {
         drop(pf);
 
         let mut reopened = PageFile::open(&path).unwrap();
-        let (entries, custom_tables, content_hashes) = read_catalog(&mut reopened).unwrap();
+        let (entries, custom_tables, content_hashes, views) = read_catalog(&mut reopened).unwrap();
 
         assert_eq!(entries, vec![entry]);
         assert!(custom_tables.is_empty());
         assert!(content_hashes.is_empty());
+        assert!(views.is_empty());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -411,20 +451,64 @@ mod tests {
         // Reserve page 1 the same way `Storage::create` does.
         let placeholder = make_page(PAGE_TYPE_CATALOG, 1, 0, &0u32.to_le_bytes());
         pf.append_page(&placeholder).unwrap();
-        write_catalog(&mut pf, std::slice::from_ref(&entry), &[], &hashes).unwrap();
+        write_catalog(&mut pf, std::slice::from_ref(&entry), &[], &hashes, &[]).unwrap();
         pf.sync_header().unwrap();
         drop(pf);
 
         let mut reopened = PageFile::open(&path).unwrap();
-        let (entries, custom_tables, read_hashes) = read_catalog(&mut reopened).unwrap();
+        let (entries, custom_tables, read_hashes, views) = read_catalog(&mut reopened).unwrap();
 
         assert_eq!(entries, vec![entry]);
         assert!(custom_tables.is_empty());
+        assert!(views.is_empty());
         let mut read_hashes = read_hashes;
         read_hashes.sort();
         let mut expected = hashes;
         expected.sort();
         assert_eq!(read_hashes, expected);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_then_read_catalog_round_trips_views() {
+        let path = test_file_path("views-round-trip");
+        let _ = std::fs::remove_file(&path);
+
+        let entry = CatalogEntry {
+            document_id: 1,
+            path: Some("a.md".to_string()),
+            first_block_page: 1,
+            num_blocks: 2,
+            zone_map_bytes: vec![],
+            index_start_page: 0,
+        };
+        let views = vec![
+            ViewEntry {
+                name: "headings".to_string(),
+                sql: "SELECT content FROM blocks WHERE block_type = 'heading'".to_string(),
+            },
+            ViewEntry {
+                name: "empty_view".to_string(),
+                sql: "SELECT 1".to_string(),
+            },
+        ];
+
+        let mut pf = PageFile::create(&path).unwrap();
+        let placeholder = make_page(PAGE_TYPE_CATALOG, 1, 0, &0u32.to_le_bytes());
+        pf.append_page(&placeholder).unwrap();
+        write_catalog(&mut pf, std::slice::from_ref(&entry), &[], &[], &views).unwrap();
+        pf.sync_header().unwrap();
+        drop(pf);
+
+        let mut reopened = PageFile::open(&path).unwrap();
+        let (entries, custom_tables, content_hashes, read_views) =
+            read_catalog(&mut reopened).unwrap();
+
+        assert_eq!(entries, vec![entry]);
+        assert!(custom_tables.is_empty());
+        assert!(content_hashes.is_empty());
+        assert_eq!(read_views, views);
 
         let _ = std::fs::remove_file(&path);
     }

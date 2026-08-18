@@ -9,7 +9,9 @@ use crate::{
     document::Document,
     error::MqdbError,
     storage::{
-        catalog::{CatalogData, CatalogEntry, CustomTableEntry, read_catalog, write_catalog},
+        catalog::{
+            CatalogData, CatalogEntry, CustomTableEntry, ViewEntry, read_catalog, write_catalog,
+        },
         codec::{decode_block, decode_table_rows, encode_block, encode_table_rows},
         page::{
             PAGE_BODY_SIZE, PAGE_HEADER_SIZE, PAGE_TYPE_BLOCK_DATA, PAGE_TYPE_CATALOG,
@@ -167,8 +169,15 @@ impl Storage {
         entries: &[CatalogEntry],
         custom_tables: &[CustomTableEntry],
         content_hashes: &[(u32, u64)],
+        views: &[ViewEntry],
     ) -> Result<(), MqdbError> {
-        write_catalog(&mut self.page_file, entries, custom_tables, content_hashes)?;
+        write_catalog(
+            &mut self.page_file,
+            entries,
+            custom_tables,
+            content_hashes,
+            views,
+        )?;
         self.page_file.sync_header()
     }
 
@@ -556,11 +565,11 @@ mod tests {
             zone_map_bytes: encode_zone_map(&document.zone_maps),
             index_start_page: 0,
         };
-        storage.flush_catalog(&[catalog_entry], &[], &[]).unwrap();
+        storage.flush_catalog(&[catalog_entry], &[], &[], &[]).unwrap();
         drop(storage);
 
         let mut reopened = Storage::open(&path).unwrap();
-        let (catalog, _, _) = reopened.load_catalog().unwrap();
+        let (catalog, _, _, _) = reopened.load_catalog().unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(
             decode_zone_map(&catalog[0].zone_map_bytes).unwrap(),
@@ -860,7 +869,7 @@ mod tests {
         cleanup(&path);
 
         let mut storage = Storage::create(&path).unwrap();
-        storage.flush_catalog(&[], &[], &[]).unwrap();
+        storage.flush_catalog(&[], &[], &[], &[]).unwrap();
 
         let batch1 = vec![
             vec!["1".to_string(), "a".to_string()],
