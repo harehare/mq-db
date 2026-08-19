@@ -894,10 +894,8 @@ impl DocumentStore {
                 },
             );
         }
-        let views: FxHashMap<String, String> = view_entries
-            .into_iter()
-            .map(|v| (v.name, v.sql))
-            .collect();
+        let views: FxHashMap<String, String> =
+            view_entries.into_iter().map(|v| (v.name, v.sql)).collect();
 
         Ok(Self {
             documents,
@@ -948,10 +946,8 @@ impl DocumentStore {
                 },
             );
         }
-        let views: FxHashMap<String, String> = view_entries
-            .into_iter()
-            .map(|v| (v.name, v.sql))
-            .collect();
+        let views: FxHashMap<String, String> =
+            view_entries.into_iter().map(|v| (v.name, v.sql)).collect();
 
         Ok(Self {
             documents,

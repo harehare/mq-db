@@ -565,7 +565,9 @@ mod tests {
             zone_map_bytes: encode_zone_map(&document.zone_maps),
             index_start_page: 0,
         };
-        storage.flush_catalog(&[catalog_entry], &[], &[], &[]).unwrap();
+        storage
+            .flush_catalog(&[catalog_entry], &[], &[], &[])
+            .unwrap();
         drop(storage);
 
         let mut reopened = Storage::open(&path).unwrap();

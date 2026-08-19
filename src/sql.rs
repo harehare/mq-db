@@ -2560,8 +2560,16 @@ impl<'a> SqlEngine<'a> {
         result
     }
 
-    fn resolve_view(&self, name: &str, sql_text: &str, prefix: &str) -> Result<Vec<Row>, MqdbError> {
-        Ok(output_to_rows(&self.exec_view_query(name, sql_text)?, prefix))
+    fn resolve_view(
+        &self,
+        name: &str,
+        sql_text: &str,
+        prefix: &str,
+    ) -> Result<Vec<Row>, MqdbError> {
+        Ok(output_to_rows(
+            &self.exec_view_query(name, sql_text)?,
+            prefix,
+        ))
     }
 
     fn project_and_aggregate(
@@ -5522,7 +5530,9 @@ mod tests {
     fn create_view_rejects_builtin_name() {
         let store = make_store();
         let engine = SqlEngine::new(&store).unwrap();
-        let err = engine.execute("CREATE VIEW blocks AS SELECT 1").unwrap_err();
+        let err = engine
+            .execute("CREATE VIEW blocks AS SELECT 1")
+            .unwrap_err();
         assert!(err.to_string().contains("built-in"));
     }
 
@@ -5619,11 +5629,7 @@ mod tests {
         let engine = SqlEngine::new(&store).unwrap();
         engine.execute("CREATE VIEW v AS SELECT 1").unwrap();
         let out = engine.execute("SHOW TABLES").unwrap();
-        assert!(
-            out.rows
-                .iter()
-                .any(|r| r[0] == "v" && r[1] == "view")
-        );
+        assert!(out.rows.iter().any(|r| r[0] == "v" && r[1] == "view"));
     }
 
     #[test]
@@ -5661,9 +5667,7 @@ mod tests {
         // Still live after reload, not a frozen snapshot.
         let mut reloaded = reloaded;
         reloaded
-            .execute_sql_mut(
-                "UPDATE blocks SET content = 'Updated' WHERE content = 'Hello'",
-            )
+            .execute_sql_mut("UPDATE blocks SET content = 'Updated' WHERE content = 'Hello'")
             .unwrap();
         let out = SqlEngine::new(&reloaded)
             .unwrap()
@@ -5680,7 +5684,9 @@ mod tests {
         store.add_file(&path).unwrap();
 
         store
-            .execute_sql_mut("CREATE VIEW v AS SELECT content FROM blocks WHERE block_type = 'heading'")
+            .execute_sql_mut(
+                "CREATE VIEW v AS SELECT content FROM blocks WHERE block_type = 'heading'",
+            )
             .unwrap();
         let out = store.execute_sql_mut("SELECT content FROM v").unwrap();
         assert_eq!(out.rows, vec![vec!["Title".to_string()]]);
