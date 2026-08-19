@@ -47,8 +47,8 @@
 use rustc_hash::FxHashMap;
 use sqlparser::{
     ast::{
-        AssignmentTarget, BinaryOperator, CaseWhen, CeilFloorKind, CreateTable, DateTimeField,
-        DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
+        AssignmentTarget, BinaryOperator, CaseWhen, CeilFloorKind, CreateTable, CreateView,
+        DateTimeField, DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
         FunctionArguments, GroupByExpr, Insert, JoinConstraint, JoinOperator, LimitClause,
         ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select,
         SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, TrimWhereField,
@@ -520,6 +520,21 @@ fn qualify_row(row: Row, prefix: &str) -> Row {
             .collect(),
         values: row.values,
     }
+}
+
+fn output_to_rows(out: &QueryOutput, prefix: &str) -> Vec<Row> {
+    out.rows
+        .iter()
+        .map(|r| {
+            qualify_row(
+                Row {
+                    columns: out.columns.clone(),
+                    values: r.iter().map(|v| Value::Str(v.clone())).collect(),
+                },
+                prefix,
+            )
+        })
+        .collect()
 }
 
 fn cross_join(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
@@ -1484,6 +1499,7 @@ pub struct SqlEngine<'a> {
     /// `exec_query` call. Looked up innermost-first so a nested subquery's
     /// own `WITH` shadows an outer CTE of the same name.
     cte_scopes: std::cell::RefCell<Vec<FxHashMap<String, std::rc::Rc<QueryOutput>>>>,
+    view_stack: std::cell::RefCell<Vec<String>>,
 }
 
 impl<'a> SqlEngine<'a> {
@@ -1508,6 +1524,7 @@ impl<'a> SqlEngine<'a> {
             store,
             indexes,
             cte_scopes: std::cell::RefCell::new(Vec::new()),
+            view_stack: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -1551,11 +1568,18 @@ impl<'a> SqlEngine<'a> {
                 if_exists,
                 ..
             } => self.exec_drop_tables(&names, if_exists),
+            Statement::Drop {
+                object_type: ObjectType::View,
+                names,
+                if_exists,
+                ..
+            } => self.exec_drop_views(&names, if_exists),
+            Statement::CreateView(cv) => self.exec_create_view(&cv),
             Statement::Explain {
                 analyze, statement, ..
             } => self.exec_explain(analyze, &statement),
             _ => Err(MqdbError::SqlExec(
-                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, DROP TABLE, DESC, SHOW TABLES, EXPLAIN".into(),
+                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, DROP TABLE, CREATE VIEW, DROP VIEW, DESC, SHOW TABLES, EXPLAIN".into(),
             )),
         }
     }
@@ -1880,6 +1904,19 @@ impl<'a> SqlEngine<'a> {
                 rows,
             });
         }
+        drop(guard);
+        if let Some(sql_text) = self.store.views.read().unwrap().get(table_name).cloned() {
+            let out = self.exec_view_query(table_name, &sql_text)?;
+            let rows = out
+                .columns
+                .iter()
+                .map(|c| vec![c.clone(), "text".to_string()])
+                .collect();
+            return Ok(QueryOutput {
+                columns: vec!["column".to_string(), "type".to_string()],
+                rows,
+            });
+        }
         Err(MqdbError::SqlExec(format!("unknown table: {table_name}")))
     }
 
@@ -1893,6 +1930,13 @@ impl<'a> SqlEngine<'a> {
         drop(guard);
         custom.sort();
         rows.extend(custom.into_iter().map(|n| vec![n, "custom".to_string()]));
+
+        let guard = self.store.views.read().unwrap();
+        let mut views: Vec<String> = guard.keys().cloned().collect();
+        drop(guard);
+        views.sort();
+        rows.extend(views.into_iter().map(|n| vec![n, "view".to_string()]));
+
         Ok(QueryOutput {
             columns: vec!["table".to_string(), "kind".to_string()],
             rows,
@@ -1910,6 +1954,11 @@ impl<'a> SqlEngine<'a> {
         if matches!(table_name.as_str(), "blocks" | "documents") {
             return Err(MqdbError::SqlExec(format!(
                 "cannot override built-in table '{table_name}'"
+            )));
+        }
+        if self.store.views.read().unwrap().contains_key(&table_name) {
+            return Err(MqdbError::SqlExec(format!(
+                "'{table_name}' is already defined as a view"
             )));
         }
 
@@ -1970,6 +2019,103 @@ impl<'a> SqlEngine<'a> {
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec!["ok".to_string()]],
+        })
+    }
+
+    fn exec_create_view(&self, cv: &CreateView) -> Result<QueryOutput, MqdbError> {
+        let view_name = cv
+            .name
+            .0
+            .last()
+            .map(ident_value)
+            .unwrap_or("")
+            .to_lowercase();
+        if matches!(view_name.as_str(), "blocks" | "documents") {
+            return Err(MqdbError::SqlExec(format!(
+                "cannot override built-in table '{view_name}'"
+            )));
+        }
+        if self
+            .store
+            .custom_tables
+            .read()
+            .unwrap()
+            .contains_key(&view_name)
+        {
+            return Err(MqdbError::SqlExec(format!(
+                "'{view_name}' is already defined as a table"
+            )));
+        }
+        if !cv.columns.is_empty() {
+            return Err(MqdbError::SqlExec(
+                "explicit view columns (CREATE VIEW v (a, b) AS ...) are not supported".into(),
+            ));
+        }
+
+        let already_exists = self.store.views.read().unwrap().contains_key(&view_name);
+        if already_exists && !cv.or_replace {
+            if cv.if_not_exists {
+                return Ok(QueryOutput {
+                    columns: vec!["result".to_string()],
+                    rows: vec![vec!["already exists".to_string()]],
+                });
+            }
+            return Err(MqdbError::SqlExec(format!(
+                "view '{view_name}' already exists"
+            )));
+        }
+
+        // Validate the query now so a bad CREATE VIEW fails immediately
+        // rather than on first use.
+        self.exec_query(&cv.query)?;
+        let sql_text = cv.query.to_string();
+        if sql_text.len() > u16::MAX as usize {
+            return Err(MqdbError::SqlExec(
+                "view query is too long to persist (max 65535 bytes)".into(),
+            ));
+        }
+
+        self.store
+            .views
+            .write()
+            .unwrap()
+            .insert(view_name, sql_text);
+        self.store.try_flush_catalog_to_storage();
+        Ok(QueryOutput {
+            columns: vec!["result".to_string()],
+            rows: vec![vec!["ok".to_string()]],
+        })
+    }
+
+    fn exec_drop_views(
+        &self,
+        names: &[ObjectName],
+        if_exists: bool,
+    ) -> Result<QueryOutput, MqdbError> {
+        let dropped = {
+            let mut guard = self.store.views.write().unwrap();
+            let mut dropped = 0usize;
+            for name in names {
+                let view_name = name.0.last().map(ident_value).unwrap_or("").to_lowercase();
+                if matches!(view_name.as_str(), "blocks" | "documents") {
+                    return Err(MqdbError::SqlExec(format!(
+                        "cannot drop built-in table '{view_name}'"
+                    )));
+                }
+                if guard.remove(&view_name).is_some() {
+                    dropped += 1;
+                } else if !if_exists {
+                    return Err(MqdbError::SqlExec(format!(
+                        "view '{view_name}' does not exist"
+                    )));
+                }
+            }
+            dropped
+        };
+        self.store.try_flush_catalog_to_storage();
+        Ok(QueryOutput {
+            columns: vec!["result".to_string()],
+            rows: vec![vec![format!("{dropped} view(s) dropped")]],
         })
     }
 
@@ -2303,19 +2449,7 @@ impl<'a> SqlEngine<'a> {
         for scope in self.cte_scopes.borrow().iter().rev() {
             if let Some(out) = scope.get(&table_name) {
                 let prefix = alias.as_deref().unwrap_or(&table_name);
-                return Ok(out
-                    .rows
-                    .iter()
-                    .map(|r| {
-                        qualify_row(
-                            Row {
-                                columns: out.columns.clone(),
-                                values: r.iter().map(|v| Value::Str(v.clone())).collect(),
-                            },
-                            prefix,
-                        )
-                    })
-                    .collect());
+                return Ok(output_to_rows(out, prefix));
             }
         }
 
@@ -2369,6 +2503,10 @@ impl<'a> SqlEngine<'a> {
                     .collect())
             }
             other => {
+                if let Some(sql_text) = self.store.views.read().unwrap().get(other).cloned() {
+                    let prefix = alias.as_deref().unwrap_or(other).to_string();
+                    return self.resolve_view(other, &sql_text, &prefix);
+                }
                 let guard = self.store.custom_tables.read().unwrap();
                 if let Some(state) = guard.get(other) {
                     let prefix = alias.as_deref().unwrap_or(other);
@@ -2394,6 +2532,36 @@ impl<'a> SqlEngine<'a> {
                 Err(MqdbError::SqlExec(format!("unknown table: {other}")))
             }
         }
+    }
+
+    fn exec_view_query(&self, name: &str, sql_text: &str) -> Result<QueryOutput, MqdbError> {
+        if self.view_stack.borrow().iter().any(|n| n == name) {
+            let mut cycle = self.view_stack.borrow().clone();
+            cycle.push(name.to_string());
+            return Err(MqdbError::SqlExec(format!(
+                "circular view reference: {}",
+                cycle.join(" -> ")
+            )));
+        }
+        self.view_stack.borrow_mut().push(name.to_string());
+        let result = (|| {
+            let stmts = Parser::parse_sql(&GenericDialect {}, sql_text)
+                .map_err(|e| MqdbError::SqlParse(e.to_string()))?;
+            let stmt = stmts
+                .into_iter()
+                .next()
+                .ok_or_else(|| MqdbError::SqlParse("empty view query".into()))?;
+            let Statement::Query(query) = stmt else {
+                return Err(MqdbError::SqlExec("view query is not a SELECT".into()));
+            };
+            self.exec_query(&query)
+        })();
+        self.view_stack.borrow_mut().pop();
+        result
+    }
+
+    fn resolve_view(&self, name: &str, sql_text: &str, prefix: &str) -> Result<Vec<Row>, MqdbError> {
+        Ok(output_to_rows(&self.exec_view_query(name, sql_text)?, prefix))
     }
 
     fn project_and_aggregate(
@@ -5314,5 +5482,207 @@ mod tests {
             .execute_sql_mut("EXPLAIN SELECT content FROM blocks WHERE block_type = 'heading'")
             .unwrap();
         assert!(explain_detail(&out, "query:where").contains("BitmapIndex"));
+    }
+
+    // CREATE VIEW / DROP VIEW
+
+    #[test]
+    fn create_view_then_select_reflects_current_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nOld Content\n");
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        store
+            .execute_sql_mut(
+                "CREATE VIEW paras AS SELECT content FROM blocks WHERE block_type = 'paragraph'",
+            )
+            .unwrap();
+
+        let out = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SELECT content FROM paras")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Old Content".to_string()]]);
+
+        store
+            .execute_sql_mut(
+                "UPDATE blocks SET content = 'New Content' WHERE content = 'Old Content'",
+            )
+            .unwrap();
+
+        let out = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SELECT content FROM paras")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["New Content".to_string()]]);
+    }
+
+    #[test]
+    fn create_view_rejects_builtin_name() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine.execute("CREATE VIEW blocks AS SELECT 1").unwrap_err();
+        assert!(err.to_string().contains("built-in"));
+    }
+
+    #[test]
+    fn create_view_rejects_duplicate_without_if_not_exists() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE VIEW v AS SELECT 1").unwrap();
+        let err = engine.execute("CREATE VIEW v AS SELECT 2").unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn create_view_if_not_exists_is_a_noop() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE VIEW v AS SELECT 1").unwrap();
+        let out = engine
+            .execute("CREATE VIEW IF NOT EXISTS v AS SELECT 2")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "already exists");
+
+        let sel = engine.execute("SELECT * FROM v").unwrap();
+        assert_eq!(sel.rows, vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn create_view_or_replace_overwrites() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE VIEW v AS SELECT 1").unwrap();
+        engine
+            .execute("CREATE OR REPLACE VIEW v AS SELECT 2")
+            .unwrap();
+        let out = engine.execute("SELECT * FROM v").unwrap();
+        assert_eq!(out.rows, vec![vec!["2".to_string()]]);
+    }
+
+    #[test]
+    fn create_view_rejects_name_colliding_with_custom_table() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE t (x TEXT)").unwrap();
+        let err = engine.execute("CREATE VIEW t AS SELECT 1").unwrap_err();
+        assert!(err.to_string().contains("table"));
+    }
+
+    #[test]
+    fn create_table_rejects_name_colliding_with_view() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE VIEW v AS SELECT 1").unwrap();
+        let err = engine.execute("CREATE TABLE v (x TEXT)").unwrap_err();
+        assert!(err.to_string().contains("view"));
+    }
+
+    #[test]
+    fn view_detects_circular_reference() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE VIEW a AS SELECT 1").unwrap();
+        engine.execute("CREATE VIEW b AS SELECT * FROM a").unwrap();
+        // At validation time this only sees b's current (non-circular)
+        // definition, so it succeeds — but now a -> b -> a is a real cycle.
+        engine
+            .execute("CREATE OR REPLACE VIEW a AS SELECT * FROM b")
+            .unwrap();
+
+        let err = engine.execute("SELECT * FROM a").unwrap_err();
+        assert!(err.to_string().contains("circular"));
+    }
+
+    #[test]
+    fn drop_view_removes_it() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE VIEW v AS SELECT 1").unwrap();
+        engine.execute("DROP VIEW v").unwrap();
+        let err = engine.execute("SELECT * FROM v").unwrap_err();
+        assert!(err.to_string().contains("unknown table"));
+    }
+
+    #[test]
+    fn drop_view_if_exists_on_missing_is_noop() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine.execute("DROP VIEW IF EXISTS missing").unwrap();
+        assert!(out.rows[0][0].contains("0 view"));
+    }
+
+    #[test]
+    fn show_tables_lists_views() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE VIEW v AS SELECT 1").unwrap();
+        let out = engine.execute("SHOW TABLES").unwrap();
+        assert!(
+            out.rows
+                .iter()
+                .any(|r| r[0] == "v" && r[1] == "view")
+        );
+    }
+
+    #[test]
+    fn desc_view_reports_query_columns() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute("CREATE VIEW headings AS SELECT content, depth FROM blocks WHERE block_type = 'heading'")
+            .unwrap();
+        let out = engine.execute("DESC headings").unwrap();
+        let cols: Vec<&str> = out.rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(cols, vec!["content", "depth"]);
+    }
+
+    #[test]
+    fn view_persists_across_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let md_path = write_md(&dir, "doc.md", "# Title\n\nHello\n");
+        let path = dir.path().join("test.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&md_path).unwrap();
+        store
+            .execute_sql_mut(
+                "CREATE VIEW paras AS SELECT content FROM blocks WHERE block_type = 'paragraph'",
+            )
+            .unwrap();
+        store.save(&path).unwrap();
+
+        let reloaded = DocumentStore::load(&path).unwrap();
+        let engine = SqlEngine::new(&reloaded).unwrap();
+        let out = engine.execute("SELECT content FROM paras").unwrap();
+        assert_eq!(out.rows, vec![vec!["Hello".to_string()]]);
+
+        // Still live after reload, not a frozen snapshot.
+        let mut reloaded = reloaded;
+        reloaded
+            .execute_sql_mut(
+                "UPDATE blocks SET content = 'Updated' WHERE content = 'Hello'",
+            )
+            .unwrap();
+        let out = SqlEngine::new(&reloaded)
+            .unwrap()
+            .execute("SELECT content FROM paras")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Updated".to_string()]]);
+    }
+
+    #[test]
+    fn view_works_through_execute_sql_mut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        store
+            .execute_sql_mut("CREATE VIEW v AS SELECT content FROM blocks WHERE block_type = 'heading'")
+            .unwrap();
+        let out = store.execute_sql_mut("SELECT content FROM v").unwrap();
+        assert_eq!(out.rows, vec![vec!["Title".to_string()]]);
     }
 }
