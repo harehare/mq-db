@@ -112,6 +112,11 @@ enum Commands {
         /// UPDATE/DELETE are rejected.
         #[arg(long)]
         write_back: bool,
+
+        /// Attach another .mq-db store, queryable as <alias>.blocks etc.
+        /// Format: PATH:ALIAS. Repeatable.
+        #[arg(long, value_name = "PATH:ALIAS")]
+        attach: Vec<String>,
     },
 
     /// Interactive REPL (supports both mq and SQL)
@@ -129,6 +134,11 @@ enum Commands {
         /// UPDATE/DELETE are rejected.
         #[arg(long)]
         write_back: bool,
+
+        /// Attach another .mq-db store, queryable as <alias>.blocks etc.
+        /// Format: PATH:ALIAS. Repeatable.
+        #[arg(long, value_name = "PATH:ALIAS")]
+        attach: Vec<String>,
     },
 
     /// Run structural lint checks
@@ -211,6 +221,11 @@ enum Commands {
         /// Path to TLS private key file (PEM); requires --tls-cert
         #[arg(long, requires = "tls_cert")]
         tls_key: Option<PathBuf>,
+
+        /// Attach another .mq-db store, queryable as <alias>.blocks etc.
+        /// Format: PATH:ALIAS. Repeatable.
+        #[arg(long, value_name = "PATH:ALIAS")]
+        attach: Vec<String>,
     },
 }
 
@@ -334,6 +349,20 @@ fn open_store_for_sql(db: &Path) -> anyhow::Result<DocumentStore> {
         .load_all_indexes()
         .map_err(|e| anyhow::anyhow!("Failed to load indexes: {}", e))?;
     Ok(store)
+}
+
+/// Parses `--attach PATH:ALIAS` values and attaches each to `store`. Splits
+/// on the *last* `:` so a Windows drive-letter path still works.
+fn attach_all(store: &DocumentStore, specs: &[String]) -> anyhow::Result<()> {
+    for spec in specs {
+        let (path, alias) = spec.rsplit_once(':').ok_or_else(|| {
+            anyhow::anyhow!("--attach expects PATH:ALIAS, e.g. other.mq-db:other")
+        })?;
+        store
+            .attach(alias, Path::new(path))
+            .map_err(|e| anyhow::anyhow!("Failed to attach '{}': {}", path, e))?;
+    }
+    Ok(())
 }
 
 /// Load only catalog metadata (zone maps, paths, block counts) — no block data.
@@ -632,6 +661,7 @@ async fn main() -> anyhow::Result<()> {
             file,
             format,
             write_back,
+            attach,
         } => {
             let sql = if let Some(f) = file {
                 std::fs::read_to_string(&f)
@@ -649,6 +679,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let mut store = open_store_for_sql(&db)?;
+            attach_all(&store, &attach)?;
             let out = if write_back {
                 store.execute_sql_mut(&sql)
             } else {
@@ -670,8 +701,10 @@ async fn main() -> anyhow::Result<()> {
             db,
             mode,
             write_back,
+            attach,
         } => {
             let store = open_store_for_sql(&db)?;
+            attach_all(&store, &attach)?;
             run_repl(store, mode, write_back)?;
         }
 
@@ -883,8 +916,11 @@ async fn main() -> anyhow::Result<()> {
             basic_auth,
             tls_cert,
             tls_key,
+            attach,
         } => {
-            let store = Arc::new(load_store(&db)?);
+            let store = load_store(&db)?;
+            attach_all(&store, &attach)?;
+            let store = Arc::new(store);
             let addr: SocketAddr = format!("{}:{}", host, port)
                 .parse()
                 .map_err(|e| anyhow::anyhow!("Invalid address {}:{}: {}", host, port, e))?;
@@ -1364,6 +1400,9 @@ fn print_repl_help() {
       WHERE under(b.pre, b.post,
         (SELECT pre FROM blocks WHERE content = 'Architecture'),
         (SELECT post FROM blocks WHERE content = 'Architecture'));
+    ATTACH DATABASE 'other.mq-db' AS other;
+    SELECT * FROM blocks JOIN other.blocks o ON blocks.block_type = o.block_type;
+    DETACH other;
 
   mq examples
     .h1

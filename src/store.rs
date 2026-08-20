@@ -158,6 +158,9 @@ pub struct DocumentStore {
     /// `CREATE VIEW` definitions: name → `SELECT` SQL text, re-executed live
     /// on every reference rather than materialized.
     pub(crate) views: RwLock<FxHashMap<String, String>>,
+    /// Stores attached via `ATTACH DATABASE`, keyed by alias. Session-scoped
+    /// only — never persisted.
+    pub(crate) attached: RwLock<FxHashMap<String, DocumentStore>>,
     /// Content hash of each document's source, keyed by `DocumentId`. Used by
     /// [`reindex_paths`](DocumentStore::reindex_paths) to skip re-parsing
     /// files whose content hasn't changed since the last index run. Absent
@@ -177,6 +180,7 @@ impl Default for DocumentStore {
             doc_indexes: Vec::new(),
             custom_tables: RwLock::new(FxHashMap::default()),
             views: RwLock::new(FxHashMap::default()),
+            attached: RwLock::new(FxHashMap::default()),
             content_hashes: FxHashMap::default(),
         }
     }
@@ -262,6 +266,37 @@ impl DocumentStore {
     /// Remove a previously registered custom table. Returns `true` if it existed.
     pub fn unregister_table(&mut self, name: &str) -> bool {
         self.custom_tables.write().unwrap().remove(name).is_some()
+    }
+
+    /// Attach another `.mq-db` store under `alias`, queryable as
+    /// `<alias>.<table>`. Session-scoped; not persisted.
+    pub fn attach(&self, alias: &str, path: &Path) -> Result<(), MqdbError> {
+        let alias_lower = alias.to_ascii_lowercase();
+        if matches!(alias_lower.as_str(), "main" | "blocks" | "documents") {
+            return Err(MqdbError::SqlExec(format!(
+                "'{alias}' is a reserved name and cannot be used as a database alias"
+            )));
+        }
+        if self.attached.read().unwrap().contains_key(&alias_lower) {
+            return Err(MqdbError::SqlExec(format!(
+                "database alias '{alias}' is already attached — DETACH it first"
+            )));
+        }
+        let mut other = DocumentStore::open(path)?;
+        other.load_all_blocks()?;
+        other.load_all_indexes()?;
+        self.attached.write().unwrap().insert(alias_lower, other);
+        Ok(())
+    }
+
+    /// Detach a previously `attach`ed store. Returns `true` if `alias` was
+    /// attached, `false` otherwise.
+    pub fn detach(&self, alias: &str) -> bool {
+        self.attached
+            .write()
+            .unwrap()
+            .remove(&alias.to_ascii_lowercase())
+            .is_some()
     }
 
     /// Parses and adds a Markdown file from disk.
@@ -949,6 +984,7 @@ impl DocumentStore {
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(custom_tables),
             views: RwLock::new(views),
+            attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
         })
     }
@@ -1001,6 +1037,7 @@ impl DocumentStore {
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(custom_tables),
             views: RwLock::new(views),
+            attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
         })
     }
@@ -1040,6 +1077,7 @@ impl DocumentStore {
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(FxHashMap::default()),
             views: RwLock::new(FxHashMap::default()),
+            attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
         })
     }
