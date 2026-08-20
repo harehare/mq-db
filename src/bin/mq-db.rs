@@ -19,7 +19,9 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
-use mq_db::{DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape};
+use mq_db::{
+    DatabaseAlias, DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape,
+};
 use serde::Deserialize;
 
 #[cfg(feature = "use_mimalloc")]
@@ -358,6 +360,8 @@ fn attach_all(store: &DocumentStore, specs: &[String]) -> anyhow::Result<()> {
         let (path, alias) = spec.rsplit_once(':').ok_or_else(|| {
             anyhow::anyhow!("--attach expects PATH:ALIAS, e.g. other.mq-db:other")
         })?;
+        let alias = DatabaseAlias::parse(alias)
+            .map_err(|e| anyhow::anyhow!("Failed to attach '{}': {}", path, e))?;
         store
             .attach(alias, Path::new(path))
             .map_err(|e| anyhow::anyhow!("Failed to attach '{}': {}", path, e))?;

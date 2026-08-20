@@ -65,7 +65,7 @@ use crate::{
     block::{Block, BlockType, Properties, PropertyValue},
     document::{Document, ZoneMaps},
     indexes::{DocumentIndex, IndexHint, tokenize},
-    store::CustomTableState,
+    store::{CustomTableState, DatabaseAlias},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1649,8 +1649,8 @@ impl<'a> SqlEngine<'a> {
                         "ATTACH DATABASE: file path must be a string literal".into(),
                     )
                 })?;
-                self.store
-                    .attach(&schema_name.value, std::path::Path::new(&path))?;
+                let alias = DatabaseAlias::parse(&schema_name.value)?;
+                self.store.attach(alias, std::path::Path::new(&path))?;
                 Ok(ok_result())
             }
             _ => Err(MqdbError::SqlExec(
@@ -2682,7 +2682,7 @@ impl<'a> SqlEngine<'a> {
         // this one. No CTE shadowing or transitive attach across it.
         if let Some(schema) = schema {
             let guard = self.store.attached.read().unwrap();
-            let other = guard.get(&schema).ok_or_else(|| {
+            let other = guard.get(schema.as_str()).ok_or_else(|| {
                 MqdbError::SqlExec(format!(
                     "unknown database '{schema}' (attach it first with ATTACH DATABASE '<path>' AS {schema})"
                 ))

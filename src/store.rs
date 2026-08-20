@@ -22,6 +22,53 @@ pub(crate) struct CustomTableState {
 
 use mq_markdown::Markdown;
 
+/// A validated alias for a store mounted via `ATTACH DATABASE ... AS
+/// <alias>` (or the CLI's `--attach PATH:ALIAS`).
+///
+/// Normalizes to lowercase, since aliases are matched case-insensitively
+/// like unquoted SQL identifiers, and rejects names that would collide with
+/// the local store's own namespace (`main`, `blocks`, `documents`).
+/// [`DatabaseAlias::parse`] is the only constructor, so every attach path
+/// gets the same validation instead of each call site re-implementing it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DatabaseAlias(String);
+
+impl DatabaseAlias {
+    /// Names reserved for the local store's own namespace; an attached
+    /// database may not use one of these as its alias.
+    const RESERVED: [&'static str; 3] = ["main", "blocks", "documents"];
+
+    /// Validates and normalizes a raw alias string.
+    pub fn parse(raw: &str) -> Result<Self, MqdbError> {
+        if raw.is_empty() {
+            return Err(MqdbError::SqlExec("database alias cannot be empty".into()));
+        }
+        let lower = raw.to_ascii_lowercase();
+        if Self::RESERVED.contains(&lower.as_str()) {
+            return Err(MqdbError::SqlExec(format!(
+                "'{raw}' is a reserved name and cannot be used as a database alias"
+            )));
+        }
+        Ok(Self(lower))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DatabaseAlias {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::borrow::Borrow<str> for DatabaseAlias {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 use crate::{
     block::{BlockType, DocumentId},
     document::Document,
@@ -160,7 +207,7 @@ pub struct DocumentStore {
     pub(crate) views: RwLock<FxHashMap<String, String>>,
     /// Stores attached via `ATTACH DATABASE`, keyed by alias. Session-scoped
     /// only — never persisted.
-    pub(crate) attached: RwLock<FxHashMap<String, DocumentStore>>,
+    pub(crate) attached: RwLock<FxHashMap<DatabaseAlias, DocumentStore>>,
     /// Content hash of each document's source, keyed by `DocumentId`. Used by
     /// [`reindex_paths`](DocumentStore::reindex_paths) to skip re-parsing
     /// files whose content hasn't changed since the last index run. Absent
@@ -270,14 +317,8 @@ impl DocumentStore {
 
     /// Attach another `.mq-db` store under `alias`, queryable as
     /// `<alias>.<table>`. Session-scoped; not persisted.
-    pub fn attach(&self, alias: &str, path: &Path) -> Result<(), MqdbError> {
-        let alias_lower = alias.to_ascii_lowercase();
-        if matches!(alias_lower.as_str(), "main" | "blocks" | "documents") {
-            return Err(MqdbError::SqlExec(format!(
-                "'{alias}' is a reserved name and cannot be used as a database alias"
-            )));
-        }
-        if self.attached.read().unwrap().contains_key(&alias_lower) {
+    pub fn attach(&self, alias: DatabaseAlias, path: &Path) -> Result<(), MqdbError> {
+        if self.attached.read().unwrap().contains_key(&alias) {
             return Err(MqdbError::SqlExec(format!(
                 "database alias '{alias}' is already attached — DETACH it first"
             )));
@@ -285,7 +326,7 @@ impl DocumentStore {
         let mut other = DocumentStore::open(path)?;
         other.load_all_blocks()?;
         other.load_all_indexes()?;
-        self.attached.write().unwrap().insert(alias_lower, other);
+        self.attached.write().unwrap().insert(alias, other);
         Ok(())
     }
 
@@ -295,7 +336,7 @@ impl DocumentStore {
         self.attached
             .write()
             .unwrap()
-            .remove(&alias.to_ascii_lowercase())
+            .remove(alias.to_ascii_lowercase().as_str())
             .is_some()
     }
 
@@ -1109,6 +1150,29 @@ impl DocumentStore {
         let store = Self::load(path)?;
         store.save(path)?;
         Ok(old_version)
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    #[test]
+    fn parse_lowercases() {
+        assert_eq!(DatabaseAlias::parse("Other").unwrap().as_str(), "other");
+    }
+
+    #[test]
+    fn parse_rejects_empty() {
+        assert!(DatabaseAlias::parse("").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_reserved_names_case_insensitively() {
+        for reserved in ["main", "BLOCKS", "Documents"] {
+            let err = DatabaseAlias::parse(reserved).unwrap_err();
+            assert!(err.to_string().contains("reserved"));
+        }
     }
 }
 
