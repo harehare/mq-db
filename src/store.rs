@@ -33,7 +33,7 @@ use crate::{
         Storage,
         catalog::{CatalogEntry, CustomTableEntry, ViewEntry},
         codec::{decode_zone_map, encode_zone_map},
-        page::FILE_VERSION,
+        page::{FILE_VERSION, PAGE_SIZE},
     },
 };
 
@@ -94,6 +94,19 @@ pub struct StoreStats {
     pub block_type_counts: Vec<(BlockType, usize)>,
     /// `(language, count)`, most frequent first — code blocks only.
     pub code_lang_counts: Vec<(String, usize)>,
+}
+
+/// Result of [`DocumentStore::vacuum`]: page counts before/after compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumReport {
+    pub pages_before: u32,
+    pub pages_after: u32,
+}
+
+impl VacuumReport {
+    pub fn bytes_reclaimed(&self) -> u64 {
+        u64::from(self.pages_before.saturating_sub(self.pages_after)) * PAGE_SIZE as u64
+    }
 }
 
 /// The top-level embedded document store.
@@ -840,6 +853,37 @@ impl DocumentStore {
         Ok(())
     }
 
+    /// Rewrites the backing `.mq-db` file at `path` from scratch (same
+    /// compaction [`save`](Self::save) already does), reclaiming dead page
+    /// chains left behind by [`replace_document`](Self::replace_document),
+    /// `DROP TABLE`/`DROP VIEW`, and re-indexing changed files. Requires a
+    /// store opened via [`open`](Self::open) (a live backing file).
+    pub fn vacuum(&mut self, path: impl AsRef<Path>) -> Result<VacuumReport, MqdbError> {
+        let path = path.as_ref();
+        let pages_before = {
+            let guard = self.storage.lock().unwrap();
+            let Some(storage) = guard.as_ref() else {
+                return Err(MqdbError::Storage(
+                    "vacuum requires a store opened from a file (DocumentStore::open) — \
+                     this store has no backing file"
+                        .into(),
+                ));
+            };
+            storage.num_pages()
+        };
+
+        self.save(path)?;
+
+        let reopened = Storage::open(path)?;
+        let pages_after = reopened.num_pages();
+        *self.storage.lock().unwrap() = Some(reopened);
+
+        Ok(VacuumReport {
+            pages_before,
+            pages_after,
+        })
+    }
+
     /// Open a `.mq-db` file in lazy mode: reads only catalog and zone maps.
     ///
     /// Block data is not loaded until you call
@@ -1160,5 +1204,148 @@ mod reindex_tests {
         assert_eq!(report.added, vec![a]);
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, missing);
+    }
+}
+
+#[cfg(test)]
+mod vacuum_tests {
+    use super::*;
+
+    fn write_md(dir: &tempfile::TempDir, name: &str, content: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn open_for_writes(path: &Path) -> DocumentStore {
+        let mut store = DocumentStore::open(path).unwrap();
+        store.load_all_blocks().unwrap();
+        store.load_all_indexes().unwrap();
+        store
+    }
+
+    #[test]
+    fn vacuum_reclaims_space_after_document_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let md_path = write_md(&dir, "a.md", "# A\n\nHello\n");
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        let doc_id = store.add_file(&md_path).unwrap();
+        store.save(&db_path).unwrap();
+
+        let mut opened = open_for_writes(&db_path);
+        for i in 0..5 {
+            opened
+                .replace_document(
+                    doc_id,
+                    &format!("# A\n\nHello {i}\n"),
+                    Some(md_path.clone()),
+                )
+                .unwrap();
+        }
+
+        let report = opened.vacuum(&db_path).unwrap();
+        assert!(
+            report.pages_before > report.pages_after,
+            "expected reclaim, got before={} after={}",
+            report.pages_before,
+            report.pages_after
+        );
+
+        let reloaded = DocumentStore::load(&db_path).unwrap();
+        assert_eq!(reloaded.documents().len(), 1);
+        assert!(
+            reloaded.documents()[0]
+                .blocks
+                .iter()
+                .any(|b| b.content == "Hello 4")
+        );
+    }
+
+    #[test]
+    fn vacuum_reclaims_space_after_drop_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let md_path = write_md(&dir, "a.md", "# A\n\nHello\n");
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&md_path).unwrap();
+        store.save(&db_path).unwrap();
+
+        let mut opened = open_for_writes(&db_path);
+        opened.execute_sql_mut("CREATE TABLE t (x TEXT)").unwrap();
+        for i in 0..200 {
+            opened
+                .execute_sql_mut(&format!("INSERT INTO t VALUES ('row {i}')"))
+                .unwrap();
+        }
+        opened.execute_sql_mut("DROP TABLE t").unwrap();
+
+        let report = opened.vacuum(&db_path).unwrap();
+        assert!(
+            report.pages_before > report.pages_after,
+            "expected reclaim, got before={} after={}",
+            report.pages_before,
+            report.pages_after
+        );
+    }
+
+    #[test]
+    fn vacuum_is_a_noop_when_nothing_to_reclaim() {
+        let dir = tempfile::tempdir().unwrap();
+        let md_path = write_md(&dir, "a.md", "# A\n\nHello\n");
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&md_path).unwrap();
+        store.save(&db_path).unwrap();
+
+        let mut opened = open_for_writes(&db_path);
+        let report = opened.vacuum(&db_path).unwrap();
+        assert_eq!(report.pages_before, report.pages_after);
+        assert_eq!(report.bytes_reclaimed(), 0);
+    }
+
+    #[test]
+    fn vacuum_rejects_in_memory_only_store() {
+        let mut store = DocumentStore::new();
+        store.add_str("# A\n\nHello\n").unwrap();
+        let err = store.vacuum("/tmp/does-not-matter.mq-db").unwrap_err();
+        assert!(err.to_string().contains("backing file"));
+    }
+
+    #[test]
+    fn vacuum_preserves_views_and_custom_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let md_path = write_md(&dir, "a.md", "# A\n\nHello\n");
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&md_path).unwrap();
+        store.save(&db_path).unwrap();
+
+        let mut opened = open_for_writes(&db_path);
+        opened
+            .execute_sql_mut(
+                "CREATE VIEW v AS SELECT content FROM blocks WHERE block_type = 'heading'",
+            )
+            .unwrap();
+        opened.execute_sql_mut("CREATE TABLE t (x TEXT)").unwrap();
+        opened
+            .execute_sql_mut("INSERT INTO t VALUES ('hello')")
+            .unwrap();
+
+        opened.vacuum(&db_path).unwrap();
+
+        let out = opened.execute_sql_mut("SELECT content FROM v").unwrap();
+        assert_eq!(out.rows, vec![vec!["A".to_string()]]);
+        let out = opened.execute_sql_mut("SELECT x FROM t").unwrap();
+        assert_eq!(out.rows, vec![vec!["hello".to_string()]]);
+
+        // Also confirm a *fresh* open of the vacuumed file (not just the
+        // live handle vacuum() reopened) sees the same state.
+        let reloaded = DocumentStore::load(&db_path).unwrap();
+        assert_eq!(reloaded.documents().len(), 1);
     }
 }

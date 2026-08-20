@@ -1612,6 +1612,9 @@ impl<'a> SqlEngine<'a> {
             Statement::Explain {
                 analyze, statement, ..
             } => self.exec_explain(analyze, &statement),
+            Statement::Vacuum(_) => Err(MqdbError::SqlExec(
+                "VACUUM is a CLI command, not a SQL statement here — run `mq-db vacuum --db <path>`".into(),
+            )),
             _ => Err(MqdbError::SqlExec(
                 "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, DROP TABLE, CREATE VIEW, DROP VIEW, DESC, SHOW TABLES, EXPLAIN".into(),
             )),
@@ -6371,5 +6374,18 @@ mod tests {
             .execute("SELECT * FROM read_parquet('/tmp/x.parquet')")
             .unwrap_err();
         assert!(err.to_string().contains("unknown table function"));
+    }
+
+    #[test]
+    fn vacuum_statement_redirects_to_cli() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine.execute("VACUUM").unwrap_err();
+        assert!(err.to_string().contains("mq-db vacuum"));
+
+        let mut store = DocumentStore::new();
+        store.add_str("# Title\n\nBody\n").unwrap();
+        let err = store.execute_sql_mut("VACUUM").unwrap_err();
+        assert!(err.to_string().contains("mq-db vacuum"));
     }
 }

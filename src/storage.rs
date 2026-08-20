@@ -66,6 +66,11 @@ impl Storage {
         self.page_file.version
     }
 
+    /// Total pages in the file, including the header and catalog pages.
+    pub fn num_pages(&self) -> u32 {
+        self.page_file.num_pages
+    }
+
     /// Write one document's blocks to the page file. Returns the first_block_page.
     pub fn write_document(&mut self, doc: &Document) -> Result<u32, MqdbError> {
         let mut bytes = Vec::new();

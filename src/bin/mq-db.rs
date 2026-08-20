@@ -149,6 +149,14 @@ enum Commands {
         db: PathBuf,
     },
 
+    /// Compact the store file, reclaiming dead space left by write-back
+    /// edits, DROP TABLE/VIEW, and re-indexing changed files
+    Vacuum {
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
+        db: PathBuf,
+    },
+
     /// Show all blocks in a document
     Show {
         /// Document ID to show
@@ -348,6 +356,21 @@ fn bar(count: usize, max: usize, width: usize) -> String {
     let filled = (count * width / max).min(width);
     let empty = width - filled;
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 fn block_type_icon(bt: &BlockType) -> &'static str {
@@ -731,6 +754,18 @@ async fn main() -> anyhow::Result<()> {
                     println!("  {{}}  {:<12}  {}  {:>5}  ({:>2}%)", lang, b, count, pct);
                 }
             }
+        }
+
+        // vacuum
+        Commands::Vacuum { db } => {
+            let mut store = open_store_for_sql(&db)?;
+            let report = store
+                .vacuum(&db)
+                .map_err(|e| anyhow::anyhow!("Failed to vacuum store: {}", e))?;
+            let reclaimed = report.bytes_reclaimed();
+            println!("  Pages before   {}", report.pages_before);
+            println!("  Pages after    {}", report.pages_after);
+            println!("  Reclaimed      {}", format_bytes(reclaimed));
         }
 
         // show
