@@ -65,7 +65,7 @@ use crate::{
     block::{Block, BlockType, Properties, PropertyValue},
     document::{Document, ZoneMaps},
     indexes::{DocumentIndex, IndexHint, tokenize},
-    store::CustomTableState,
+    store::{CustomTableState, DatabaseAlias},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -630,6 +630,27 @@ fn ident_value(part: &ObjectNamePart) -> &str {
     match part {
         ObjectNamePart::Identifier(i) => &i.value,
         ObjectNamePart::Function(_) => "",
+    }
+}
+
+/// Table name for DDL/DML targets, which must be unqualified — writes
+/// through an ATTACHed database's `<alias>.<table>` are not supported.
+fn require_unqualified(name: &ObjectName) -> Result<String, MqdbError> {
+    if name.0.len() > 1 {
+        return Err(MqdbError::SqlExec(format!(
+            "'{}': writes to an attached database are not supported — only SELECT/JOIN may use <alias>.<table>",
+            name.0.iter().map(ident_value).collect::<Vec<_>>().join(".")
+        )));
+    }
+    Ok(name.0.last().map(ident_value).unwrap_or("").to_lowercase())
+}
+
+/// Single-row `("ok")` result for statements with no natural row output
+/// (`ATTACH`/`DETACH`).
+fn ok_result() -> QueryOutput {
+    QueryOutput {
+        columns: vec!["result".to_string()],
+        rows: vec![vec!["ok".to_string()]],
     }
 }
 
@@ -1585,6 +1606,9 @@ impl<'a> SqlEngine<'a> {
         if upper == "SHOW TABLES" {
             return self.exec_show_tables();
         }
+        if upper.starts_with("DETACH") {
+            return self.exec_detach(trimmed);
+        }
 
         let stmts = Parser::parse_sql(&GenericDialect {}, sql)
             .map_err(|e| MqdbError::SqlParse(e.to_string()))?;
@@ -1615,10 +1639,50 @@ impl<'a> SqlEngine<'a> {
             Statement::Vacuum(_) => Err(MqdbError::SqlExec(
                 "VACUUM is a CLI command, not a SQL statement here — run `mq-db vacuum --db <path>`".into(),
             )),
+            Statement::AttachDatabase {
+                schema_name,
+                database_file_name,
+                ..
+            } => {
+                let path = expr_str_val(&database_file_name).ok_or_else(|| {
+                    MqdbError::SqlExec(
+                        "ATTACH DATABASE: file path must be a string literal".into(),
+                    )
+                })?;
+                let alias = DatabaseAlias::parse(&schema_name.value)?;
+                self.store.attach(alias, std::path::Path::new(&path))?;
+                Ok(ok_result())
+            }
             _ => Err(MqdbError::SqlExec(
-                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, DROP TABLE, CREATE VIEW, DROP VIEW, DESC, SHOW TABLES, EXPLAIN".into(),
+                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, DROP TABLE, CREATE VIEW, DROP VIEW, ATTACH DATABASE, DETACH, DESC, SHOW TABLES, EXPLAIN".into(),
             )),
         }
+    }
+
+    /// `DETACH [DATABASE] <alias>` — not parsed generically by `sqlparser`
+    /// under `GenericDialect`, so handled here like `DESC`/`SHOW TABLES`.
+    fn exec_detach(&self, trimmed: &str) -> Result<QueryOutput, MqdbError> {
+        let mut tokens = trimmed.split_whitespace().skip(1); // skip "DETACH"
+        let mut tok = tokens.next();
+        if let Some(t) = tok
+            && t.eq_ignore_ascii_case("DATABASE")
+        {
+            tok = tokens.next();
+        }
+        let alias = tok.ok_or_else(|| {
+            MqdbError::SqlParse("malformed DETACH statement: expected a database alias".into())
+        })?;
+        if tokens.next().is_some() {
+            return Err(MqdbError::SqlParse(
+                "malformed DETACH statement: unexpected trailing tokens".into(),
+            ));
+        }
+        if !self.store.detach(alias) {
+            return Err(MqdbError::SqlExec(format!(
+                "database alias '{alias}' is not attached"
+            )));
+        }
+        Ok(ok_result())
     }
 
     fn exec_explain(&self, analyze: bool, inner: &Statement) -> Result<QueryOutput, MqdbError> {
@@ -2004,13 +2068,7 @@ impl<'a> SqlEngine<'a> {
     }
 
     fn exec_create_table(&self, ct: &CreateTable) -> Result<QueryOutput, MqdbError> {
-        let table_name = ct
-            .name
-            .0
-            .last()
-            .map(ident_value)
-            .unwrap_or("")
-            .to_lowercase();
+        let table_name = require_unqualified(&ct.name)?;
         if matches!(table_name.as_str(), "blocks" | "documents") {
             return Err(MqdbError::SqlExec(format!(
                 "cannot override built-in table '{table_name}'"
@@ -2083,13 +2141,7 @@ impl<'a> SqlEngine<'a> {
     }
 
     fn exec_create_view(&self, cv: &CreateView) -> Result<QueryOutput, MqdbError> {
-        let view_name = cv
-            .name
-            .0
-            .last()
-            .map(ident_value)
-            .unwrap_or("")
-            .to_lowercase();
+        let view_name = require_unqualified(&cv.name)?;
         if matches!(view_name.as_str(), "blocks" | "documents") {
             return Err(MqdbError::SqlExec(format!(
                 "cannot override built-in table '{view_name}'"
@@ -2156,7 +2208,7 @@ impl<'a> SqlEngine<'a> {
             let mut guard = self.store.views.write().unwrap();
             let mut dropped = 0usize;
             for name in names {
-                let view_name = name.0.last().map(ident_value).unwrap_or("").to_lowercase();
+                let view_name = require_unqualified(name)?;
                 if matches!(view_name.as_str(), "blocks" | "documents") {
                     return Err(MqdbError::SqlExec(format!(
                         "cannot drop built-in table '{view_name}'"
@@ -2181,9 +2233,7 @@ impl<'a> SqlEngine<'a> {
 
     fn exec_insert(&self, ins: &Insert) -> Result<QueryOutput, MqdbError> {
         let table_name = match &ins.table {
-            TableObject::TableName(name) => {
-                name.0.last().map(ident_value).unwrap_or("").to_lowercase()
-            }
+            TableObject::TableName(name) => require_unqualified(name)?,
             _ => return Err(MqdbError::SqlExec("unsupported INSERT target".into())),
         };
 
@@ -2271,7 +2321,7 @@ impl<'a> SqlEngine<'a> {
             let mut guard = self.store.custom_tables.write().unwrap();
             let mut dropped = 0usize;
             for name in names {
-                let table_name = name.0.last().map(ident_value).unwrap_or("").to_lowercase();
+                let table_name = require_unqualified(name)?;
                 if matches!(table_name.as_str(), "blocks" | "documents") {
                     return Err(MqdbError::SqlExec(format!(
                         "cannot drop built-in table '{table_name}'"
@@ -2604,13 +2654,21 @@ impl<'a> SqlEngine<'a> {
         hint: &IndexHint,
         zone_filter: Option<&Expr>,
     ) -> Result<Vec<Row>, MqdbError> {
-        let (table_name, alias, func_args) = match factor {
+        let (schema, table_name, alias, func_args) = match factor {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
-                let n = name.0.last().map(ident_value).unwrap_or("").to_lowercase();
+                let parts: Vec<&str> = name.0.iter().map(ident_value).collect();
+                let (schema, n) = if parts.len() >= 2 {
+                    (
+                        Some(parts[parts.len() - 2].to_lowercase()),
+                        parts[parts.len() - 1].to_lowercase(),
+                    )
+                } else {
+                    (None, parts.last().unwrap_or(&"").to_lowercase())
+                };
                 let a = alias.as_ref().map(|a| a.name.value.clone());
-                (n, a, args.clone())
+                (schema, n, a, args.clone())
             }
             _ => return Err(MqdbError::SqlExec("unsupported FROM clause".into())),
         };
@@ -2618,6 +2676,19 @@ impl<'a> SqlEngine<'a> {
         if let Some(func_args) = &func_args {
             let prefix = alias.as_deref().unwrap_or(&table_name).to_string();
             return resolve_table_function(&table_name, func_args, &prefix);
+        }
+
+        // `<alias>.<table>` — resolve against an ATTACHed store instead of
+        // this one. No CTE shadowing or transitive attach across it.
+        if let Some(schema) = schema {
+            let guard = self.store.attached.read().unwrap();
+            let other = guard.get(schema.as_str()).ok_or_else(|| {
+                MqdbError::SqlExec(format!(
+                    "unknown database '{schema}' (attach it first with ATTACH DATABASE '<path>' AS {schema})"
+                ))
+            })?;
+            let engine = SqlEngine::new(other)?;
+            return engine.table_rows_unqualified(&table_name, alias.as_deref(), hint, zone_filter);
         }
 
         // A `WITH x AS (...)` shadows a real table named `x`; search
@@ -2629,9 +2700,22 @@ impl<'a> SqlEngine<'a> {
             }
         }
 
-        match table_name.as_str() {
+        self.table_rows_unqualified(&table_name, alias.as_deref(), hint, zone_filter)
+    }
+
+    /// Resolves `blocks`/`documents`/a view/a custom table by name, with no
+    /// schema qualifier or CTE shadowing — shared by local and
+    /// `<alias>.<table>` (attached-store) resolution.
+    fn table_rows_unqualified(
+        &self,
+        table_name: &str,
+        alias: Option<&str>,
+        hint: &IndexHint,
+        zone_filter: Option<&Expr>,
+    ) -> Result<Vec<Row>, MqdbError> {
+        match table_name {
             "blocks" => {
-                let prefix = alias.as_deref().unwrap_or("blocks");
+                let prefix = alias.unwrap_or("blocks");
                 let mut rows = Vec::new();
                 let mut global_idx: u32 = 0;
 
@@ -2670,7 +2754,7 @@ impl<'a> SqlEngine<'a> {
                 Ok(rows)
             }
             "documents" => {
-                let prefix = alias.as_deref().unwrap_or("documents");
+                let prefix = alias.unwrap_or("documents");
                 Ok(self
                     .store
                     .documents()
@@ -2680,12 +2764,12 @@ impl<'a> SqlEngine<'a> {
             }
             other => {
                 if let Some(sql_text) = self.store.views.read().unwrap().get(other).cloned() {
-                    let prefix = alias.as_deref().unwrap_or(other).to_string();
+                    let prefix = alias.unwrap_or(other).to_string();
                     return self.resolve_view(other, &sql_text, &prefix);
                 }
                 let guard = self.store.custom_tables.read().unwrap();
                 if let Some(state) = guard.get(other) {
-                    let prefix = alias.as_deref().unwrap_or(other);
+                    let prefix = alias.unwrap_or(other);
                     let rows = state
                         .rows
                         .iter()
@@ -2878,9 +2962,7 @@ fn single_table_name(twj: &TableWithJoins) -> Result<String, MqdbError> {
         ));
     }
     match &twj.relation {
-        TableFactor::Table { name, .. } => {
-            Ok(name.0.last().map(ident_value).unwrap_or("").to_lowercase())
-        }
+        TableFactor::Table { name, .. } => require_unqualified(name),
         _ => Err(MqdbError::SqlExec(
             "unsupported UPDATE/DELETE target".into(),
         )),
@@ -3429,9 +3511,7 @@ impl DocumentStore {
             }
             Statement::Insert(ins) => {
                 let table_name = match &ins.table {
-                    TableObject::TableName(name) => {
-                        name.0.last().map(ident_value).unwrap_or("").to_lowercase()
-                    }
+                    TableObject::TableName(name) => require_unqualified(name)?,
                     _ => return Err(MqdbError::SqlExec("unsupported INSERT target".into())),
                 };
                 if table_name == "blocks" {
@@ -6387,5 +6467,129 @@ mod tests {
         store.add_str("# Title\n\nBody\n").unwrap();
         let err = store.execute_sql_mut("VACUUM").unwrap_err();
         assert!(err.to_string().contains("mq-db vacuum"));
+    }
+
+    // ATTACH / DETACH
+
+    fn saved_store(dir: &tempfile::TempDir, name: &str, md: &str) -> std::path::PathBuf {
+        let mut s = DocumentStore::new();
+        s.add_str(md).unwrap();
+        let path = dir.path().join(name);
+        s.save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn attach_selects_rows_from_other_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_path = saved_store(&dir, "other.mq-db", "# Other Doc\n\nOther body\n");
+
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let out = engine
+            .execute("SELECT content FROM other.blocks WHERE block_type = 'heading'")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Other Doc".to_string()]]);
+    }
+
+    #[test]
+    fn attach_join_across_local_and_other_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_path = saved_store(&dir, "other.mq-db", "# Other Doc\n\nOther body\n");
+
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let out = engine
+            .execute(
+                "SELECT b.content, o.content FROM blocks b JOIN other.blocks o \
+                 ON b.block_type = o.block_type WHERE b.block_type = 'heading'",
+            )
+            .unwrap();
+        assert!(!out.rows.is_empty());
+    }
+
+    #[test]
+    fn detach_makes_alias_unknown_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_path = saved_store(&dir, "other.mq-db", "# Other Doc\n\nOther body\n");
+
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+        engine.execute("DETACH other").unwrap();
+
+        let err = engine.execute("SELECT * FROM other.blocks").unwrap_err();
+        assert!(err.to_string().contains("unknown database"));
+
+        let err = engine.execute("DETACH other").unwrap_err();
+        assert!(err.to_string().contains("not attached"));
+    }
+
+    #[test]
+    fn attach_rejects_duplicate_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_path = saved_store(&dir, "other.mq-db", "# Other Doc\n\nOther body\n");
+
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let attach_sql = format!("ATTACH DATABASE '{}' AS other", other_path.display());
+        engine.execute(&attach_sql).unwrap();
+
+        let err = engine.execute(&attach_sql).unwrap_err();
+        assert!(err.to_string().contains("already attached"));
+    }
+
+    #[test]
+    fn qualified_writes_to_attached_store_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_path = saved_store(&dir, "other.mq-db", "# Other Doc\n\nOther body\n");
+
+        let mut store = make_store();
+        {
+            let engine = SqlEngine::new(&store).unwrap();
+            engine
+                .execute(&format!(
+                    "ATTACH DATABASE '{}' AS other",
+                    other_path.display()
+                ))
+                .unwrap();
+        }
+
+        let err = SqlEngine::new(&store)
+            .unwrap()
+            .execute("CREATE TABLE other.t (a TEXT)")
+            .unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+
+        let err = store
+            .execute_sql_mut("UPDATE other.blocks SET content = 'x' WHERE block_type = 'heading'")
+            .unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+
+        let err = store
+            .execute_sql_mut(
+                "INSERT INTO other.blocks (block_type, content) VALUES ('paragraph', 'x')",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("not supported"));
     }
 }

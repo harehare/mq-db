@@ -49,6 +49,7 @@ flowchart TD
 - **Comprehensive SQL function library** — string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
 - **`mq()` scalar function** — run an mq program against Markdown content inline in SQL
 - **`read_csv()` / `read_json()` table functions** — query external CSV/JSON Lines files directly in `FROM`, no import step
+- **`ATTACH DATABASE` / `DETACH`** — query across multiple `.mq-db` stores as `<alias>.blocks`, session-scoped like SQLite
 - **Custom page-file persistence** — 8 KB fixed pages, checksums, atomic writes
 - **`vacuum`** — reclaim dead page chains left by write-back edits, `DROP TABLE`/`DROP VIEW`, and re-indexing changed files
 - **CLI + interactive REPL + TUI** — full terminal experience
@@ -265,6 +266,27 @@ mq-db sql "CREATE TABLE people AS SELECT * FROM read_csv('people.csv')" --db sto
 ```
 
 `read_csv` parses RFC 4180 (quoted fields, embedded commas/quotes/newlines); the first row is the header. `read_json` expects one JSON object per line (JSON Lines) — the column set is the union of every line's keys, in first-seen order. In both, numeric-looking values support arithmetic/comparison (`WHERE age > 26`), and a short/missing cell becomes `NULL` rather than erroring. Parquet is not supported (would need a large `parquet`/Arrow dependency); an unrecognized table function name (including `read_parquet`) is rejected with a clear error rather than silently misparsed.
+
+### ATTACH — querying across multiple stores
+
+`ATTACH DATABASE '<path>' AS <alias>` mounts another `.mq-db` store for the
+session, queryable as `<alias>.blocks`, `<alias>.documents`, or any of its
+views/custom tables — usable in `SELECT`, `JOIN`, subqueries, and CTEs.
+`DETACH <alias>` unmounts it. Like SQLite, this is session-scoped only (not
+saved into either store's file), so re-run `ATTACH` each session — or pass
+`--attach path.mq-db:alias` (repeatable) to `sql`, `repl`, or `serve` to
+attach automatically on startup:
+
+```bash
+mq-db repl --db project-a.mq-db --attach project-b.mq-db:b
+
+sql> SELECT a.content, b.content FROM blocks a
+     JOIN b.blocks b ON a.block_type = b.block_type
+     WHERE a.block_type = 'heading';
+```
+
+Writes (`INSERT`/`UPDATE`/`DELETE`/`CREATE TABLE`) through an attached
+alias are rejected — only the local store can be written to.
 
 ### INSERT / UPDATE / DELETE with write-back
 
@@ -683,6 +705,8 @@ Aggregates (usable with `GROUP BY`):
 | `DROP VIEW name`                  | Drop a view                                       |
 | `SHOW TABLES`                     | List all tables and views                         |
 | `DESC name`                       | Show schema of a table or view                    |
+| `ATTACH DATABASE 'path' AS alias` | Mount another `.mq-db` store as `alias.<table>`   |
+| `DETACH alias`                    | Unmount a previously attached store               |
 
 ### Example queries
 

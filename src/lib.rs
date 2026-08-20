@@ -70,4 +70,4 @@ pub use query::{LintViolation, Query, QueryResult};
 pub use sql::{QueryOutput, SqlEngine};
 pub use storage::Storage;
 pub use storage::catalog::CatalogEntry;
-pub use store::{DocumentStore, ReindexReport, StoreStats};
+pub use store::{DatabaseAlias, DocumentStore, ReindexReport, StoreStats};
