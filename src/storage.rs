@@ -84,11 +84,7 @@ impl Storage {
             bytes.chunks(PAGE_BODY_SIZE).collect()
         };
 
-        let placeholder = make_page(PAGE_TYPE_BLOCK_DATA, 0, 0, &[]);
-        let mut page_ids = Vec::with_capacity(chunks.len());
-        for _ in 0..chunks.len() {
-            page_ids.push(self.page_file.append_page(&placeholder)?);
-        }
+        let page_ids = self.reserve_page_ids(chunks.len())?;
 
         for (index, chunk) in chunks.iter().enumerate() {
             let page_id = page_ids[index];
@@ -99,7 +95,7 @@ impl Storage {
                 PAGE_TYPE_OVERFLOW
             };
             let page = make_page(page_type, page_id, next_page, chunk);
-            self.page_file.write_page(page_id, &page)?;
+            self.page_file.append_page(&page)?;
         }
 
         page_ids
@@ -199,11 +195,7 @@ impl Storage {
             bytes.chunks(PAGE_BODY_SIZE).collect()
         };
 
-        let placeholder = make_page(PAGE_TYPE_INDEX, 0, 0, &[]);
-        let mut page_ids = Vec::with_capacity(chunks.len());
-        for _ in 0..chunks.len() {
-            page_ids.push(self.page_file.append_page(&placeholder)?);
-        }
+        let page_ids = self.reserve_page_ids(chunks.len())?;
 
         for (i, chunk) in chunks.iter().enumerate() {
             let page_id = page_ids[i];
@@ -214,7 +206,7 @@ impl Storage {
                 PAGE_TYPE_OVERFLOW
             };
             let page = make_page(page_type, page_id, next_page, chunk);
-            self.page_file.write_page(page_id, &page)?;
+            self.page_file.append_page(&page)?;
         }
 
         page_ids
@@ -312,11 +304,7 @@ impl Storage {
         let bytes = encode_table_rows(rows);
         let chunks: Vec<&[u8]> = bytes.chunks(TABLE_ROW_PAGE_CAPACITY).collect();
 
-        let placeholder = make_page(PAGE_TYPE_OVERFLOW, 0, 0, &[]);
-        let mut page_ids = Vec::with_capacity(chunks.len());
-        for _ in 0..chunks.len() {
-            page_ids.push(self.page_file.append_page(&placeholder)?);
-        }
+        let page_ids = self.reserve_page_ids(chunks.len())?;
 
         for (index, chunk) in chunks.iter().enumerate() {
             let page_id = page_ids[index];
@@ -330,12 +318,30 @@ impl Storage {
             body.extend_from_slice(&(chunk.len() as u16).to_le_bytes());
             body.extend_from_slice(chunk);
             let page = make_page(page_type, page_id, next_page, &body);
-            self.page_file.write_page(page_id, &page)?;
+            self.page_file.append_page(&page)?;
         }
 
         let first = *page_ids.first().expect("checked non-empty above");
         let last = *page_ids.last().expect("checked non-empty above");
         Ok((first, last))
+    }
+
+    /// Predict the page ids a run of `count` consecutive `append_page` calls
+    /// will produce, without writing anything. `append_page` always assigns
+    /// `num_pages` (then increments it), so as long as nothing else appends
+    /// to the file in between, the ids are exactly this contiguous range —
+    /// letting a page chain's `next_page` links be resolved and each page
+    /// written once in its final form, instead of appending zeroed
+    /// placeholders first and overwriting them in a second pass.
+    fn reserve_page_ids(&self, count: usize) -> Result<Vec<u32>, MqdbError> {
+        let start = self.page_file.num_pages;
+        (0..count as u32)
+            .map(|i| {
+                start
+                    .checked_add(i)
+                    .ok_or_else(|| invalid_data("page count overflow"))
+            })
+            .collect()
     }
 
     /// Rewrite a single page's `next_page` pointer in place, preserving its

@@ -19,16 +19,7 @@ pub(crate) const PAGE_TYPE_INDEX: u32 = 5;
 pub(crate) const PAGE_TYPE_TABLE_DATA: u32 = 6;
 
 const FILE_MAGIC: u32 = 0x4D51_4442;
-// v5: DocumentIndex gained a TermIndex (full-text search postings), appended
-// after the pre-existing four index sections. Files written by v4 lack that
-// section; `PageFile::open` accepts them anyway (see `LEGACY_VERSIONS`) and
-// callers rebuild the in-memory index from block data instead of trusting
-// the persisted (pre-TermIndex) index bytes — see `Storage::file_version`.
 pub const FILE_VERSION: u32 = 5;
-/// Older on-disk versions that `PageFile::open` still accepts. The page,
-/// catalog, and block encodings are unchanged across these versions — only
-/// the persisted secondary-index bytes differ — so callers that don't trust
-/// old index chains can read these files without a dedicated converter.
 const LEGACY_VERSIONS: &[u32] = &[4];
 const CATALOG_START_PAGE: u32 = 1;
 
@@ -48,10 +39,10 @@ fn file_header_body(num_pages: u32) -> [u8; PAGE_BODY_SIZE] {
 
 pub fn compute_checksum(page: &[u8; PAGE_SIZE]) -> u32 {
     let mut checksum = 0u32;
-    for (index, byte) in page.iter().enumerate() {
-        if (4..8).contains(&index) {
-            continue;
-        }
+    for byte in &page[0..4] {
+        checksum = checksum.wrapping_add(u32::from(*byte));
+    }
+    for byte in &page[8..PAGE_SIZE] {
         checksum = checksum.wrapping_add(u32::from(*byte));
     }
     checksum
@@ -210,7 +201,6 @@ impl PageFile {
         self.file
             .seek(SeekFrom::Start(u64::from(page_id) * PAGE_SIZE as u64))?;
         self.file.write_all(data)?;
-        self.file.flush()?;
         Ok(())
     }
 
@@ -241,7 +231,6 @@ impl PageFile {
         let page = make_page(PAGE_TYPE_FILE_HEADER, 0, 0, &body);
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&page)?;
-        self.file.flush()?;
         Ok(())
     }
 }
