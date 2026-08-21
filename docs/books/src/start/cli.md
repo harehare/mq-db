@@ -64,6 +64,7 @@ mq-db sql "SELECT ..." --db store.mq-db --format json
 | --- | --- |
 | `query` | SQL query string (omit when using `--file`) |
 | `-f, --file <PATH>` | Read SQL from a file |
+| `--attach <PATH:ALIAS>` | Mount another `.mq-db` store as `alias.<table>` (repeatable) |
 
 ## `mq`
 

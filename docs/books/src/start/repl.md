@@ -37,3 +37,5 @@ mq> .h2
 | `.quit` | Exit the REPL |
 
 The initial mode can be set with `--mode sql` or `--mode mq` (default `sql`).
+
+Pass `--attach path.mq-db:alias` (repeatable) to mount other stores at startup, queryable as `alias.blocks`/`alias.documents` — see [ATTACH / DETACH](../reference/sql-ddl.md#attach--detach).

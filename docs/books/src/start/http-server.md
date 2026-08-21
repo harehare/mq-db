@@ -27,6 +27,7 @@ mq-db serve --db store.mq-db --host 0.0.0.0 \
 | `--api-key <KEY>` | Require `Api-Key: <KEY>` or `Authorization: Bearer <KEY>` (env `MQ_DB_API_KEY`) |
 | `--basic-auth <USER:PASS>` | Require HTTP Basic auth (env `MQ_DB_BASIC_AUTH`) |
 | `--tls-cert` / `--tls-key` | PEM certificate/key pair to serve over HTTPS instead of plain HTTP |
+| `--attach <PATH:ALIAS>` | Mount another `.mq-db` store as `alias.<table>` at startup (repeatable) |
 
 If both `--api-key` and `--basic-auth` are set, either credential grants access. `--tls-cert` and `--tls-key` must be provided together.
 
