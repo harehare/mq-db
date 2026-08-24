@@ -58,6 +58,7 @@ pub mod index;
 pub mod indexes;
 pub mod mq_engine;
 pub mod query;
+pub mod search;
 pub mod sql;
 pub mod storage;
 pub mod store;
