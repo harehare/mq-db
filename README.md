@@ -135,6 +135,29 @@ mq-db list --db store.mq-db --format json   # also: csv, tsv, markdown, html
 2 documents
 ```
 
+### Quick full-text search
+
+`find` is a shortcut for `match()`/`score()` full-text search — no SQL required.
+It also falls back to a case-insensitive substring match, so a query still
+finds a hit even when it's a *part* of a token the tokenizer treated as one
+piece (e.g. a CJK run with no ASCII punctuation — see
+[`tokenize`](src/indexes.rs)'s known limitations). Each result shows a
+snippet centred on the match rather than the block's first N characters, and
+(when stdout is a terminal, unless `NO_COLOR` is set) highlights the matched
+terms:
+
+```bash
+mq-db find "error handling" --db store.mq-db
+mq-db find "error handling" --db store.mq-db -n 5 -F json   # top 5, JSON
+```
+
+```
+docs/API.md  ¶   0.67  Error handling follows RFC 7807 problem details...
+docs/API.md  #   0.25  Error Handling
+
+2 matches
+```
+
 ### SQL queries
 
 ```bash
@@ -546,6 +569,10 @@ mq-db tui --db store.mq-db
  5 docs  632 blocks  3 rows
 ```
 
+`Tab` cycles the input mode through SQL → **find** → mq. In find mode, type a
+search query and press `Enter` for the same match-centered, highlighted
+results as the [`find` CLI command](#quick-full-text-search) — no SQL needed.
+
 **Keys:**
 
 | Key            | Action                   |
@@ -553,7 +580,7 @@ mq-db tui --db store.mq-db
 | `i`            | Focus query input        |
 | `Esc`          | Blur input               |
 | `Enter`        | Run query                |
-| `Tab`          | Toggle mq / SQL mode     |
+| `Tab`          | Cycle SQL / find / mq mode |
 | `j` / `k`      | Navigate document list   |
 | `d` / `u`      | Scroll results down / up |
 | `g` / `G`      | Jump to top / bottom     |

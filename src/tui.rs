@@ -44,6 +44,7 @@ mod theme {
 pub enum QueryMode {
     Mq,
     Sql,
+    Find,
 }
 
 impl QueryMode {
@@ -51,38 +52,72 @@ impl QueryMode {
         match self {
             QueryMode::Mq => "mq",
             QueryMode::Sql => "SQL",
+            QueryMode::Find => "find",
         }
     }
 
     fn toggle(self) -> Self {
         match self {
+            QueryMode::Sql => QueryMode::Find,
+            QueryMode::Find => QueryMode::Mq,
             QueryMode::Mq => QueryMode::Sql,
-            QueryMode::Sql => QueryMode::Mq,
         }
     }
 }
 
-// A single displayable line in the results pane, optionally styled.
+// A results-pane line; multiple spans let `find` highlight matches mid-line.
 #[derive(Clone)]
 struct ResultLine {
-    text: String,
-    style: Style,
+    spans: Vec<(String, Style)>,
 }
 
 impl ResultLine {
     fn plain(text: impl Into<String>) -> Self {
         Self {
-            text: text.into(),
-            style: Style::default(),
+            spans: vec![(text.into(), Style::default())],
         }
     }
 
     fn styled(text: impl Into<String>, style: Style) -> Self {
         Self {
-            text: text.into(),
-            style,
+            spans: vec![(text.into(), style)],
         }
     }
+
+    fn spans(spans: Vec<(String, Style)>) -> Self {
+        Self { spans }
+    }
+}
+
+/// Splits `text` into spans, styling `ranges` (sorted, non-overlapping char
+/// offsets from [`crate::search::snippet`]) as `highlight`, rest as `base`.
+fn highlighted_spans(
+    text: &str,
+    ranges: &[(usize, usize)],
+    base: Style,
+    highlight: Style,
+) -> Vec<(String, Style)> {
+    if ranges.is_empty() {
+        return vec![(text.to_string(), base)];
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    for &(s, e) in ranges {
+        let s = s.min(chars.len());
+        let e = e.min(chars.len());
+        if s > i {
+            spans.push((chars[i..s].iter().collect::<String>(), base));
+        }
+        if e > s {
+            spans.push((chars[s..e].iter().collect::<String>(), highlight));
+        }
+        i = i.max(e);
+    }
+    if i < chars.len() {
+        spans.push((chars[i..].iter().collect::<String>(), base));
+    }
+    spans
 }
 
 struct App {
@@ -145,6 +180,57 @@ impl App {
                 Err(e) => {
                     self.result_lines = vec![ResultLine::styled(
                         format!("engine error: {}", e),
+                        Style::default().fg(theme::ERROR),
+                    )];
+                }
+            },
+            QueryMode::Find => match crate::search::find_hits(&self.store, &code, 50) {
+                Ok(hits) => {
+                    if hits.is_empty() {
+                        self.result_lines = vec![ResultLine::styled(
+                            "(no matches)".to_string(),
+                            Style::default().fg(theme::INK_DIM),
+                        )];
+                    } else {
+                        let mut lines = Vec::new();
+                        for hit in &hits {
+                            let (icon, color) = find_hit_style(&hit.block_type);
+                            lines.push(ResultLine::spans(vec![
+                                (format!("{icon} "), Style::default().fg(color)),
+                                (
+                                    hit.path.clone(),
+                                    Style::default()
+                                        .fg(theme::ACCENT)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                (
+                                    format!("  {:.2}", hit.score),
+                                    Style::default().fg(theme::INK_DIM),
+                                ),
+                            ]));
+                            let (snippet, ranges) = crate::search::snippet(&hit.content, &code, 90);
+                            lines.push(ResultLine::spans(highlighted_spans(
+                                &snippet,
+                                &ranges,
+                                Style::default().fg(theme::INK),
+                                Style::default()
+                                    .fg(theme::PAPER)
+                                    .bg(theme::MARK)
+                                    .add_modifier(Modifier::BOLD),
+                            )));
+                            lines.push(ResultLine::plain(String::new()));
+                        }
+                        self.status_msg = Some(format!(
+                            "{} match{}",
+                            hits.len(),
+                            if hits.len() == 1 { "" } else { "es" }
+                        ));
+                        self.result_lines = lines;
+                    }
+                }
+                Err(e) => {
+                    self.result_lines = vec![ResultLine::styled(
+                        format!("error: {}", e),
                         Style::default().fg(theme::ERROR),
                     )];
                 }
@@ -345,6 +431,26 @@ fn block_display(bt: &BlockType, depth: Option<u8>) -> (&'static str, String, Co
     }
 }
 
+/// Like [`block_display`] but keyed by string, since `find` hits come from
+/// a SQL row rather than a typed [`BlockType`].
+fn find_hit_style(block_type: &str) -> (&'static str, Color) {
+    match block_type {
+        "heading" => ("#", theme::ACCENT),
+        "paragraph" => ("¶", theme::INK),
+        "code" => ("{}", theme::MARK),
+        "list" => ("•", theme::SAGE),
+        "blockquote" => ("❝", theme::LAVENDER),
+        "table_cell" | "table_row" | "table_align" => ("▦", theme::TEAL),
+        "yaml" | "toml" => ("≡", theme::INK_DIM),
+        "html" => ("<>", theme::INK_DIM),
+        "horizontal_rule" => ("─", theme::PAPER_DEEP),
+        "math" => ("∑", theme::DUSK),
+        "definition" => ("§", theme::INK_DIM),
+        "footnote" => ("†", theme::INK_DIM),
+        _ => ("?", theme::INK_DIM),
+    }
+}
+
 // Entry point
 
 /// Launch the TUI. Blocks until the user quits.
@@ -467,6 +573,7 @@ fn render_title_bar(f: &mut Frame, app: &App, area: Rect) {
     let mode_indicator = match app.mode {
         QueryMode::Sql => "SQL",
         QueryMode::Mq => " mq",
+        QueryMode::Find => "find",
     };
     let text = format!(
         " mq-db  {}  {}",
@@ -636,7 +743,14 @@ fn render_results(f: &mut Frame, app: &App, area: Rect) {
     let lines: Vec<Line> = app
         .result_lines
         .iter()
-        .map(|rl| Line::from(Span::styled(rl.text.clone(), rl.style)))
+        .map(|rl| {
+            Line::from(
+                rl.spans
+                    .iter()
+                    .map(|(text, style)| Span::styled(text.clone(), *style))
+                    .collect::<Vec<_>>(),
+            )
+        })
         .collect();
 
     let widget = Paragraph::new(lines)
@@ -705,6 +819,36 @@ mod tests {
             }
         }
 
-        assert_eq!(app.mode, QueryMode::Mq);
+        assert_eq!(app.mode, QueryMode::Find);
+    }
+
+    #[test]
+    fn toggle_cycles_through_all_three_modes() {
+        assert_eq!(QueryMode::Sql.toggle(), QueryMode::Find);
+        assert_eq!(QueryMode::Find.toggle(), QueryMode::Mq);
+        assert_eq!(QueryMode::Mq.toggle(), QueryMode::Sql);
+    }
+
+    #[test]
+    fn find_mode_highlights_the_matched_term() {
+        let mut store = DocumentStore::default();
+        store
+            .add_str("# Title\n\nSome text about error handling.\n")
+            .unwrap();
+
+        let mut app = App::new(store);
+        app.mode = QueryMode::Find;
+        app.input = "error".to_string();
+        app.run_query();
+
+        let highlighted = app.result_lines.iter().any(|rl| {
+            rl.spans
+                .iter()
+                .any(|(text, style)| text == "error" && style.bg == Some(theme::MARK))
+        });
+        assert!(
+            highlighted,
+            "expected a highlighted 'error' span in results"
+        );
     }
 }

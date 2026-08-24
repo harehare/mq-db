@@ -20,7 +20,8 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
 use mq_db::{
-    DatabaseAlias, DocumentStore, MqEngine, SqlEngine, block::BlockType, sql::html_escape,
+    DatabaseAlias, DocumentStore, MqEngine, QueryOutput, SqlEngine, block::BlockType,
+    sql::html_escape,
 };
 use serde::Deserialize;
 
@@ -72,6 +73,25 @@ enum Commands {
         /// Path to .mq-db store file
         #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
+
+        /// Output format
+        #[arg(long, short = 'F', default_value = "table")]
+        format: OutputFormat,
+    },
+
+    /// Full-text search across all indexed blocks (shortcut for
+    /// `sql "SELECT ... WHERE match(content, ...)"`)
+    Find {
+        /// Search terms (e.g. "error handling")
+        query: String,
+
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
+        db: PathBuf,
+
+        /// Maximum number of results
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
 
         /// Output format
         #[arg(long, short = 'F', default_value = "table")]
@@ -406,6 +426,54 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Wraps each `(start, end)` char range in bold-yellow ANSI codes.
+/// `ranges` must be sorted and non-overlapping.
+fn highlight_ansi(text: &str, ranges: &[(usize, usize)]) -> String {
+    if ranges.is_empty() {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + ranges.len() * 9);
+    let mut i = 0;
+    for &(s, e) in ranges {
+        let s = s.min(chars.len());
+        let e = e.min(chars.len());
+        if s > i {
+            out.extend(&chars[i..s]);
+        }
+        if e > s {
+            out.push_str("\x1b[1;33m");
+            out.extend(&chars[s..e]);
+            out.push_str("\x1b[0m");
+        }
+        i = i.max(e);
+    }
+    if i < chars.len() {
+        out.extend(&chars[i..]);
+    }
+    out
+}
+
+/// Like [`block_type_icon`] but keyed by string, since `find` results come
+/// back as SQL row strings rather than typed blocks.
+fn block_type_icon_str(block_type: &str) -> &'static str {
+    match block_type {
+        "heading" => "#",
+        "paragraph" => "¶",
+        "code" => "{}",
+        "list" => "•",
+        "table_cell" | "table_row" | "table_align" => "▦",
+        "blockquote" => "❝",
+        "horizontal_rule" => "─",
+        "html" => "<>",
+        "yaml" | "toml" => "≡",
+        "math" => "∑",
+        "definition" => "§",
+        "footnote" => "†",
+        _ => "?",
+    }
+}
+
 fn block_type_icon(bt: &BlockType) -> &'static str {
     match bt {
         BlockType::Heading => "#",
@@ -596,6 +664,79 @@ async fn main() -> anyhow::Result<()> {
                         store.len(),
                         if store.len() == 1 { "" } else { "s" }
                     );
+                }
+            }
+        }
+
+        // find
+        Commands::Find {
+            query,
+            db,
+            limit,
+            format,
+        } => {
+            let store = open_store_for_sql(&db)?;
+            let hits = mq_db::search::find_hits(&store, &query, limit)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            if hits.is_empty() {
+                println!("(no matches for \"{}\")", query);
+                return Ok(());
+            }
+
+            match format {
+                OutputFormat::Table => {
+                    let color =
+                        std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+                    for hit in &hits {
+                        let (snippet, ranges) = mq_db::search::snippet(&hit.content, &query, 100);
+                        let snippet = if color {
+                            highlight_ansi(&snippet, &ranges)
+                        } else {
+                            snippet
+                        };
+                        println!(
+                            "{}  {}  {:>5.2}  {}",
+                            hit.path,
+                            block_type_icon_str(&hit.block_type),
+                            hit.score,
+                            snippet
+                        );
+                    }
+                    println!(
+                        "\n{} match{}",
+                        hits.len(),
+                        if hits.len() == 1 { "" } else { "es" }
+                    );
+                }
+                _ => {
+                    let out = QueryOutput {
+                        columns: vec![
+                            "path".to_string(),
+                            "type".to_string(),
+                            "content".to_string(),
+                            "score".to_string(),
+                        ],
+                        rows: hits
+                            .iter()
+                            .map(|h| {
+                                vec![
+                                    h.path.clone(),
+                                    h.block_type.clone(),
+                                    h.content.clone(),
+                                    h.score.to_string(),
+                                ]
+                            })
+                            .collect(),
+                    };
+                    match format {
+                        OutputFormat::Json => print!("{}", out.to_json()),
+                        OutputFormat::Csv => print!("{}", out.to_csv()),
+                        OutputFormat::Tsv => print!("{}", out.to_tsv()),
+                        OutputFormat::Markdown => print!("{}", out.to_markdown_table()),
+                        OutputFormat::Html => print!("{}", out.to_html_table()),
+                        OutputFormat::Table => unreachable!(),
+                    }
                 }
             }
         }
