@@ -35,7 +35,7 @@ If both `--api-key` and `--basic-auth` are set, either credential grants access.
 
 | Method | Path | Body | Description |
 | --- | --- | --- | --- |
-| `GET` | `/health` | — | `{"status":"ok","documents":<n>}` |
+| `GET` | `/health` | (none) | `{"status":"ok","documents":<n>}` |
 | `POST` | `/sql` | `{"query":"SELECT …"}` | Execute a SQL query, returns JSON rows |
 | `POST` | `/mq` | `{"code":".h1"}` | Evaluate an mq expression, returns `{"results":[…]}` |
 

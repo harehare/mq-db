@@ -225,7 +225,7 @@
             into O(1) integer comparisons. Query it with
             <span class="text-ink font-medium">SQL</span> or
             <a href="https://github.com/harehare/mq" target="_blank" class="text-accent hover:underline">mq</a>,
-            persist it to a compact custom page-file format — no SQLite
+            persist it to a compact custom page-file format, no SQLite
             dependency.
           </p>
           <div class="flex flex-wrap gap-3 mb-16 fade-up">
@@ -264,7 +264,7 @@
 <span class="text-accent">ORDER BY</span> b.pre;</pre>
             </div>
             <p class="text-xs text-ink-dim mt-3">
-              Every block gets a <span class="text-ink font-medium">pre</span>/<span class="text-ink font-medium">post</span> pair at index time — "is X inside Y?" becomes one integer range comparison, not a tree walk.
+              Every block gets a <span class="text-ink font-medium">pre</span>/<span class="text-ink font-medium">post</span> pair at index time: "is X inside Y?" becomes one integer range comparison, not a tree walk.
             </p>
           </div>
         </div>
@@ -279,7 +279,7 @@
               <h3 class="font-headline font-semibold text-lg text-ink mb-2">No tree walk</h3>
               <p class="text-sm text-ink-dim leading-relaxed">
                 Nested Set (pre/post) encoding assigned at index time turns
-                "is X inside Y?" into a single interval comparison —
+                "is X inside Y?" into a single interval comparison:
                 <code class="text-accent">under(pre, post, anc_pre, anc_post)</code>.
               </p>
             </div>
@@ -295,7 +295,7 @@
             <div>
               <h3 class="font-headline font-semibold text-lg text-ink mb-2">Two query engines</h3>
               <p class="text-sm text-ink-dim leading-relaxed">
-                A custom sqlparser-based SQL evaluator, and mq via mq-lang —
+                A custom sqlparser-based SQL evaluator, and mq via mq-lang;
                 run either against the same block storage. No SQLite
                 dependency.
               </p>
@@ -341,7 +341,7 @@
           <h2 class="text-3xl font-headline font-semibold mb-4 tracking-tight text-ink">SQL, joins included</h2>
           <p class="text-ink-dim max-w-2xl mb-14 leading-relaxed">
             <code class="text-accent">documents</code> and <code class="text-accent">blocks</code> are
-            plain virtual tables — join them like any relational schema, plus
+            plain virtual tables: join them like any relational schema, plus
             self-joins over the interval index for structural checks.
           </p>
           <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-10">
@@ -357,7 +357,7 @@
 <span class="text-accent">JOIN</span> blocks b <span class="text-accent">ON</span> b.document_id = d.id
 <span class="text-accent">WHERE</span> b.block_type = <span class="text-mark">'code'</span> <span class="text-accent">AND</span> b.lang = <span class="text-mark">'python'</span>;</pre>
               </div>
-              <p class="text-xs italic text-ink-dim mt-3">fig. 1 — a plain relational join across documents and blocks.</p>
+              <p class="text-xs italic text-ink-dim mt-3">fig. 1: a plain relational join across documents and blocks.</p>
             </div>
             <div>
               <div class="border border-paper-deep rounded-xl bg-paper-alt overflow-hidden">
@@ -374,7 +374,7 @@
 <span class="text-accent">WHERE</span> h.block_type = <span class="text-mark">'heading'</span> <span class="text-accent">AND</span> h.depth = 2
   <span class="text-accent">AND</span> nxt.block_type = <span class="text-mark">'list'</span>;</pre>
               </div>
-              <p class="text-xs italic text-ink-dim mt-3">fig. 2 — a structural self-join, one row apart in pre-order.</p>
+              <p class="text-xs italic text-ink-dim mt-3">fig. 2: a structural self-join, one row apart in pre-order.</p>
             </div>
             <div>
               <div class="border border-paper-deep rounded-xl bg-paper-alt overflow-hidden">
@@ -387,7 +387,7 @@
 <span class="text-accent">FROM</span> blocks
 <span class="text-accent">WHERE</span> block_type = <span class="text-mark">'code'</span> <span class="text-accent">AND</span> lang = <span class="text-mark">'markdown'</span>;</pre>
               </div>
-              <p class="text-xs italic text-ink-dim mt-3">fig. 3 — mq embedded as a scalar function inside a SQL projection.</p>
+              <p class="text-xs italic text-ink-dim mt-3">fig. 3: mq embedded as a scalar function inside a SQL projection.</p>
             </div>
             <div>
               <div class="border border-paper-deep rounded-xl bg-paper-alt overflow-hidden">
@@ -404,7 +404,7 @@
 <span class="text-accent">WHERE</span> block_type = <span class="text-mark">'heading'</span>
 <span class="text-accent">GROUP BY</span> <span class="text-accent">CASE WHEN</span> depth &lt;= 1 <span class="text-accent">THEN</span> <span class="text-mark">'top-level'</span> <span class="text-accent">ELSE</span> <span class="text-mark">'nested'</span> <span class="text-accent">END</span>;</pre>
               </div>
-              <p class="text-xs italic text-ink-dim mt-3">fig. 4 — CASE expressions and aggregates over heading depth.</p>
+              <p class="text-xs italic text-ink-dim mt-3">fig. 4: CASE expressions and aggregates over heading depth.</p>
             </div>
           </div>
         </div>

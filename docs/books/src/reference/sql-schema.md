@@ -1,6 +1,6 @@
 # Virtual Schema
 
-The SQL engine exposes two virtual tables backed directly by the in-memory store — there is no separate schema to migrate.
+The SQL engine exposes two virtual tables backed directly by the in-memory store; there is no separate schema to migrate.
 
 ```sql
 SELECT id, path, title, tags FROM documents;
@@ -32,4 +32,4 @@ SELECT id, document_id, block_type, content, pre, post,
 | `lang` | text | Code fence language, when `block_type = 'code'` |
 | `properties` | text | Remaining block-type-specific properties as JSON |
 
-`pre`/`post` are the Nested-Set interval-index boundaries described in [Index Layers](index-layers.md) — they encode heading hierarchy as a pure integer range, which is what the [`under()`](sql-functions.md) function operates on.
+`pre`/`post` are the Nested-Set interval-index boundaries described in [Index Layers](index-layers.md); they encode heading hierarchy as a pure integer range, which is what the [`under()`](sql-functions.md) function operates on.

@@ -2,13 +2,13 @@
 
 `mq-db` treats Markdown documents as **structured, hierarchical databases** rather than plain text.
 
-It parses Markdown into a flat block list annotated with an **interval index** (Nested Set / Pre-Post Order), which turns heading-hierarchy questions — "is this paragraph inside that section?" — into a single `O(1)` integer comparison instead of a tree walk. Documents can be queried with **SQL** or **[mq](https://github.com/harehare/mq)**, and persisted to a compact custom page-file format with no SQLite dependency.
+It parses Markdown into a flat block list annotated with an **interval index** (Nested Set / Pre-Post Order), which turns heading-hierarchy questions like "is this paragraph inside that section?" into a single `O(1)` integer comparison instead of a tree walk. Documents can be queried with **SQL** or **[mq](https://github.com/harehare/mq)**, and persisted to a compact custom page-file format with no SQLite dependency.
 
 > This project is under active development and the API may change.
 
 ## Why Markdown-as-database?
 
-Markdown files already have implicit structure — headings nest sections, code blocks carry a language, front matter carries metadata. `mq-db` makes that structure queryable directly:
+Markdown files already have implicit structure: headings nest sections, code blocks carry a language, front matter carries metadata. `mq-db` makes that structure queryable directly:
 
 ```sql
 SELECT block_type, count(*) FROM blocks GROUP BY block_type;
@@ -36,21 +36,27 @@ Flat Block Vector (pre/post integers)
       ├── HashIndex     (content / lang / depth)
       ├── Zone Maps     (per-document stats)
       │
-      ├── SQL Engine   (sqlparser — custom native evaluator)
+      ├── SQL Engine   (sqlparser, custom native evaluator)
       └── mq Engine    (mq-lang evaluator)
 ```
 
 ## Features
 
-- **Flat block storage** — every Markdown element becomes a typed `Block` with row-polymorphic properties
-- **O(1) hierarchy queries** — interval index (`pre`/`post`) makes ancestor/descendant checks a single integer comparison
-- **Three-layer secondary indexes** — `BitmapIndex` (block type), `BTreeIndex` (pre/post), `HashIndex` (content/lang/depth) for fast SQL predicate pushdown
-- **Zone Maps** — per-document statistics skip irrelevant files before scanning any blocks
-- **Dual query engines** — SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
-- **DDL support** — `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
-- **Comprehensive SQL function library** — string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
-- **`mq()` scalar function** — run an mq program against Markdown content inline in SQL
-- **Custom page-file persistence** — 8 KB fixed pages, checksums, atomic writes
-- **CLI + interactive REPL + TUI** — full terminal experience
+- **Flat block storage**: every Markdown element becomes a typed `Block` with row-polymorphic properties
+- **O(1) hierarchy queries**: interval index (`pre`/`post`) makes ancestor/descendant checks a single integer comparison
+- **Four-layer secondary indexes**: `BitmapIndex` (block type), `BTreeIndex` (pre/post), `HashIndex` (content/lang/depth), `TermIndex` (tokenized content, full-text) for fast SQL predicate pushdown
+- **Zone Maps**: per-document statistics skip irrelevant files before scanning any blocks
+- **Dual query engines**: SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
+- **`WITH` / `WITH RECURSIVE` support**: common table expressions, see [CTEs](reference/cte.md)
+- **Full-text search**: `match()`/`score()` SQL functions, see [Full-Text Search](reference/full-text-search.md)
+- **`EXPLAIN` / `EXPLAIN ANALYZE`**: inspect and profile a query's plan, see [EXPLAIN](reference/explain.md)
+- **SQL `INSERT`/`UPDATE`/`DELETE` with write-back**: edit `blocks` and push the change back to the source file, see [Write-Back](reference/write-back.md)
+- **DDL support**: `CREATE TABLE`, `INSERT INTO`, `DROP TABLE`, and views, see [DDL Statements](reference/sql-ddl.md)
+- **Comprehensive SQL function library**: string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
+- **`mq()` scalar function**: run an mq program against Markdown content inline in SQL
+- **`read_csv()` / `read_json()` table functions**: query external files directly, see [External Files](reference/external-files.md)
+- **`ATTACH DATABASE` / `DETACH`**: query across multiple `.mq-db` stores, session-scoped like SQLite
+- **Custom page-file persistence**: 8 KB fixed pages, checksums, atomic writes
+- **CLI + interactive REPL + TUI**: full terminal experience
 
 Keep reading in [Getting Started](start/index.md), or jump straight to the [SQL Reference](reference/index.md) if you already have a `.mq-db` store.

@@ -25,7 +25,7 @@ flowchart TD
     C --> E["BTreeIndex\n(pre / post)"]
     C --> F["HashIndex\n(content / lang / depth)"]
     C --> G["Zone Maps\n(per-document stats)"]
-    C --> H["SQL Engine\n(sqlparser — custom native evaluator)"]
+    C --> H["SQL Engine\n(sqlparser, custom native evaluator)"]
     C --> I["mq Engine\n(mq-lang evaluator)"]
 ```
 
@@ -34,25 +34,27 @@ flowchart TD
 
 ## Features
 
-- **Flat block storage** — every Markdown element becomes a typed `Block` with row-polymorphic properties
-- **O(1) hierarchy queries** — interval index (`pre`/`post`) makes ancestor/descendant checks a single integer comparison
-- **Four-layer secondary indexes** — `BitmapIndex` (block type), `BTreeIndex` (pre/post), `HashIndex` (content/lang/depth), `TermIndex` (tokenized content, full-text) for fast SQL predicate pushdown
-- **Zone Maps** — per-document statistics skip irrelevant files before scanning any blocks
-- **Dual query engines** — SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
-- **`WITH` / `WITH RECURSIVE` support** — common table expressions, usable in `FROM`, `JOIN`, and subqueries; recursive CTEs via iterative fixed-point evaluation
-- **Full-text search** — `match()`/`score()` SQL functions backed by a persisted per-document inverted index
-- **`EXPLAIN` / `EXPLAIN ANALYZE`** — see the zone-map/index/join plan a query resolves to, with actual row/timing stats under `ANALYZE`
-- **Incremental re-indexing** — re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
-- **SQL `INSERT`/`UPDATE`/`DELETE` with write-back** — add, edit, or remove `blocks` and push the change back to the source Markdown file, opt-in via `--write-back`
-- **DDL support** — `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
-- **`CREATE VIEW`** — persisted, live (non-materialized) named queries, re-run on every reference
-- **Comprehensive SQL function library** — string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
-- **`mq()` scalar function** — run an mq program against Markdown content inline in SQL
-- **`read_csv()` / `read_json()` table functions** — query external CSV/JSON Lines files directly in `FROM`, no import step
-- **`ATTACH DATABASE` / `DETACH`** — query across multiple `.mq-db` stores as `<alias>.blocks`, session-scoped like SQLite
-- **Custom page-file persistence** — 8 KB fixed pages, checksums, atomic writes
-- **`vacuum`** — reclaim dead page chains left by write-back edits, `DROP TABLE`/`DROP VIEW`, and re-indexing changed files
-- **CLI + interactive REPL + TUI** — full terminal experience
+- **Flat block storage**: every Markdown element becomes a typed `Block` with row-polymorphic properties
+- **O(1) hierarchy queries**: interval index (`pre`/`post`) makes ancestor/descendant checks a single integer comparison
+- **Four-layer secondary indexes**: `BitmapIndex` (block type), `BTreeIndex` (pre/post), `HashIndex` (content/lang/depth), `TermIndex` (tokenized content, full-text) for fast SQL predicate pushdown
+- **Zone Maps**: per-document statistics skip irrelevant files before scanning any blocks
+- **Dual query engines**: SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
+- **`WITH` / `WITH RECURSIVE` support**: common table expressions, usable in `FROM`, `JOIN`, and subqueries; recursive CTEs via iterative fixed-point evaluation
+- **Full-text search**: `match()`/`score()` SQL functions backed by a persisted per-document inverted index
+- **`EXPLAIN` / `EXPLAIN ANALYZE`**: see the zone-map/index/join plan a query resolves to, with actual row/timing stats under `ANALYZE`
+- **Incremental re-indexing**: re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
+- **SQL `INSERT`/`UPDATE`/`DELETE` with write-back**: add, edit, or remove `blocks` and push the change back to the source Markdown file, opt-in via `--write-back`
+- **DDL support**: `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
+- **`CREATE VIEW`**: persisted, live (non-materialized) named queries, re-run on every reference
+- **Comprehensive SQL function library**: string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
+- **`mq()` scalar function**: run an mq program against Markdown content inline in SQL
+- **`read_csv()` / `read_json()` table functions**: query external CSV/JSON Lines files directly in `FROM`, no import step
+- **`ATTACH DATABASE` / `DETACH`**: query across multiple `.mq-db` stores as `<alias>.blocks`, session-scoped like SQLite
+- **Custom page-file persistence**: 8 KB fixed pages, checksums, atomic writes
+- **`vacuum`**: reclaim dead page chains left by write-back edits, `DROP TABLE`/`DROP VIEW`, and re-indexing changed files
+- **CLI + interactive REPL + TUI**: full terminal experience
+
+Full documentation, including the SQL/mq reference and architecture deep-dive, lives at **[db.mqlang.org/book](https://db.mqlang.org/book/)**.
 
 ## Installation
 
@@ -137,7 +139,7 @@ mq-db list --db store.mq-db --format json   # also: csv, tsv, markdown, html
 
 ### Quick full-text search
 
-`find` is a shortcut for `match()`/`score()` full-text search — no SQL needed. It falls back to a case-insensitive substring match too, so partial CJK queries still hit (see [`tokenize`](src/indexes.rs)'s known limitations). Results show a snippet centred on the match, with matched terms highlighted when stdout is a terminal (respects `NO_COLOR`):
+`find` is a shortcut for `match()`/`score()` full-text search, no SQL needed. It falls back to a case-insensitive substring match too, so partial CJK queries still hit. Results show a snippet centred on the match, with matched terms highlighted when stdout is a terminal (respects `NO_COLOR`). See [Full-Text Search](https://db.mqlang.org/book/reference/full-text-search) for details and known limitations.
 
 ```bash
 mq-db find "error handling" --db store.mq-db
@@ -170,7 +172,7 @@ mq-db sql "SELECT ..." --db store.mq-db --format json  # also: csv, tsv, markdow
 (3 rows)
 ```
 
-**Hierarchy query with `under()`** — find all content inside a specific section:
+**Hierarchy query with `under()`**: find all content inside a specific section:
 
 ```bash
 mq-db sql "
@@ -183,199 +185,20 @@ mq-db sql "
 " --db store.mq-db
 ```
 
-**`mq()` scalar function** — run an mq program against Markdown content inline:
+**`mq()` scalar function**: run an mq program against Markdown content inline:
 
 ```bash
 mq-db sql "SELECT mq('.h1 | to_text', content) AS title FROM blocks WHERE block_type = 'code'" --db store.mq-db
 ```
 
-**CTE (`WITH`)** — name an intermediate result and reuse it in the main query, a join, or a subquery:
+The SQL dialect also has CTEs, full-text search, `EXPLAIN`, external-file table functions, cross-store `ATTACH`, write-back DML, custom tables, and live views. Full reference and examples are in the book:
 
-```bash
-mq-db sql "
-  WITH headings AS (SELECT content, pre, post FROM blocks WHERE block_type = 'heading')
-  SELECT content FROM headings WHERE pre < 10 ORDER BY pre
-" --db store.mq-db
-```
-
-A CTE's (and a view's — see below) output columns are recovered from their
-rendered text, so arithmetic/numeric comparisons on them (`WHERE pre < 10`
-above) work as expected, but this is a heuristic, not a real type system: a
-value that merely *looks* numeric (e.g. a text cell containing `"007"`)
-round-trips as a number, and a float's trailing zeros aren't preserved.
-
-**`WITH RECURSIVE`** — the standard `<anchor> UNION [ALL] <recursive term>` shape, evaluated by iterative fixed-point: the anchor runs once, then the recursive term re-runs against only the *previous iteration's new rows* until it produces none. `UNION` (not `ALL`) dedupes against every row produced so far, which is also what makes a query that would otherwise cycle forever terminate. A hard cap of 10,000 iterations guards against a recursive term with no terminating condition. The recursive term must reference the CTE by name exactly once in its `FROM`; the anchor must not reference it at all.
-
-```bash
-# Number sequence — the canonical minimal recursive CTE
-mq-db sql "
-  WITH RECURSIVE seq AS (
-    SELECT 1 AS n
-    UNION ALL
-    SELECT n + 1 FROM seq WHERE n < 10
-  )
-  SELECT n FROM seq ORDER BY n
-" --db store.mq-db
-
-# Heading ancestor chain via interval containment — walk up from a block's
-# pre/post to every heading whose interval contains it
-mq-db sql "
-  WITH RECURSIVE ancestors AS (
-    SELECT pre, post, content FROM blocks WHERE pre = 24
-    UNION
-    SELECT b.pre, b.post, b.content
-    FROM blocks b, ancestors
-    WHERE b.pre < ancestors.pre AND ancestors.post < b.post
-      AND b.block_type = 'heading'
-  )
-  SELECT content FROM ancestors ORDER BY pre
-" --db store.mq-db
-```
-
-A plain top-level `SELECT ... UNION SELECT ...` outside a recursive CTE is not supported. A CTE name identical to `blocks`, `documents`, or a custom table shadows it for the duration of the `WITH` clause's scope.
-
-**Full-text search with `match()`/`score()`** — index-accelerated term matching and simple TF-based ranking:
-
-```bash
-mq-db sql "
-  SELECT content, score(content, 'error handling') AS relevance
-  FROM blocks
-  WHERE match(content, 'error handling')
-  ORDER BY relevance DESC
-" --db store.mq-db
-```
-
-**`EXPLAIN` / `EXPLAIN ANALYZE`** — see which index (zone map, `BitmapIndex`, `BTreeIndex`, `HashIndex`, `TermIndex`, or full scan) a query's `WHERE`/`JOIN` resolves to, without running it. When more than one index is viable for the same `WHERE` clause, the choice is **cost-based** — each candidate's real matching-block count is read from its index, and the cheapest wins; `EXPLAIN` shows every candidate considered. Add `ANALYZE` to also run the query and report actual row counts, document-skip counts, and timing:
-
-```bash
-mq-db sql "EXPLAIN SELECT content FROM blocks WHERE block_type = 'code' AND lang = 'json'" --db store.mq-db
-```
-
-```
-┌──────────────────────┬────────────────────────────────────────────────────────────────────────┐
-│ step                 │ detail                                                                 │
-├──────────────────────┼────────────────────────────────────────────────────────────────────────┤
-│ query:from           │ blocks (blocks)                                                        │
-│ query:where          │ HashIndex(lang = 'json') used (est. 2 row(s); also considered:          │
-│                       │   BitmapIndex(block_type IN (code)) [est. 289])                        │
-│ query:zone-map       │ eligible via lang                                                       │
-│ query:where-recheck  │ row-by-row (full predicate re-evaluated after scan)                     │
-└──────────────────────┴────────────────────────────────────────────────────────────────────────┘
-```
-
-```bash
-mq-db sql "EXPLAIN ANALYZE SELECT * FROM blocks WHERE match(content, 'error handling')" --db store.mq-db
-```
-
-`WITH` CTEs are described separately (`cte:<name>:...` steps) before the outer query; `JOIN`s report whether they resolve to a hash join (equi-join `ON`) or a nested loop. Only `SELECT` queries are supported — `EXPLAIN` on other statements is rejected.
-
-### Reading external CSV / JSON Lines
-
-`read_csv(path)` and `read_json(path)` are table functions — use them anywhere a table name goes (`FROM`, `JOIN`, `CREATE TABLE ... AS SELECT`) to query an external file alongside `blocks`, no separate import step:
-
-```bash
-mq-db sql "SELECT name, age FROM read_csv('people.csv') WHERE age > 26" --db store.mq-db
-mq-db sql "SELECT name FROM read_json('people.jsonl') WHERE active = true" --db store.mq-db
-
-# Persist as a custom table
-mq-db sql "CREATE TABLE people AS SELECT * FROM read_csv('people.csv')" --db store.mq-db
-```
-
-`read_csv` parses RFC 4180 (quoted fields, embedded commas/quotes/newlines); the first row is the header. `read_json` expects one JSON object per line (JSON Lines) — the column set is the union of every line's keys, in first-seen order. In both, numeric-looking values support arithmetic/comparison (`WHERE age > 26`), and a short/missing cell becomes `NULL` rather than erroring. Parquet is not supported (would need a large `parquet`/Arrow dependency); an unrecognized table function name (including `read_parquet`) is rejected with a clear error rather than silently misparsed.
-
-### ATTACH — querying across multiple stores
-
-`ATTACH DATABASE '<path>' AS <alias>` mounts another `.mq-db` store for the
-session, queryable as `<alias>.blocks`, `<alias>.documents`, or any of its
-views/custom tables — usable in `SELECT`, `JOIN`, subqueries, and CTEs.
-`DETACH <alias>` unmounts it. Like SQLite, this is session-scoped only (not
-saved into either store's file), so re-run `ATTACH` each session — or pass
-`--attach path.mq-db:alias` (repeatable) to `sql`, `repl`, or `serve` to
-attach automatically on startup:
-
-```bash
-mq-db repl --db project-a.mq-db --attach project-b.mq-db:b
-
-sql> SELECT a.content, b.content FROM blocks a
-     JOIN b.blocks b ON a.block_type = b.block_type
-     WHERE a.block_type = 'heading';
-```
-
-Writes (`INSERT`/`UPDATE`/`DELETE`/`CREATE TABLE`) through an attached
-alias are rejected — only the local store can be written to.
-
-### INSERT / UPDATE / DELETE with write-back
-
-`INSERT`/`UPDATE`/`DELETE` on `blocks` write the change back to the
-document's *source Markdown file* (re-parsed in place, same `DocumentId`)
-— pass `--write-back` to allow it; without the flag the statement is
-rejected:
-
-```bash
-mq-db sql "UPDATE blocks SET content = 'New Title' WHERE block_type = 'heading' AND content = 'Old Title'" \
-  --db store.mq-db --write-back
-
-mq-db sql "DELETE FROM blocks WHERE content = 'Outdated paragraph'" \
-  --db store.mq-db --write-back
-
-# after_pre anchors the new block right after an existing block's `pre`;
-# omit it to append at the end of the document.
-mq-db sql "INSERT INTO blocks (document_id, block_type, content, depth, after_pre) VALUES (0, 'heading', 'New Section', 2, 4)" \
-  --db store.mq-db --write-back
-
-mq-db sql "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'Appended at the end')" \
-  --db store.mq-db --write-back
-```
-
-Limitations in this version:
-
-- `UPDATE ... SET content` and `INSERT INTO blocks` only support `heading`/`paragraph` blocks (not tables, code, lists, ...)
-- `INSERT INTO blocks` requires an explicit column list drawn from `document_id`, `block_type`, `content`, `depth` (required for `heading`, 1-6), `after_pre` (optional) — `INSERT ... SELECT` is not supported, only `VALUES`
-- Only documents indexed **with spans** (the default; not `--no-spans`) and from a real file (not added via the library's `add_str`) are eligible
-- Not available over `serve`'s HTTP endpoint or from `mq-mcp` — CLI (`sql`/`repl` with `--write-back`) and the library (`DocumentStore::execute_sql_mut`) only
-
-### DDL — custom in-memory tables
-
-```bash
-# Create from a SELECT result
-mq-db sql "CREATE TABLE headings AS SELECT content, depth FROM blocks WHERE block_type = 'heading'" --db store.mq-db
-
-# Create with explicit schema, then insert
-mq-db sql "CREATE TABLE notes (id TEXT, body TEXT)" --db store.mq-db
-mq-db sql "INSERT INTO notes VALUES ('1', 'Hello world')" --db store.mq-db
-
-# Inspect
-mq-db sql "SHOW TABLES" --db store.mq-db
-mq-db sql "DESC notes"  --db store.mq-db
-
-# Drop
-mq-db sql "DROP TABLE notes" --db store.mq-db
-```
-
-### Views
-
-Unlike `CREATE TABLE name AS SELECT ...` (a frozen snapshot), a view is **not
-materialized** — its `SELECT` re-runs on every reference, so it always
-reflects current data, including `--write-back` edits and re-indexing. View
-definitions persist to the `.mq-db` file, same as custom tables.
-
-```bash
-mq-db sql "CREATE VIEW headings AS SELECT content, depth FROM blocks WHERE block_type = 'heading'" --db store.mq-db
-mq-db sql "SELECT * FROM headings WHERE depth = 1" --db store.mq-db
-
-mq-db sql "SHOW TABLES" --db store.mq-db   # views are listed with kind = "view"
-mq-db sql "DESC headings" --db store.mq-db
-
-mq-db sql "CREATE OR REPLACE VIEW headings AS SELECT content FROM blocks WHERE block_type = 'heading'" --db store.mq-db
-mq-db sql "DROP VIEW headings" --db store.mq-db
-```
-
-Limitations in this version:
-
-- `CREATE VIEW v (a, b) AS ...` (explicit column list) is not supported
-- A view and a custom table can't share a name
-- A view's output columns are recovered from their rendered text, same as
-  `WITH` CTEs (see the CTE section above for the trade-off this implies)
+- [CTEs (`WITH` / `WITH RECURSIVE`)](https://db.mqlang.org/book/reference/cte)
+- [Full-Text Search (`match()` / `score()`)](https://db.mqlang.org/book/reference/full-text-search)
+- [`EXPLAIN` / `EXPLAIN ANALYZE`](https://db.mqlang.org/book/reference/explain)
+- [External Files (`read_csv()` / `read_json()`)](https://db.mqlang.org/book/reference/external-files)
+- [DDL Statements (custom tables, views, `ATTACH`/`DETACH`)](https://db.mqlang.org/book/reference/sql-ddl)
+- [Write-Back (`INSERT`/`UPDATE`/`DELETE`)](https://db.mqlang.org/book/reference/write-back)
 
 ### mq queries
 
@@ -450,7 +273,7 @@ Three endpoints are available:
 
 | Method | Path      | Body                   | Description                                          |
 | ------ | --------- | ---------------------- | ---------------------------------------------------- |
-| `GET`  | `/health` | —                      | `{"status":"ok","documents":<n>}`                    |
+| `GET`  | `/health` | (none)                 | `{"status":"ok","documents":<n>}`                    |
 | `POST` | `/sql`    | `{"query":"SELECT …"}` | Execute a SQL query, returns JSON rows               |
 | `POST` | `/mq`     | `{"code":".h1"}`       | Evaluate an mq expression, returns `{"results":[…]}` |
 
@@ -509,7 +332,7 @@ mq-db stats --db store.mq-db
 
 ### Compaction (VACUUM)
 
-`UPDATE`/`DELETE` write-back, `DROP TABLE`/`DROP VIEW`, and re-indexing a changed file all replace or remove data by writing a fresh page chain and abandoning the old one — the `.mq-db` file only grows. `vacuum` rewrites the file from scratch (same compaction `save`/`index` already do for a brand-new file) and reclaims that dead space:
+`UPDATE`/`DELETE` write-back, `DROP TABLE`/`DROP VIEW`, and re-indexing a changed file all replace or remove data by writing a fresh page chain and abandoning the old one, so the `.mq-db` file only grows. `vacuum` rewrites the file from scratch (same compaction `save`/`index` already do for a brand-new file) and reclaims that dead space:
 
 ```bash
 mq-db vacuum --db store.mq-db
@@ -521,7 +344,7 @@ mq-db vacuum --db store.mq-db
   Reclaimed      536.0 KB
 ```
 
-`VACUUM` as a SQL statement is recognized but redirects to this command rather than doing something different or silently failing — mq-db's compaction operates on the whole store file, not per-table, so it doesn't fit the `--write-back`/`execute_sql_mut` path the way `UPDATE`/`DELETE` do.
+`VACUUM` as a SQL statement is recognized but redirects to this command rather than doing something different or silently failing: mq-db's compaction operates on the whole store file, not per-table, so it doesn't fit the `--write-back`/`execute_sql_mut` path the way `UPDATE`/`DELETE` do.
 
 ### Show document structure
 
@@ -582,19 +405,19 @@ mq-db tui --db store.mq-db
 ```rust
 use mq_db::{DocumentStore, SqlEngine, MqEngine, block::BlockType};
 
-// ── Build in memory ──────────────────────────────────────────────────────────
+// Build in memory
 let mut store = DocumentStore::new();
 store.add_file("docs/DESIGN.md")?;
 store.add_str("# Hello\n\n## Architecture\n\nDetails\n")?;
 
-// Chainable query API — zone-map skip + interval scope + block predicates
+// Chainable query API: zone-map skip + interval scope + block predicates
 let chunks = store.query()
     .documents(|doc| doc.zone_maps.heading_contents.contains("Architecture"))
     .under_heading("Architecture", Some(2))
     .filter(|b| matches!(b.block_type, BlockType::Paragraph | BlockType::Code))
     .blocks();
 
-// SQL engine (custom sqlparser-based evaluator — no SQLite dependency)
+// SQL engine (custom sqlparser-based evaluator, no SQLite dependency)
 let engine = SqlEngine::new(&store)?;
 let out = engine.execute(
     "SELECT content FROM blocks WHERE block_type = 'heading' ORDER BY pre"
@@ -607,153 +430,53 @@ let results = MqEngine::eval_store(".h1", &store)?;
 // Structural lint
 let violations = store.query().lint_heading_followed_by(2, &[BlockType::List]);
 
-// ── Incremental re-index ─────────────────────────────────────────────────────
-// Skips unchanged files (content-hash based), replaces changed ones in place
-// (same DocumentId), adds new ones; prune=true drops missing paths.
+// Incremental re-index: skips unchanged files (content-hash based), replaces
+// changed ones in place (same DocumentId), adds new ones; prune=true drops
+// missing paths.
 let report = store.reindex_paths(&[std::path::PathBuf::from("docs/DESIGN.md")], false)?;
 println!("{} added, {} updated, {} unchanged", report.added.len(), report.updated.len(), report.unchanged);
 
-// ── UPDATE/DELETE with write-back ────────────────────────────────────────────
-// Rewrites the affected block's *source file* (heading/paragraph content
-// only), then re-parses it in place — see the CLI section above for the
-// full write-back constraints.
+// UPDATE/DELETE with write-back: rewrites the affected block's source file
+// (heading/paragraph content only), then re-parses it in place.
 store.execute_sql_mut(
     "UPDATE blocks SET content = 'New Title' WHERE block_type = 'heading' AND content = 'Old Title'"
 )?;
 
-// ── Persist / load ───────────────────────────────────────────────────────────
+// Persist / load
 store.save("store.mq-db")?;
 
-// Full load — all blocks read into memory, indexes built on first SqlEngine use
+// Full load: all blocks read into memory, indexes built on first SqlEngine use
 let store = DocumentStore::load("store.mq-db")?;
 
-// Lazy open — catalog only; call load_all_blocks() + load_all_indexes() before SQL
+// Lazy open: catalog only; call load_all_blocks() + load_all_indexes() before SQL
 let mut store = DocumentStore::open("store.mq-db")?;
 store.load_all_blocks()?;
 store.load_all_indexes()?;
 
-// Catalog-only — for metadata commands (list, stats) that don't need block data
+// Catalog-only: for metadata commands (list, stats) that don't need block data
 let store = DocumentStore::load_catalog_only("store.mq-db")?;
 ```
 
+See the book's [Library API](https://db.mqlang.org/book/start/library) page for the loading-strategy comparison and the full query-builder reference.
+
 ## SQL Reference
 
-### Virtual schema
+The virtual schema (`documents`/`blocks`), the full built-in function library (mq-db-specific, string, numeric, date/time, null-handling, and aggregate functions), and the DDL statement list live in the book, along with a set of worked example queries:
+
+- [Virtual Schema](https://db.mqlang.org/book/reference/sql-schema)
+- [Built-in Functions](https://db.mqlang.org/book/reference/sql-functions)
+- [DDL Statements](https://db.mqlang.org/book/reference/sql-ddl)
+- [Example Queries](https://db.mqlang.org/book/reference/sql-examples)
+
+A quick taste:
 
 ```sql
-SELECT id, path, title, tags FROM documents;
-
-SELECT id, document_id, block_type, content, pre, post,
-       depth, lang, properties FROM blocks;
-```
-
-### Built-in functions
-
-mq-db-specific:
-
-| Function                              | Description                                |
-| ------------------------------------- | ------------------------------------------ |
-| `under(pre, post, anc_pre, anc_post)` | O(1) interval ancestor check               |
-| `mq(program, content)`                | Run an mq program against Markdown content |
-| `json_extract(json, path)`            | Extract a value from a JSON string         |
-| `match(content, query)`               | Full-text search — true iff every tokenized term in `query` appears in `content`; index-accelerated when `content` is a bare column reference and `query` is a string literal |
-| `score(content, query)`               | Simple term-frequency relevance score for `query` against `content` (no IDF — see [Storage format](#storage-format) note) |
-
-String:
-
-| Function | Description |
-| --- | --- |
-| `lower` / `upper` | Case conversion |
-| `length` / `len` | Character count |
-| `trim` / `ltrim` / `rtrim` | Strip whitespace, or the given characters |
-| `concat` / `concat_ws` | Join strings (with optional separator) |
-| `replace` | Replace all occurrences of a substring |
-| `substring` / `substr` | Extract a substring (1-based, `FROM`/`FOR` or comma form) |
-| `position` / `instr` | Find the 1-based index of a substring (0 if absent) |
-| `left` / `right` | First/last `n` characters |
-| `lpad` / `rpad` | Pad to a fixed length |
-| `reverse` | Reverse a string |
-| `repeat` | Repeat a string `n` times |
-| `initcap` | Capitalize each word |
-| `ascii` / `chr` | Char ↔ code point |
-| `split_part` | Extract the nth delimiter-separated field |
-
-Numeric:
-
-| Function | Description |
-| --- | --- |
-| `abs` | Absolute value |
-| `round` / `trunc` | Round / truncate, with optional decimal scale |
-| `ceil` / `floor` | Round up / down |
-| `mod` | Remainder |
-| `power` / `sqrt` | Exponentiation / square root |
-| `exp` / `ln` | `e^x` / natural log |
-| `log` / `log10` / `log2` | Logarithm (1-arg = base 10, 2-arg = custom base) |
-| `sign` | `-1` / `0` / `1` |
-| `pi` | π |
-| `greatest` / `least` | Max / min across arguments (ignoring NULL) |
-
-Null handling & control flow:
-
-| Function | Description |
-| --- | --- |
-| `coalesce` / `ifnull` | First non-NULL argument |
-| `nullif` | NULL if the two arguments are equal |
-| `CASE WHEN … THEN … ELSE … END` | Conditional expressions |
-| `typeof` | Runtime type of a value |
-
-Aggregates (usable with `GROUP BY`):
-
-| Function | Description |
-| --- | --- |
-| `count(*)` / `count(DISTINCT col)` | Row / distinct-value count |
-| `min` / `max` / `sum` / `avg` | Standard aggregates |
-| `group_concat` / `string_agg(expr[, sep])` | Concatenate group values (default separator `,`) |
-
-### DDL statements
-
-| Statement                         | Description                                       |
-| --------------------------------- | ------------------------------------------------- |
-| `CREATE TABLE name AS SELECT …`   | Create a custom table from a query result         |
-| `CREATE TABLE name (col TYPE, …)` | Create an empty custom table with explicit schema |
-| `INSERT INTO name VALUES (…)`     | Insert a row into a custom table                  |
-| `DROP TABLE name`                 | Drop a custom table                               |
-| `CREATE VIEW name AS SELECT …`    | Create a live (non-materialized) view             |
-| `CREATE OR REPLACE VIEW name AS …`| Overwrite an existing view's definition           |
-| `DROP VIEW name`                  | Drop a view                                       |
-| `SHOW TABLES`                     | List all tables and views                         |
-| `DESC name`                       | Show schema of a table or view                    |
-| `ATTACH DATABASE 'path' AS alias` | Mount another `.mq-db` store as `alias.<table>`   |
-| `DETACH alias`                    | Unmount a previously attached store               |
-
-### Example queries
-
-```sql
--- All text/code under a specific section (RAG extraction)
-SELECT b.block_type, b.content
-FROM blocks b
-WHERE under(b.pre, b.post,
-  (SELECT pre FROM blocks WHERE block_type = 'heading' AND content = 'Architecture'),
-  (SELECT post FROM blocks WHERE block_type = 'heading' AND content = 'Architecture'))
-  AND b.block_type IN ('paragraph', 'code')
-ORDER BY b.pre;
-
--- Extract H1 title from code block content via the mq() scalar function
-SELECT mq('.h1 | to_text', content) AS title
-FROM blocks
-WHERE block_type = 'code' AND lang = 'markdown';
-
 -- H2 headings immediately followed by a list (structural lint)
 SELECT d.path, h.content AS heading
 FROM blocks h
 JOIN blocks nxt ON nxt.document_id = h.document_id AND nxt.pre = h.pre + 1
 JOIN documents d ON d.id = h.document_id
 WHERE h.block_type = 'heading' AND depth = 2 AND nxt.block_type = 'list';
-
--- Documents containing Python code
-SELECT DISTINCT d.path
-FROM documents d JOIN blocks b ON b.document_id = d.id
-WHERE b.block_type = 'code' AND lang = 'python';
 
 -- Bucket headings by depth and summarize with string/numeric functions
 SELECT
@@ -763,153 +486,17 @@ SELECT
 FROM blocks
 WHERE block_type = 'heading'
 GROUP BY CASE WHEN depth <= 1 THEN 'top-level' ELSE 'nested' END;
-
--- CTE: rank documents by how many headings they contain
-WITH heading_counts AS (
-  SELECT document_id, count(*) AS n
-  FROM blocks
-  WHERE block_type = 'heading'
-  GROUP BY document_id
-)
-SELECT d.path, h.n
-FROM heading_counts h
-JOIN documents d ON d.id = h.document_id
-ORDER BY h.n DESC;
-
--- Full-text search, ranked by relevance
-SELECT content, score(content, 'error handling') AS relevance
-FROM blocks
-WHERE match(content, 'error handling')
-ORDER BY relevance DESC;
 ```
 
 ## Architecture
 
-### Block model
+Every Markdown element becomes a `Block` (a typed struct with `pre`/`post` interval-index bounds and row-polymorphic `properties`), indexed through three complementary layers, cheapest-first: **Zone Maps** (document-level skip), the **Interval Index** (section hierarchy, `pre`/`post` containment), and **Secondary Indexes** (`BitmapIndex`/`BTreeIndex`/`HashIndex`/`TermIndex`). Documents persist to a custom 8 KB page file with atomic writes.
 
-Every Markdown element becomes a `Block`:
+See the book for the full architecture, with diagrams and the on-disk byte layout:
 
-```rust
-struct Block {
-    id: u32,
-    document_id: u32,
-    block_type: BlockType,  // Heading, Paragraph, Code, List, …
-    content: String,
-    span: Option<Span>,     // line/column for editor sync
-    pre: u32,               // interval index pre-order
-    post: u32,              // interval index post-order
-    properties: Properties, // row-polymorphic extra attributes
-}
-```
-
-| Block type      | Properties                                          |
-| --------------- | --------------------------------------------------- |
-| `Heading`       | `{ "depth": 2, "slug": "architecture" }`            |
-| `Code`          | `{ "lang": "rust", "meta": "no_run" }`              |
-| `List`          | `{ "ordered": false, "level": 1, "checked": null }` |
-| `Yaml` / `Toml` | parsed front-matter keys (`"title"`, `"tags"`, …)   |
-
-### Index layers
-
-mq-db applies three complementary index layers, cheapest-first.
-
-```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#f2ebdb','primaryTextColor':'#2a2420','primaryBorderColor':'#b3402c','lineColor':'#b3402c','secondaryColor':'#e3c3b7','tertiaryColor':'#faf6ef','background':'#faf6ef','fontFamily':'JetBrains Mono, monospace'}}}%%
-flowchart LR
-    Q["SQL Query"] --> ZM["Layer 1\nZone Maps\n(document skip)"]
-    ZM -->|"relevant docs"| II["Layer 2\nInterval Index\n(section scope)"]
-    II -->|"candidate blocks"| SI["Layer 3\nSecondary Indexes\n(block lookup)"]
-    SI -->|"BitmapIndex\nBTreeIndex\nHashIndex"| R["Result Rows"]
-    ZM -->|"skip"| X1["✗ irrelevant docs"]
-    SI -->|"no hint"| FS["Full Scan"]
-```
-
-#### Layer 1 — Zone Maps (document-level skip)
-
-Built once per document and stored in the `.mq-db` file. Checked before any block is read.
-
-**Via SQL** — `SqlEngine` derives a skip automatically from the WHERE clause, for a single, non-`JOIN`ed `SELECT ... FROM blocks`:
-
-| WHERE conjunct                          | Skips documents where…                              |
-| ---------------------------------------- | --------------------------------------------------- |
-| `lang = 'X'`                             | `code_languages` doesn't contain `X`                |
-| `depth = N` (`N > 0`)                    | `N` exceeds `max_heading_depth`                     |
-| `block_type = 'heading' AND content = 'X'` | `heading_contents` has no case-insensitive match for `X` |
-
-**Via the Rust API** — `store.query().documents(|doc| ...)` lets you filter on *any* zone-map field yourself (`heading_slugs`, `frontmatter_keys`, `title`, `tags`, …), not just the patterns `SqlEngine` recognizes automatically.
-
-#### Layer 2 — Interval Index (section hierarchy)
-
-Heading hierarchy encoded as `(pre, post)` pairs via Pre-Post Order (Nested Set) traversal:
-
-```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#f2ebdb','primaryTextColor':'#2a2420','primaryBorderColor':'#b3402c','lineColor':'#b3402c','secondaryColor':'#e3c3b7','tertiaryColor':'#faf6ef','background':'#faf6ef','fontFamily':'JetBrains Mono, monospace'}}}%%
-graph TD
-    doc["# Doc\npre=0 · post=11"]
-    secA["## Section A\npre=2 · post=7"]
-    para1["Paragraph\npre=3 · post=4"]
-    code1["Code\npre=5 · post=6"]
-    secB["## Section B\npre=8 · post=11"]
-    para2["Paragraph\npre=9 · post=10"]
-
-    doc --> secA
-    doc --> secB
-    secA --> para1
-    secA --> code1
-    secB --> para2
-```
-
-`A is_under B` ↔ `B.pre < A.pre AND A.post < B.post` — O(1), no tree traversal.
-
-#### Layer 3 — Secondary Indexes (block-level fast lookup)
-
-| Index         | Column(s)                  | Structure              | Complexity                         |
-| ------------- | -------------------------- | ---------------------- | ---------------------------------- |
-| `BitmapIndex` | `block_type`               | Inverted list per type | O(1) key + O(k) iterate            |
-| `BTreeIndex`  | `pre`, `post`              | `BTreeMap`             | O(log n) point, O(log n + k) range |
-| `HashIndex`   | `content`, `lang`, `depth` | `HashMap`              | O(1) average                       |
-
-SQL predicate pushdown recognizes one `IndexHint` candidate per indexable
-`WHERE` conjunct:
-
-```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#f2ebdb','primaryTextColor':'#2a2420','primaryBorderColor':'#b3402c','lineColor':'#b3402c','secondaryColor':'#e3c3b7','tertiaryColor':'#faf6ef','background':'#faf6ef','fontFamily':'JetBrains Mono, monospace'}}}%%
-flowchart TD
-    P["SQL WHERE predicate"]
-    P -->|"block_type = '...'"| B["BitmapIndex"]
-    P -->|"pre = N"| BT1["BTreeIndex (point)"]
-    P -->|"pre BETWEEN N AND M"| BT2["BTreeIndex (range)"]
-    P -->|"content = '...'"| H1["HashIndex"]
-    P -->|"lang = '...'"| H2["HashIndex"]
-    P -->|"depth = N"| H3["HashIndex"]
-    P -->|"other"| FS["Full Scan"]
-```
-
-When a `WHERE` clause has more than one viable candidate (e.g. `block_type =
-'code' AND lang = 'json'` matches both `BitmapIndex` and `HashIndex`), the
-choice between them is **cost-based**: each candidate's real matching-block
-count is read directly from its already-built index (no scanning), and the
-cheapest wins. `EXPLAIN` shows the full comparison:
-
-```
-query:where   HashIndex(lang = 'json') used (est. 2 row(s); also considered: BitmapIndex(block_type IN (code)) [est. 289])
-```
-
-### Storage format
-
-Custom 8 KB page file:
-
-```mermaid
-%%{init: {'theme':'base', 'themeVariables': {'primaryColor':'#f2ebdb','primaryTextColor':'#2a2420','primaryBorderColor':'#b3402c','lineColor':'#b3402c','secondaryColor':'#e3c3b7','tertiaryColor':'#faf6ef','background':'#faf6ef','fontFamily':'JetBrains Mono, monospace'}}}%%
-graph TD
-    P0["Page 0 — File Header\nmagic 0x4D514442 · version · page count"]
-    P1["Page 1 — Catalog\ndoc_id → first_block_page · num_blocks · ZoneMaps"]
-    P2["Page 2+ — Block Data\nlinked page chains · overflow pages"]
-
-    P0 --> P1 --> P2
-```
-
-Writes are atomic: data goes to `<path>.tmp` then renamed to `<path>` on success.
+- [Block Model](https://db.mqlang.org/book/reference/block-model)
+- [Index Layers](https://db.mqlang.org/book/reference/index-layers)
+- [Storage Format](https://db.mqlang.org/book/reference/storage-format)
 
 ## Support
 

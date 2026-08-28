@@ -50,9 +50,18 @@ mq-db list --db store.mq-db --format json
 2 documents
 ```
 
+## `find`
+
+Full-text search shortcut for `match()`/`score()`, no SQL needed. See [Full-Text Search](../reference/full-text-search.md).
+
+```bash
+mq-db find "error handling" --db store.mq-db
+mq-db find "error handling" --db store.mq-db -n 5 -F json   # top 5, JSON
+```
+
 ## `sql`
 
-Run a SQL query over the store. See the [Reference](../reference/index.md) for the virtual schema and function library.
+Run a SQL query over the store. See the [Reference](../reference/index.md) for the virtual schema and function library, including [CTEs](../reference/cte.md), [full-text search](../reference/full-text-search.md), [`EXPLAIN`](../reference/explain.md), [external files](../reference/external-files.md), and [write-back](../reference/write-back.md).
 
 ```bash
 mq-db sql "SELECT block_type, count(*) FROM blocks GROUP BY block_type" --db store.mq-db
@@ -65,6 +74,7 @@ mq-db sql "SELECT ..." --db store.mq-db --format json
 | `query` | SQL query string (omit when using `--file`) |
 | `-f, --file <PATH>` | Read SQL from a file |
 | `--attach <PATH:ALIAS>` | Mount another `.mq-db` store as `alias.<table>` (repeatable) |
+| `--write-back` | Allow `INSERT`/`UPDATE`/`DELETE` on `blocks` to write back to the source file, see [Write-Back](../reference/write-back.md) |
 
 ## `mq`
 
@@ -121,6 +131,22 @@ mq-db stats --db store.mq-db
   {}  code         ███████░░░░░░░░░░░░░░░░░    73  (12%)
    •  list         ██████░░░░░░░░░░░░░░░░░░    58   (9%)
 ```
+
+## `vacuum`
+
+`UPDATE`/`DELETE` write-back, `DROP TABLE`/`DROP VIEW`, and re-indexing a changed file all replace or remove data by writing a fresh page chain and abandoning the old one, so the `.mq-db` file only grows. `vacuum` rewrites the file from scratch (same compaction `save`/`index` already do for a brand-new file) and reclaims that dead space:
+
+```bash
+mq-db vacuum --db store.mq-db
+```
+
+```text
+  Pages before   190
+  Pages after    123
+  Reclaimed      536.0 KB
+```
+
+`VACUUM` as a SQL statement is recognized but redirects to this command rather than doing something different or silently failing: mq-db's compaction operates on the whole store file, not per-table, so it doesn't fit the `--write-back`/`execute_sql_mut` path the way `UPDATE`/`DELETE` do.
 
 ## `show`
 
