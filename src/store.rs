@@ -13,11 +13,21 @@ use rustc_hash::FxHashMap;
 /// the backing storage file (0 = not persisted yet), so a SQL `INSERT`
 /// can append just the new rows to the chain instead of rewriting `rows`
 /// in full on every call. See [`Storage::write_table_rows`].
+#[derive(Clone)]
 pub(crate) struct CustomTableState {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
     pub first_row_page: u32,
     pub last_row_page: u32,
+    pub not_null: Vec<usize>,
+    pub unique: Vec<Vec<usize>>,
+}
+
+pub(crate) struct TxSnapshot {
+    pub documents: Vec<Document>,
+    pub custom_tables: FxHashMap<String, CustomTableState>,
+    pub views: FxHashMap<String, String>,
+    pub content_hashes: FxHashMap<DocumentId, u64>,
 }
 
 use mq_markdown::Markdown;
@@ -215,6 +225,7 @@ pub struct DocumentStore {
     /// `.mq-db` file predating this feature) are treated as "unknown, always
     /// reindex".
     content_hashes: FxHashMap<DocumentId, u64>,
+    pub(crate) tx_snapshot: Mutex<Option<TxSnapshot>>,
 }
 
 impl Default for DocumentStore {
@@ -229,6 +240,7 @@ impl Default for DocumentStore {
             views: RwLock::new(FxHashMap::default()),
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: FxHashMap::default(),
+            tx_snapshot: Mutex::new(None),
         }
     }
 }
@@ -240,6 +252,20 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
+}
+
+fn diff_written_paths(before: &[Document], after: &[Document]) -> Vec<String> {
+    after
+        .iter()
+        .filter_map(|a| {
+            let b = before.iter().find(|d| d.id == a.id)?;
+            if b.blocks != a.blocks {
+                a.path.as_ref().map(|p| p.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Reads every file in `files`, in order, using a small worker-thread pool —
@@ -306,6 +332,8 @@ impl DocumentStore {
                 rows,
                 first_row_page: 0,
                 last_row_page: 0,
+                not_null: vec![],
+                unique: vec![],
             },
         );
     }
@@ -781,6 +809,59 @@ impl DocumentStore {
     /// their existing pages untouched — see
     /// [`try_append_table_rows_to_storage`](DocumentStore::try_append_table_rows_to_storage)
     /// for the incremental `INSERT` path.
+    pub(crate) fn begin_transaction(&self) -> Result<(), MqdbError> {
+        let mut guard = self.tx_snapshot.lock().unwrap();
+        if guard.is_some() {
+            return Err(MqdbError::SqlExec(
+                "a transaction is already in progress".into(),
+            ));
+        }
+        *guard = Some(TxSnapshot {
+            documents: self.documents.clone(),
+            custom_tables: self.custom_tables.read().unwrap().clone(),
+            views: self.views.read().unwrap().clone(),
+            content_hashes: self.content_hashes.clone(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn commit_transaction(&self) -> Result<(), MqdbError> {
+        if self.tx_snapshot.lock().unwrap().take().is_none() {
+            return Err(MqdbError::SqlExec("no transaction is in progress".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rollback_transaction_tables_only(&self) -> Result<(), MqdbError> {
+        let snapshot = self
+            .tx_snapshot
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| MqdbError::SqlExec("no transaction is in progress".into()))?;
+        *self.custom_tables.write().unwrap() = snapshot.custom_tables;
+        *self.views.write().unwrap() = snapshot.views;
+        self.try_flush_catalog_to_storage();
+        Ok(())
+    }
+
+    pub(crate) fn rollback_transaction(&mut self) -> Result<Vec<String>, MqdbError> {
+        let snapshot = self
+            .tx_snapshot
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| MqdbError::SqlExec("no transaction is in progress".into()))?;
+        let unrevertable_paths = diff_written_paths(&snapshot.documents, &self.documents);
+        self.documents = snapshot.documents;
+        self.doc_indexes = vec![None; self.documents.len()];
+        self.content_hashes = snapshot.content_hashes;
+        *self.custom_tables.write().unwrap() = snapshot.custom_tables;
+        *self.views.write().unwrap() = snapshot.views;
+        self.try_flush_catalog_to_storage();
+        Ok(unrevertable_paths)
+    }
+
     pub(crate) fn try_flush_catalog_to_storage(&self) {
         let mut guard = self.storage.lock().unwrap();
         if let Some(storage) = guard.as_mut() {
@@ -1011,6 +1092,8 @@ impl DocumentStore {
                     rows,
                     first_row_page: ct.first_row_page,
                     last_row_page: ct.last_row_page,
+                    not_null: vec![],
+                    unique: vec![],
                 },
             );
         }
@@ -1027,6 +1110,7 @@ impl DocumentStore {
             views: RwLock::new(views),
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
+            tx_snapshot: Mutex::new(None),
         })
     }
 
@@ -1064,6 +1148,8 @@ impl DocumentStore {
                     rows,
                     first_row_page: ct.first_row_page,
                     last_row_page: ct.last_row_page,
+                    not_null: vec![],
+                    unique: vec![],
                 },
             );
         }
@@ -1080,6 +1166,7 @@ impl DocumentStore {
             views: RwLock::new(views),
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
+            tx_snapshot: Mutex::new(None),
         })
     }
 
@@ -1120,6 +1207,7 @@ impl DocumentStore {
             views: RwLock::new(FxHashMap::default()),
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
+            tx_snapshot: Mutex::new(None),
         })
     }
 

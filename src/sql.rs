@@ -9,7 +9,8 @@
 //!
 //! ```sql
 //! -- documents table
-//! SELECT id, path, title, tags FROM documents;
+//! SELECT id, path, title, tags, block_count, max_heading_depth,
+//!        code_languages, frontmatter_keys FROM documents;
 //!
 //! -- blocks table
 //! SELECT id, document_id, block_type, content, pre, post, depth, lang,
@@ -23,11 +24,20 @@
 //! | `under(pre, post, anc_pre, anc_post)` | O(1) interval ancestor check |
 //! | `json_extract(json, path)` | Extract value from JSON string |
 //! | `mq(program, content)` | Run an mq program against Markdown content |
-//! | `count`/`min`/`max`/`sum`/`avg`/`group_concat`/`string_agg` | Aggregates (`count` and `group_concat`/`string_agg` support `DISTINCT`) |
+//! | `count`/`min`/`max`/`sum`/`avg`/`group_concat`/`string_agg` | Aggregates (`count` and `group_concat`/`string_agg` support `DISTINCT`); `GROUP BY ... HAVING` filters on them |
 //! | `lower`/`upper`/`length`/`trim`/`ltrim`/`rtrim`/`concat`/`concat_ws`/`replace`/`left`/`right`/`lpad`/`rpad`/`reverse`/`repeat`/`initcap`/`ascii`/`chr`/`instr`/`split_part`/`substring`/`substr`/`position` | String functions |
+//! | `REGEXP`/`RLIKE` operator, `regexp_like`/`regexp_replace`/`regexp_extract` | Regular-expression matching |
 //! | `abs`/`round`/`ceil`/`floor`/`trunc`/`mod`/`power`/`sqrt`/`sign`/`exp`/`ln`/`log`/`log10`/`log2`/`pi`/`greatest`/`least` | Numeric functions |
 //! | `coalesce`/`ifnull`/`nullif` | Null handling |
 //! | `typeof`/`now`/`current_timestamp`/`current_date`/`current_time`/`CASE WHEN` | Misc |
+//! | `date_trunc`/`date_diff`/`date_add`/`date_sub`/`strftime`/`EXTRACT(field FROM ...)` | Date/time functions |
+//!
+//! `SELECT ... LIMIT n OFFSET m` pages through results; `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`
+//! combine two `SELECT`s; `BEGIN`/`COMMIT`/`ROLLBACK` wrap a run of statements (custom tables and
+//! views always roll back; `--write-back` block edits already committed to the source Markdown
+//! file cannot be undone and are called out in the `ROLLBACK` result). `CREATE TABLE` accepts
+//! `NOT NULL`/`UNIQUE`/`PRIMARY KEY` column and table constraints, enforced on `INSERT` (session-only,
+//! not persisted across reload).
 //!
 //! # Example
 //!
@@ -44,15 +54,17 @@
 //! assert!(!out.rows.is_empty());
 //! ```
 
+use regex::Regex;
 use rustc_hash::FxHashMap;
 use sqlparser::{
     ast::{
-        AssignmentTarget, BinaryOperator, CaseWhen, CeilFloorKind, CreateTable, CreateView,
-        DateTimeField, DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr,
-        FunctionArguments, GroupByExpr, Insert, JoinConstraint, JoinOperator, LimitClause,
-        ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select,
-        SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TableFunctionArgs,
-        TableObject, TableWithJoins, TrimWhereField, UnaryOperator, Value as SqlValue, Values,
+        AssignmentTarget, BinaryOperator, CaseWhen, CeilFloorKind, ColumnDef, ColumnOption,
+        CreateTable, CreateView, DateTimeField, DuplicateTreatment, Expr, FromTable, Function,
+        FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, IndexColumn, Insert,
+        JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, ObjectType,
+        OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier,
+        Statement, TableConstraint, TableFactor, TableFunctionArgs, TableObject, TableWithJoins,
+        TrimWhereField, UnaryOperator, Value as SqlValue, Values,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -484,18 +496,31 @@ fn block_to_row(doc_id: u32, block: &Block, block_idx: u32) -> Row {
     }
 }
 
+fn json_string_array<'a>(items: impl Iterator<Item = &'a String>) -> String {
+    let items: Vec<String> = items
+        .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+fn json_string_array_sorted<'a>(items: impl Iterator<Item = &'a String>) -> String {
+    let mut sorted: Vec<&String> = items.collect();
+    sorted.sort();
+    json_string_array(sorted.into_iter())
+}
+
 fn doc_to_row(doc: &Document) -> Row {
-    let tags_json = {
-        let items: Vec<String> = doc
-            .zone_maps
-            .tags
-            .iter()
-            .map(|t| format!("\"{}\"", t.replace('"', "\\\"")))
-            .collect();
-        format!("[{}]", items.join(","))
-    };
     Row {
-        columns: vec!["id".into(), "path".into(), "title".into(), "tags".into()],
+        columns: vec![
+            "id".into(),
+            "path".into(),
+            "title".into(),
+            "tags".into(),
+            "block_count".into(),
+            "max_heading_depth".into(),
+            "code_languages".into(),
+            "frontmatter_keys".into(),
+        ],
         values: vec![
             Value::Int(doc.id as i64),
             Value::Str(
@@ -506,7 +531,15 @@ fn doc_to_row(doc: &Document) -> Row {
                     .to_string(),
             ),
             Value::Str(doc.zone_maps.title.clone().unwrap_or_default()),
-            Value::Str(tags_json),
+            Value::Str(json_string_array(doc.zone_maps.tags.iter())),
+            Value::Int(doc.block_count as i64),
+            Value::Int(doc.zone_maps.max_heading_depth as i64),
+            Value::Str(json_string_array_sorted(
+                doc.zone_maps.code_languages.iter(),
+            )),
+            Value::Str(json_string_array_sorted(
+                doc.zone_maps.frontmatter_keys.iter(),
+            )),
         ],
     }
 }
@@ -720,6 +753,21 @@ fn eval_expr(expr: &Expr, row: &Row) -> Value {
                 Value::Bool(false)
             }
         }
+        Expr::RLike {
+            expr,
+            negated,
+            pattern,
+            ..
+        } => {
+            let val = eval_expr(expr, row);
+            let pat = eval_expr(pattern, row);
+            if let (Value::Str(s), Value::Str(p)) = (val, pat) {
+                let matched = compile_regex(&p).is_some_and(|re| re.is_match(&s));
+                Value::Bool(if *negated { !matched } else { matched })
+            } else {
+                Value::Bool(false)
+            }
+        }
         Expr::Function(f) => eval_function_call(f, row),
         Expr::Nested(inner) => eval_expr(inner, row),
         Expr::Cast { expr, .. } => eval_expr(expr, row),
@@ -744,6 +792,7 @@ fn eval_expr(expr: &Expr, row: &Row) -> Value {
         Expr::Position { expr, r#in } => eval_position(expr, r#in, row),
         Expr::Ceil { expr, field } => eval_ceil_floor(expr, field, row, true),
         Expr::Floor { expr, field } => eval_ceil_floor(expr, field, row, false),
+        Expr::Extract { field, expr, .. } => eval_extract(field, expr, row),
         // Subqueries are pre-resolved by resolve_subqueries before eval
         _ => Value::Null,
     }
@@ -1104,6 +1153,42 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
                 _ => Value::Null,
             }
         }
+        "regexp_like" => {
+            let (Some(s), Some(pat)) = (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+            ) else {
+                return Value::Bool(false);
+            };
+            compile_regex(pat)
+                .map(|re| Value::Bool(re.is_match(s)))
+                .unwrap_or(Value::Bool(false))
+        }
+        "regexp_replace" => {
+            if args.len() < 3 {
+                return Value::Null;
+            }
+            match (args[0].as_str(), args[1].as_str(), args[2].as_str()) {
+                (Some(s), Some(pat), Some(rep)) => compile_regex(pat)
+                    .map(|re| Value::Str(re.replace_all(s, rep).into_owned()))
+                    .unwrap_or(Value::Null),
+                _ => Value::Null,
+            }
+        }
+        "regexp_extract" => {
+            let (Some(s), Some(pat)) = (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+            ) else {
+                return Value::Null;
+            };
+            let group = args.get(2).and_then(Value::as_i64).unwrap_or(0).max(0) as usize;
+            compile_regex(pat)
+                .and_then(|re| re.captures(s))
+                .and_then(|caps| caps.get(group))
+                .map(|m| Value::Str(m.as_str().to_string()))
+                .unwrap_or(Value::Null)
+        }
         "left" => str_int_fn(args, |chars, n| {
             chars[..(n.max(0) as usize).min(chars.len())]
                 .iter()
@@ -1306,6 +1391,48 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
         "now" | "current_timestamp" => Value::Str(current_datetime_utc(true, true)),
         "current_date" => Value::Str(current_datetime_utc(true, false)),
         "current_time" => Value::Str(current_datetime_utc(false, true)),
+        "date_trunc" => match (
+            args.first().and_then(Value::as_str),
+            args.get(1).and_then(Value::as_str),
+        ) {
+            (Some(unit), Some(date)) => eval_date_trunc(unit, date),
+            _ => Value::Null,
+        },
+        "date_diff" => {
+            match (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+                args.get(2).and_then(Value::as_str),
+            ) {
+                (Some(unit), Some(d1), Some(d2)) => eval_date_diff(unit, d1, d2),
+                _ => Value::Null,
+            }
+        }
+        "date_add" => match (
+            args.first().and_then(Value::as_str),
+            args.get(1).and_then(Value::as_i64),
+            args.get(2).and_then(Value::as_str),
+        ) {
+            (Some(date), Some(n), Some(unit)) => eval_date_add(date, n, unit),
+            (Some(date), Some(n), None) => eval_date_add(date, n, "day"),
+            _ => Value::Null,
+        },
+        "date_sub" => match (
+            args.first().and_then(Value::as_str),
+            args.get(1).and_then(Value::as_i64),
+            args.get(2).and_then(Value::as_str),
+        ) {
+            (Some(date), Some(n), Some(unit)) => eval_date_add(date, -n, unit),
+            (Some(date), Some(n), None) => eval_date_add(date, -n, "day"),
+            _ => Value::Null,
+        },
+        "strftime" => match (
+            args.first().and_then(Value::as_str),
+            args.get(1).and_then(Value::as_str),
+        ) {
+            (Some(fmt), Some(date)) => eval_strftime(fmt, date),
+            _ => Value::Null,
+        },
         _ => Value::Null,
     }
 }
@@ -1428,6 +1555,218 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(y) => 29,
+        2 => 28,
+        _ => 30,
+    }
+}
+
+fn parse_datetime(s: &str) -> Option<(i64, i64)> {
+    let s = s.trim();
+    let (date_part, time_part) = match s.find(['T', ' ']) {
+        Some(idx) => (&s[..idx], Some(&s[idx + 1..])),
+        None => (s, None),
+    };
+    let mut parts = date_part.splitn(3, '-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let days = days_from_civil(y, m, d);
+    let secs = match time_part {
+        Some(tp) => {
+            let tp = tp.trim_end_matches('Z');
+            let tp = tp.split(['+']).next().unwrap_or(tp);
+            let tp = match tp.rfind('-') {
+                Some(pos) => &tp[..pos],
+                None => tp,
+            };
+            let tp = tp.split('.').next().unwrap_or(tp);
+            let mut tparts = tp.splitn(3, ':');
+            let h: i64 = tparts.next()?.parse().ok()?;
+            let mi: i64 = tparts.next().unwrap_or("0").parse().ok()?;
+            let se: i64 = tparts.next().unwrap_or("0").parse().ok()?;
+            h * 3600 + mi * 60 + se
+        }
+        None => 0,
+    };
+    Some((days, secs))
+}
+
+fn format_date(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn format_datetime(days: i64, secs: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    let (h, mi, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+fn weekday_from_days(days: i64) -> u32 {
+    (((days % 7) + 11) % 7) as u32
+}
+
+const WEEKDAY_NAMES: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+fn eval_extract(field: &DateTimeField, expr: &Expr, row: &Row) -> Value {
+    let Some(s) = eval_expr(expr, row).as_str().map(str::to_string) else {
+        return Value::Null;
+    };
+    let Some((days, secs)) = parse_datetime(&s) else {
+        return Value::Null;
+    };
+    let (y, m, d) = civil_from_days(days);
+    match field {
+        DateTimeField::Year | DateTimeField::Years => Value::Int(y),
+        DateTimeField::Month | DateTimeField::Months => Value::Int(m as i64),
+        DateTimeField::Day | DateTimeField::Days => Value::Int(d as i64),
+        DateTimeField::Hour | DateTimeField::Hours => Value::Int(secs / 3600),
+        DateTimeField::Minute | DateTimeField::Minutes => Value::Int((secs / 60) % 60),
+        DateTimeField::Second | DateTimeField::Seconds => Value::Int(secs % 60),
+        DateTimeField::Dow => Value::Int(weekday_from_days(days) as i64),
+        DateTimeField::Doy => Value::Int(days - days_from_civil(y, 1, 1) + 1),
+        DateTimeField::Epoch => Value::Int(days * 86400 + secs),
+        _ => Value::Null,
+    }
+}
+
+fn add_months(days: i64, n: i64) -> i64 {
+    let (y, m, d) = civil_from_days(days);
+    let total_months = y * 12 + (m as i64 - 1) + n;
+    let ny = total_months.div_euclid(12);
+    let nm = (total_months.rem_euclid(12) + 1) as u32;
+    let nd = d.min(days_in_month(ny, nm));
+    days_from_civil(ny, nm, nd)
+}
+
+fn eval_date_trunc(unit: &str, date: &str) -> Value {
+    let Some((days, secs)) = parse_datetime(date) else {
+        return Value::Null;
+    };
+    let (y, m, _) = civil_from_days(days);
+    match unit.to_lowercase().as_str() {
+        "year" => Value::Str(format_date(days_from_civil(y, 1, 1))),
+        "month" => Value::Str(format_date(days_from_civil(y, m, 1))),
+        "day" => Value::Str(format_date(days)),
+        "hour" => Value::Str(format_datetime(days, (secs / 3600) * 3600)),
+        "minute" => Value::Str(format_datetime(days, (secs / 60) * 60)),
+        _ => Value::Null,
+    }
+}
+
+fn eval_date_diff(unit: &str, date1: &str, date2: &str) -> Value {
+    let (Some((days1, secs1)), Some((days2, secs2))) =
+        (parse_datetime(date1), parse_datetime(date2))
+    else {
+        return Value::Null;
+    };
+    match unit.to_lowercase().as_str() {
+        "day" => Value::Int(days2 - days1),
+        "second" => Value::Int((days2 - days1) * 86400 + (secs2 - secs1)),
+        "month" => {
+            let (y1, m1, _) = civil_from_days(days1);
+            let (y2, m2, _) = civil_from_days(days2);
+            Value::Int((y2 * 12 + m2 as i64) - (y1 * 12 + m1 as i64))
+        }
+        "year" => {
+            let (y1, _, _) = civil_from_days(days1);
+            let (y2, _, _) = civil_from_days(days2);
+            Value::Int(y2 - y1)
+        }
+        _ => Value::Null,
+    }
+}
+
+fn eval_date_add(date: &str, n: i64, unit: &str) -> Value {
+    let Some((days, secs)) = parse_datetime(date) else {
+        return Value::Null;
+    };
+    let with_time = secs != 0 || date.contains([' ', 'T']);
+    let render = |days: i64, secs: i64| {
+        if with_time {
+            format_datetime(days, secs)
+        } else {
+            format_date(days)
+        }
+    };
+    match unit.to_lowercase().as_str() {
+        "day" => Value::Str(render(days + n, secs)),
+        "month" => Value::Str(render(add_months(days, n), secs)),
+        "year" => Value::Str(render(add_months(days, n * 12), secs)),
+        "hour" => Value::Str(render(days, secs + n * 3600)),
+        "minute" => Value::Str(render(days, secs + n * 60)),
+        "second" => Value::Str(render(days, secs + n)),
+        _ => Value::Null,
+    }
+}
+
+fn eval_strftime(format: &str, date: &str) -> Value {
+    let Some((days, secs)) = parse_datetime(date) else {
+        return Value::Null;
+    };
+    let (y, m, d) = civil_from_days(days);
+    let (h, mi, s) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    let wd = weekday_from_days(days) as usize;
+    let doy = days - days_from_civil(y, 1, 1) + 1;
+    let mut out = String::new();
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('Y') => out.push_str(&format!("{y:04}")),
+            Some('m') => out.push_str(&format!("{m:02}")),
+            Some('d') => out.push_str(&format!("{d:02}")),
+            Some('H') => out.push_str(&format!("{h:02}")),
+            Some('M') => out.push_str(&format!("{mi:02}")),
+            Some('S') => out.push_str(&format!("{s:02}")),
+            Some('j') => out.push_str(&format!("{doy:03}")),
+            Some('w') => out.push_str(&wd.to_string()),
+            Some('A') => out.push_str(WEEKDAY_NAMES[wd]),
+            Some('a') => out.push_str(&WEEKDAY_NAMES[wd][..3]),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    Value::Str(out)
+}
+
 fn eval_mq_scalar(program: &str, content: &str) -> Value {
     let mut engine = DefaultEngine::default();
     engine.load_builtin_module();
@@ -1484,6 +1823,10 @@ fn extract_json_key(json: &str, key: &str) -> Value {
         }
     }
     Value::Null
+}
+
+fn compile_regex(pattern: &str) -> Option<Regex> {
+    Regex::new(pattern).ok()
 }
 
 // LIKE pattern matching (% = .*, _ = any char)
@@ -1639,6 +1982,18 @@ impl<'a> SqlEngine<'a> {
             Statement::Vacuum(_) => Err(MqdbError::SqlExec(
                 "VACUUM is a CLI command, not a SQL statement here — run `mq-db vacuum --db <path>`".into(),
             )),
+            Statement::StartTransaction { .. } => {
+                self.store.begin_transaction()?;
+                Ok(ok_result())
+            }
+            Statement::Commit { .. } => {
+                self.store.commit_transaction()?;
+                Ok(ok_result())
+            }
+            Statement::Rollback { .. } => {
+                self.store.rollback_transaction_tables_only()?;
+                Ok(ok_result())
+            }
             Statement::AttachDatabase {
                 schema_name,
                 database_file_name,
@@ -1654,7 +2009,7 @@ impl<'a> SqlEngine<'a> {
                 Ok(ok_result())
             }
             _ => Err(MqdbError::SqlExec(
-                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, DROP TABLE, CREATE VIEW, DROP VIEW, ATTACH DATABASE, DETACH, DESC, SHOW TABLES, EXPLAIN".into(),
+                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, DROP TABLE, CREATE VIEW, DROP VIEW, ATTACH DATABASE, DETACH, DESC, SHOW TABLES, EXPLAIN, BEGIN, COMMIT, ROLLBACK".into(),
             )),
         }
     }
@@ -1732,10 +2087,11 @@ impl<'a> SqlEngine<'a> {
         match query.body.as_ref() {
             SetExpr::Select(select) => {
                 let limit = limit_expr_of(query);
+                let offset = offset_expr_of(query);
                 self.describe_select(
                     select,
                     &query.order_by,
-                    limit.as_ref(),
+                    (limit.as_ref(), offset.as_ref()),
                     label,
                     cte_names,
                     out,
@@ -1755,11 +2111,12 @@ impl<'a> SqlEngine<'a> {
         &self,
         select: &Select,
         order_by: &Option<sqlparser::ast::OrderBy>,
-        limit: Option<&Expr>,
+        limit_offset: (Option<&Expr>, Option<&Expr>),
         label: &str,
         cte_names: &[String],
         out: &mut Vec<(String, String)>,
     ) {
+        let (limit, offset) = limit_offset;
         if select.from.is_empty() {
             out.push((
                 format!("{label}:from"),
@@ -1932,6 +2289,9 @@ impl<'a> SqlEngine<'a> {
         if let Some(lim) = limit {
             out.push((format!("{label}:limit"), format!("{lim}")));
         }
+        if let Some(off) = offset {
+            out.push((format!("{label}:offset"), format!("{off}")));
+        }
     }
 
     fn explain_analyze_scan_stats(&self, query: &Query, out: &mut Vec<(String, String)>) {
@@ -2004,6 +2364,10 @@ impl<'a> SqlEngine<'a> {
                 ("path", "text"),
                 ("title", "text"),
                 ("tags", "text"),
+                ("block_count", "integer"),
+                ("max_heading_depth", "integer"),
+                ("code_languages", "text"),
+                ("frontmatter_keys", "text"),
             ]),
             _ => None,
         };
@@ -2091,6 +2455,8 @@ impl<'a> SqlEngine<'a> {
                     rows: result.rows,
                     first_row_page: 0,
                     last_row_page: 0,
+                    not_null: vec![],
+                    unique: vec![],
                 },
             );
             self.store.try_flush_catalog_to_storage();
@@ -2124,6 +2490,7 @@ impl<'a> SqlEngine<'a> {
                 "table '{table_name}' already exists"
             )));
         }
+        let (not_null, unique) = table_constraints(&columns, &ct.columns, &ct.constraints);
         self.store.custom_tables.write().unwrap().insert(
             table_name,
             CustomTableState {
@@ -2131,6 +2498,8 @@ impl<'a> SqlEngine<'a> {
                 rows: vec![],
                 first_row_page: 0,
                 last_row_page: 0,
+                not_null,
+                unique,
             },
         );
         self.store.try_flush_catalog_to_storage();
@@ -2295,9 +2664,40 @@ impl<'a> SqlEngine<'a> {
                         }
                     }
                 }
-                state.rows.push(row.clone());
                 new_rows.push(row);
             }
+
+            for row in &new_rows {
+                for &idx in &state.not_null {
+                    if row.get(idx).is_none_or(|v| v.is_empty() || v == "NULL") {
+                        return Err(MqdbError::SqlExec(format!(
+                            "NOT NULL constraint failed: {}.{}",
+                            table_name, state.columns[idx]
+                        )));
+                    }
+                }
+            }
+            for group in &state.unique {
+                let key = |row: &[String]| -> Vec<String> {
+                    group.iter().map(|&i| row[i].clone()).collect()
+                };
+                let mut seen: std::collections::HashSet<Vec<String>> =
+                    state.rows.iter().map(|r| key(r)).collect();
+                for row in &new_rows {
+                    let k = key(row);
+                    if !seen.insert(k) {
+                        let cols: Vec<&str> =
+                            group.iter().map(|&i| state.columns[i].as_str()).collect();
+                        return Err(MqdbError::SqlExec(format!(
+                            "UNIQUE constraint failed: {}.{}",
+                            table_name,
+                            cols.join(", ")
+                        )));
+                    }
+                }
+            }
+
+            state.rows.extend(new_rows.iter().cloned());
             new_rows
         }; // write lock released before flush
         let inserted = new_rows.len();
@@ -2423,7 +2823,7 @@ impl<'a> SqlEngine<'a> {
         recursive: &Select,
         all: bool,
     ) -> Result<QueryOutput, MqdbError> {
-        let anchor_out = self.exec_select(anchor, &None, None)?;
+        let anchor_out = self.exec_select(anchor, &None, None, None)?;
         let columns = anchor_out.columns.clone();
         let mut result_rows = anchor_out.rows.clone();
         let mut working = anchor_out.rows;
@@ -2454,7 +2854,7 @@ impl<'a> SqlEngine<'a> {
                 .into_iter()
                 .collect(),
             );
-            let step = self.exec_select(recursive, &None, None);
+            let step = self.exec_select(recursive, &None, None, None);
             self.cte_scopes.borrow_mut().pop();
             let step_out = step?;
 
@@ -2480,8 +2880,28 @@ impl<'a> SqlEngine<'a> {
     }
 
     fn exec_query_body(&self, query: &Query) -> Result<QueryOutput, MqdbError> {
-        let select = match query.body.as_ref() {
-            SetExpr::Select(s) => s,
+        if let SetExpr::Select(select) = query.body.as_ref() {
+            let limit_expr = limit_expr_of(query);
+            let offset_expr = offset_expr_of(query);
+            return self.exec_select(
+                select,
+                &query.order_by,
+                limit_expr.as_ref(),
+                offset_expr.as_ref(),
+            );
+        }
+        let out = self.exec_set_expr(&query.body)?;
+        let limit_expr = limit_expr_of(query);
+        let offset_expr = offset_expr_of(query);
+        Ok(QueryOutput {
+            columns: out.columns,
+            rows: apply_limit_offset(out.rows, limit_expr.as_ref(), offset_expr.as_ref()),
+        })
+    }
+
+    fn exec_set_expr(&self, body: &SetExpr) -> Result<QueryOutput, MqdbError> {
+        match body {
+            SetExpr::Select(select) => self.exec_select(select, &None, None, None),
             SetExpr::Values(Values { rows, .. }) => {
                 let empty = Row {
                     columns: vec![],
@@ -2491,15 +2911,24 @@ impl<'a> SqlEngine<'a> {
                     .iter()
                     .map(|row| row.iter().map(|e| eval_expr(e, &empty).display()).collect())
                     .collect();
-                return Ok(QueryOutput {
+                Ok(QueryOutput {
                     columns: vec![],
                     rows: out,
-                });
+                })
             }
-            _ => return Err(MqdbError::SqlExec("unsupported query type".into())),
-        };
-        let limit_expr = limit_expr_of(query);
-        self.exec_select(select, &query.order_by, limit_expr.as_ref())
+            SetExpr::Query(q) => self.exec_query(q),
+            SetExpr::SetOperation {
+                left,
+                op,
+                set_quantifier,
+                right,
+            } => {
+                let left_out = self.exec_set_expr(left)?;
+                let right_out = self.exec_set_expr(right)?;
+                combine_set_operation(left_out, right_out, op, set_quantifier)
+            }
+            _ => Err(MqdbError::SqlExec("unsupported query type".into())),
+        }
     }
 
     fn exec_select(
@@ -2507,6 +2936,7 @@ impl<'a> SqlEngine<'a> {
         select: &Select,
         order_by: &Option<sqlparser::ast::OrderBy>,
         limit: Option<&Expr>,
+        offset: Option<&Expr>,
     ) -> Result<QueryOutput, MqdbError> {
         // 1. Materialise FROM — with cost-based index predicate pushdown
         let where_expr = select.selection.as_ref();
@@ -2538,7 +2968,7 @@ impl<'a> SqlEngine<'a> {
         }
 
         // 3. PROJECT / GROUP / ORDER / LIMIT
-        self.project_and_aggregate(select, rows, order_by, limit)
+        self.project_and_aggregate(select, rows, order_by, limit, offset)
     }
 
     fn resolve_subqueries(&self, expr: &Expr) -> Result<Expr, MqdbError> {
@@ -2838,6 +3268,7 @@ impl<'a> SqlEngine<'a> {
         rows: Vec<Row>,
         order_by: &Option<sqlparser::ast::OrderBy>,
         limit: Option<&Expr>,
+        offset: Option<&Expr>,
     ) -> Result<QueryOutput, MqdbError> {
         let group_by_exprs: Vec<Expr> = match &select.group_by {
             GroupByExpr::Expressions(exprs, _) => exprs.clone(),
@@ -2846,7 +3277,7 @@ impl<'a> SqlEngine<'a> {
         let is_agg = has_aggregate(&select.projection);
 
         if is_agg || !group_by_exprs.is_empty() {
-            return self.aggregate(select, rows, limit, &group_by_exprs);
+            return self.aggregate(select, rows, limit, offset, &group_by_exprs);
         }
 
         // Plain SELECT
@@ -2883,7 +3314,7 @@ impl<'a> SqlEngine<'a> {
 
         Ok(QueryOutput {
             columns,
-            rows: apply_limit(result, limit),
+            rows: apply_limit_offset(result, limit, offset),
         })
     }
 
@@ -2892,6 +3323,7 @@ impl<'a> SqlEngine<'a> {
         select: &Select,
         rows: Vec<Row>,
         limit: Option<&Expr>,
+        offset: Option<&Expr>,
         group_by_exprs: &[Expr],
     ) -> Result<QueryOutput, MqdbError> {
         validate_agg_projection(&select.projection, group_by_exprs)?;
@@ -2914,9 +3346,18 @@ impl<'a> SqlEngine<'a> {
             // Single group
             let all: Vec<&Row> = owned.iter().collect();
             let out_row = eval_agg_row(&select.projection, group_by_exprs, &[], &all);
+            let out_rows = if select
+                .having
+                .as_ref()
+                .is_some_and(|h| !eval_having(h, &select.projection, group_by_exprs, &[], &all))
+            {
+                vec![]
+            } else {
+                vec![out_row]
+            };
             return Ok(QueryOutput {
                 columns,
-                rows: apply_limit(vec![out_row], limit),
+                rows: apply_limit_offset(out_rows, limit, offset),
             });
         }
 
@@ -2932,6 +3373,11 @@ impl<'a> SqlEngine<'a> {
 
         let out_rows: Vec<Vec<String>> = groups
             .iter()
+            .filter(|(key_vals, group_rows)| {
+                select.having.as_ref().is_none_or(|h| {
+                    eval_having(h, &select.projection, group_by_exprs, key_vals, group_rows)
+                })
+            })
             .map(|(key_vals, group_rows)| {
                 eval_agg_row(&select.projection, group_by_exprs, key_vals, group_rows)
             })
@@ -2939,7 +3385,7 @@ impl<'a> SqlEngine<'a> {
 
         Ok(QueryOutput {
             columns,
-            rows: apply_limit(out_rows, limit),
+            rows: apply_limit_offset(out_rows, limit, offset),
         })
     }
 }
@@ -2953,6 +3399,64 @@ struct MatchedBlockEdit {
     pre: u32,
     /// `Some(rendered content)` for `UPDATE`, `None` for `DELETE`.
     new_content: Option<String>,
+}
+
+fn resolve_index_columns(table_columns: &[String], idx_cols: &[IndexColumn]) -> Vec<usize> {
+    idx_cols
+        .iter()
+        .filter_map(|ic| match &ic.column.expr {
+            Expr::Identifier(id) => table_columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(&id.value)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn table_constraints(
+    table_columns: &[String],
+    column_defs: &[ColumnDef],
+    constraints: &[TableConstraint],
+) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let mut not_null = Vec::new();
+    let mut unique = Vec::new();
+
+    for (i, col) in column_defs.iter().enumerate() {
+        for opt in &col.options {
+            match &opt.option {
+                ColumnOption::NotNull => not_null.push(i),
+                ColumnOption::Unique(_) => unique.push(vec![i]),
+                ColumnOption::PrimaryKey(_) => {
+                    not_null.push(i);
+                    unique.push(vec![i]);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for c in constraints {
+        match c {
+            TableConstraint::Unique(u) => {
+                let cols = resolve_index_columns(table_columns, &u.columns);
+                if !cols.is_empty() {
+                    unique.push(cols);
+                }
+            }
+            TableConstraint::PrimaryKey(pk) => {
+                let cols = resolve_index_columns(table_columns, &pk.columns);
+                not_null.extend(cols.iter().copied());
+                if !cols.is_empty() {
+                    unique.push(cols);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    not_null.sort_unstable();
+    not_null.dedup();
+    (not_null, unique)
 }
 
 fn single_table_name(twj: &TableWithJoins) -> Result<String, MqdbError> {
@@ -3525,6 +4029,21 @@ impl DocumentStore {
                     SqlEngine::new(self)?.execute(sql)
                 }
             }
+            Statement::Rollback { .. } => {
+                let unrevertable = self.rollback_transaction()?;
+                if unrevertable.is_empty() {
+                    Ok(ok_result())
+                } else {
+                    Ok(QueryOutput {
+                        columns: vec!["result".to_string()],
+                        rows: vec![vec![format!(
+                            "rolled back (note: {} source file(s) were already modified by write-back and cannot be reverted: {})",
+                            unrevertable.len(),
+                            unrevertable.join(", ")
+                        )]],
+                    })
+                }
+            }
             _ => SqlEngine::new(self)?.execute(sql),
         }
     }
@@ -3659,69 +4178,7 @@ fn eval_agg_row(
                 _ => return String::new(),
             };
             match expr {
-                Expr::Function(f) => {
-                    let name = f
-                        .name
-                        .0
-                        .last()
-                        .map(ident_value)
-                        .unwrap_or("")
-                        .to_lowercase();
-                    match name.as_str() {
-                        "count" if is_distinct(f) => {
-                            let mut seen: Vec<Value> = Vec::new();
-                            for r in group_rows {
-                                let v = agg_arg(f, r);
-                                if !matches!(v, Value::Null) && !seen.contains(&v) {
-                                    seen.push(v);
-                                }
-                            }
-                            seen.len().to_string()
-                        }
-                        "count" => group_rows.len().to_string(),
-                        "group_concat" | "string_agg" => {
-                            let sep = agg_separator(f);
-                            group_rows
-                                .iter()
-                                .map(|r| agg_arg(f, r))
-                                .filter(|v| !matches!(v, Value::Null))
-                                .map(|v| v.display())
-                                .collect::<Vec<_>>()
-                                .join(&sep)
-                        }
-                        "sum" => {
-                            let sum: f64 = group_rows
-                                .iter()
-                                .filter_map(|r| agg_arg(f, r).as_f64())
-                                .sum();
-                            sum.to_string()
-                        }
-                        "min" => group_rows
-                            .iter()
-                            .map(|r| agg_arg(f, r))
-                            .min_by(|a, b| a.cmp_val(b).unwrap_or(std::cmp::Ordering::Equal))
-                            .map(|v| v.display())
-                            .unwrap_or_else(|| "NULL".into()),
-                        "max" => group_rows
-                            .iter()
-                            .map(|r| agg_arg(f, r))
-                            .max_by(|a, b| a.cmp_val(b).unwrap_or(std::cmp::Ordering::Equal))
-                            .map(|v| v.display())
-                            .unwrap_or_else(|| "NULL".into()),
-                        "avg" => {
-                            let vals: Vec<f64> = group_rows
-                                .iter()
-                                .filter_map(|r| agg_arg(f, r).as_f64())
-                                .collect();
-                            if vals.is_empty() {
-                                "NULL".into()
-                            } else {
-                                (vals.iter().sum::<f64>() / vals.len() as f64).to_string()
-                            }
-                        }
-                        _ => String::new(),
-                    }
-                }
+                Expr::Function(f) => eval_aggregate(f, group_rows).display(),
                 other => {
                     if let Some(ki) = group_by_exprs
                         .iter()
@@ -3750,6 +4207,156 @@ fn agg_arg(f: &Function, row: &Row) -> Value {
         _ => None,
     }
     .unwrap_or(Value::Null)
+}
+
+fn eval_aggregate(f: &Function, group_rows: &[&Row]) -> Value {
+    let name = f
+        .name
+        .0
+        .last()
+        .map(ident_value)
+        .unwrap_or("")
+        .to_lowercase();
+    match name.as_str() {
+        "count" if is_distinct(f) => {
+            let mut seen: Vec<Value> = Vec::new();
+            for r in group_rows {
+                let v = agg_arg(f, r);
+                if !matches!(v, Value::Null) && !seen.contains(&v) {
+                    seen.push(v);
+                }
+            }
+            Value::Int(seen.len() as i64)
+        }
+        "count" => Value::Int(group_rows.len() as i64),
+        "group_concat" | "string_agg" => {
+            let sep = agg_separator(f);
+            Value::Str(
+                group_rows
+                    .iter()
+                    .map(|r| agg_arg(f, r))
+                    .filter(|v| !matches!(v, Value::Null))
+                    .map(|v| v.display())
+                    .collect::<Vec<_>>()
+                    .join(&sep),
+            )
+        }
+        "sum" => Value::Float(
+            group_rows
+                .iter()
+                .filter_map(|r| agg_arg(f, r).as_f64())
+                .sum(),
+        ),
+        "min" => group_rows
+            .iter()
+            .map(|r| agg_arg(f, r))
+            .min_by(|a, b| a.cmp_val(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(Value::Null),
+        "max" => group_rows
+            .iter()
+            .map(|r| agg_arg(f, r))
+            .max_by(|a, b| a.cmp_val(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(Value::Null),
+        "avg" => {
+            let vals: Vec<f64> = group_rows
+                .iter()
+                .filter_map(|r| agg_arg(f, r).as_f64())
+                .collect();
+            if vals.is_empty() {
+                Value::Null
+            } else {
+                Value::Float(vals.iter().sum::<f64>() / vals.len() as f64)
+            }
+        }
+        _ => Value::Null,
+    }
+}
+
+fn value_to_expr(v: &Value) -> Expr {
+    match v {
+        Value::Int(n) => Expr::Value(SqlValue::Number(n.to_string(), false).with_empty_span()),
+        Value::Float(n) => Expr::Value(SqlValue::Number(n.to_string(), false).with_empty_span()),
+        Value::Bool(b) => Expr::Value(SqlValue::Boolean(*b).with_empty_span()),
+        Value::Str(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone()).with_empty_span()),
+        Value::Null => Expr::Value(SqlValue::Null.with_empty_span()),
+    }
+}
+
+fn substitute_having_expr(
+    expr: &Expr,
+    group_by_exprs: &[Expr],
+    key_vals: &[Value],
+    group_rows: &[&Row],
+) -> Expr {
+    match expr {
+        Expr::Function(f) if is_aggregate_name(&func_name(f)) => {
+            value_to_expr(&eval_aggregate(f, group_rows))
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(substitute_having_expr(
+                left,
+                group_by_exprs,
+                key_vals,
+                group_rows,
+            )),
+            op: op.clone(),
+            right: Box::new(substitute_having_expr(
+                right,
+                group_by_exprs,
+                key_vals,
+                group_rows,
+            )),
+        },
+        Expr::Nested(inner) => Expr::Nested(Box::new(substitute_having_expr(
+            inner,
+            group_by_exprs,
+            key_vals,
+            group_rows,
+        ))),
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(substitute_having_expr(
+                inner,
+                group_by_exprs,
+                key_vals,
+                group_rows,
+            )),
+        },
+        other => {
+            if let Some(ki) = group_by_exprs
+                .iter()
+                .position(|g| expr_structurally_eq(g, other))
+            {
+                value_to_expr(key_vals.get(ki).unwrap_or(&Value::Null))
+            } else {
+                other.clone()
+            }
+        }
+    }
+}
+
+fn eval_having(
+    having: &Expr,
+    _projection: &[SelectItem],
+    group_by_exprs: &[Expr],
+    key_vals: &[Value],
+    group_rows: &[&Row],
+) -> bool {
+    let substituted = substitute_having_expr(having, group_by_exprs, key_vals, group_rows);
+    let dummy = Row {
+        columns: vec![],
+        values: vec![],
+    };
+    eval_expr(&substituted, &dummy).is_truthy()
+}
+
+fn func_name(f: &Function) -> String {
+    f.name
+        .0
+        .last()
+        .map(ident_value)
+        .unwrap_or("")
+        .to_lowercase()
 }
 
 fn is_distinct(f: &Function) -> bool {
@@ -3800,15 +4407,118 @@ fn apply_order_by(rows: &mut [(Row, Vec<String>)], kind: &OrderByKind) {
     });
 }
 
-fn apply_limit(mut rows: Vec<Vec<String>>, limit: Option<&Expr>) -> Vec<Vec<String>> {
-    if let Some(lim) = limit {
-        let dummy = Row {
-            columns: vec![],
-            values: vec![],
-        };
-        if let Value::Int(n) = eval_expr(lim, &dummy) {
-            rows.truncate(n as usize);
+fn multiset_counts(rows: &[Vec<String>]) -> FxHashMap<Vec<String>, usize> {
+    let mut counts = FxHashMap::default();
+    for r in rows {
+        *counts.entry(r.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn dedup_rows(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    rows.retain(|r| seen.insert(r.clone()));
+    rows
+}
+
+fn combine_set_operation(
+    left: QueryOutput,
+    right: QueryOutput,
+    op: &SetOperator,
+    quantifier: &SetQuantifier,
+) -> Result<QueryOutput, MqdbError> {
+    let n_left = left.rows.first().map(|r| r.len());
+    let n_right = right.rows.first().map(|r| r.len());
+    if let (Some(a), Some(b)) = (n_left, n_right)
+        && a != b
+    {
+        return Err(MqdbError::SqlExec(format!(
+            "set operation: left side has {a} column(s), right side has {b}"
+        )));
+    }
+    let columns = if !left.columns.is_empty() {
+        left.columns
+    } else {
+        right.columns
+    };
+    let all = matches!(quantifier, SetQuantifier::All);
+    let rows = match (op, all) {
+        (SetOperator::Union, true) => {
+            let mut combined = left.rows;
+            combined.extend(right.rows);
+            combined
         }
+        (SetOperator::Union, false) => {
+            let mut combined = left.rows;
+            combined.extend(right.rows);
+            dedup_rows(combined)
+        }
+        (SetOperator::Intersect, true) => {
+            let mut right_counts = multiset_counts(&right.rows);
+            left.rows
+                .into_iter()
+                .filter(|r| match right_counts.get_mut(r) {
+                    Some(c) if *c > 0 => {
+                        *c -= 1;
+                        true
+                    }
+                    _ => false,
+                })
+                .collect()
+        }
+        (SetOperator::Intersect, false) => {
+            let right_set: std::collections::HashSet<_> = right.rows.into_iter().collect();
+            dedup_rows(
+                left.rows
+                    .into_iter()
+                    .filter(|r| right_set.contains(r))
+                    .collect(),
+            )
+        }
+        (SetOperator::Except | SetOperator::Minus, true) => {
+            let mut right_counts = multiset_counts(&right.rows);
+            left.rows
+                .into_iter()
+                .filter(|r| match right_counts.get_mut(r) {
+                    Some(c) if *c > 0 => {
+                        *c -= 1;
+                        false
+                    }
+                    _ => true,
+                })
+                .collect()
+        }
+        (SetOperator::Except | SetOperator::Minus, false) => {
+            let right_set: std::collections::HashSet<_> = right.rows.into_iter().collect();
+            dedup_rows(
+                left.rows
+                    .into_iter()
+                    .filter(|r| !right_set.contains(r))
+                    .collect(),
+            )
+        }
+    };
+    Ok(QueryOutput { columns, rows })
+}
+
+fn apply_limit_offset(
+    mut rows: Vec<Vec<String>>,
+    limit: Option<&Expr>,
+    offset: Option<&Expr>,
+) -> Vec<Vec<String>> {
+    let dummy = Row {
+        columns: vec![],
+        values: vec![],
+    };
+    if let Some(off) = offset
+        && let Value::Int(n) = eval_expr(off, &dummy)
+    {
+        rows.drain(..(n as usize).min(rows.len()));
+    }
+    if let Some(lim) = limit
+        && let Value::Int(n) = eval_expr(lim, &dummy)
+    {
+        rows.truncate(n as usize);
     }
     rows
 }
@@ -3964,6 +4674,13 @@ fn limit_expr_of(query: &Query) -> Option<Expr> {
     query.limit_clause.as_ref().and_then(|lc| match lc {
         LimitClause::LimitOffset { limit, .. } => limit.clone(),
         LimitClause::OffsetCommaLimit { limit, .. } => Some(limit.clone()),
+    })
+}
+
+fn offset_expr_of(query: &Query) -> Option<Expr> {
+    query.limit_clause.as_ref().and_then(|lc| match lc {
+        LimitClause::LimitOffset { offset, .. } => offset.as_ref().map(|o| o.value.clone()),
+        LimitClause::OffsetCommaLimit { offset, .. } => Some(offset.clone()),
     })
 }
 
@@ -4488,6 +5205,27 @@ mod tests {
     }
 
     #[test]
+    fn test_sql_documents_zone_map_columns() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT block_count, max_heading_depth, code_languages, frontmatter_keys \
+                 FROM documents",
+            )
+            .unwrap();
+        assert_eq!(
+            out.rows,
+            vec![vec![
+                "6".to_string(),
+                "2".to_string(),
+                "[\"rust\"]".to_string(),
+                "[]".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
     fn test_sql_select_all_blocks() {
         let store = make_store();
         let engine = SqlEngine::new(&store).unwrap();
@@ -4577,6 +5315,174 @@ mod tests {
             .execute("SELECT content FROM blocks LIMIT 2")
             .unwrap();
         assert_eq!(out.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_sql_offset() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let all = engine
+            .execute("SELECT content FROM blocks ORDER BY pre")
+            .unwrap();
+        let offset = engine
+            .execute("SELECT content FROM blocks ORDER BY pre LIMIT 100 OFFSET 2")
+            .unwrap();
+        assert_eq!(offset.rows, all.rows[2..]);
+    }
+
+    #[test]
+    fn test_sql_offset_past_end_returns_empty() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT content FROM blocks LIMIT 100 OFFSET 1000")
+            .unwrap();
+        assert!(out.rows.is_empty());
+    }
+
+    #[test]
+    fn test_sql_having() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT block_type, count(*) FROM blocks GROUP BY block_type \
+                 HAVING count(*) > 1 ORDER BY block_type",
+            )
+            .unwrap();
+        assert_eq!(
+            out.rows,
+            vec![
+                vec!["heading".to_string(), "3".to_string()],
+                vec!["paragraph".to_string(), "2".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sql_union() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT content FROM blocks WHERE block_type = 'heading' \
+                 UNION SELECT content FROM blocks WHERE block_type = 'heading'",
+            )
+            .unwrap();
+        assert_eq!(out.rows.len(), 3);
+
+        let out_all = engine
+            .execute(
+                "SELECT content FROM blocks WHERE block_type = 'heading' \
+                 UNION ALL SELECT content FROM blocks WHERE block_type = 'heading'",
+            )
+            .unwrap();
+        assert_eq!(out_all.rows.len(), 6);
+    }
+
+    #[test]
+    fn test_sql_intersect_and_except() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let intersect = engine
+            .execute(
+                "SELECT content FROM blocks WHERE block_type = 'heading' \
+                 INTERSECT SELECT content FROM blocks WHERE content = 'Architecture'",
+            )
+            .unwrap();
+        assert_eq!(intersect.rows, vec![vec!["Architecture".to_string()]]);
+
+        let except = engine
+            .execute(
+                "SELECT content FROM blocks WHERE block_type = 'heading' \
+                 EXCEPT SELECT content FROM blocks WHERE content = 'Architecture'",
+            )
+            .unwrap();
+        assert_eq!(except.rows.len(), 2);
+        assert!(!except.rows.iter().any(|r| r[0] == "Architecture"));
+    }
+
+    #[test]
+    fn test_sql_union_column_count_mismatch_errors() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine
+            .execute("SELECT content FROM blocks UNION SELECT content, block_type FROM blocks")
+            .unwrap_err();
+        assert!(err.to_string().contains("column"));
+    }
+
+    #[test]
+    fn test_sql_date_functions() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT date_trunc('month', '2024-03-15'), \
+                 date_diff('day', '2024-01-01', '2024-03-15'), \
+                 date_diff('month', '2024-01-01', '2024-03-15'), \
+                 date_add('2024-01-31', 1, 'month'), \
+                 date_sub('2024-03-15', 10, 'day'), \
+                 strftime('%Y/%m/%d', '2024-03-15')",
+            )
+            .unwrap();
+        assert_eq!(
+            out.rows,
+            vec![vec![
+                "2024-03-01".to_string(),
+                "74".to_string(),
+                "2".to_string(),
+                "2024-02-29".to_string(),
+                "2024-03-05".to_string(),
+                "2024/03/15".to_string(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn test_sql_extract() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT EXTRACT(YEAR FROM '2024-03-15T10:30:00'), EXTRACT(HOUR FROM '2024-03-15T10:30:00')")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["2024".to_string(), "10".to_string()]]);
+    }
+
+    #[test]
+    fn test_sql_regexp_operator() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT content FROM blocks WHERE content REGEXP '^Arch.*ure$'")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["Architecture".to_string()]]);
+
+        let negated = engine
+            .execute("SELECT content FROM blocks WHERE content NOT REGEXP '^Arch'")
+            .unwrap();
+        assert!(!negated.rows.iter().any(|r| r[0] == "Architecture"));
+    }
+
+    #[test]
+    fn test_sql_regexp_functions() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT regexp_like('hello world', 'wor.d'), \
+                 regexp_replace('hello world', 'o', '0'), \
+                 regexp_extract('id-1234', '(\\d+)', 1)",
+            )
+            .unwrap();
+        assert_eq!(
+            out.rows,
+            vec![vec![
+                "true".to_string(),
+                "hell0 w0rld".to_string(),
+                "1234".to_string(),
+            ]]
+        );
     }
 
     #[test]
@@ -4762,6 +5668,52 @@ mod tests {
         // total rows
         let all = engine.execute("SELECT * FROM notes").unwrap();
         assert_eq!(all.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_ddl_primary_key_rejects_null_and_duplicate() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute("CREATE TABLE notes (id TEXT PRIMARY KEY, body TEXT)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO notes VALUES ('1', 'hello')")
+            .unwrap();
+
+        let dup = engine
+            .execute("INSERT INTO notes VALUES ('1', 'again')")
+            .unwrap_err();
+        assert!(dup.to_string().contains("UNIQUE"));
+
+        let null = engine
+            .execute("INSERT INTO notes (body) VALUES ('no id')")
+            .unwrap_err();
+        assert!(null.to_string().contains("NOT NULL"));
+
+        // Rejected batch must not leave partial rows committed.
+        let all = engine.execute("SELECT * FROM notes").unwrap();
+        assert_eq!(all.rows.len(), 1);
+    }
+
+    #[test]
+    fn test_ddl_table_level_unique_constraint() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute("CREATE TABLE pairs (a TEXT, b TEXT, UNIQUE (a, b))")
+            .unwrap();
+        engine
+            .execute("INSERT INTO pairs VALUES ('x', 'y')")
+            .unwrap();
+        // Same 'a' alone is fine — uniqueness is on the (a, b) pair.
+        engine
+            .execute("INSERT INTO pairs VALUES ('x', 'z')")
+            .unwrap();
+        let dup = engine
+            .execute("INSERT INTO pairs VALUES ('x', 'y')")
+            .unwrap_err();
+        assert!(dup.to_string().contains("UNIQUE"));
     }
 
     // CREATE TABLE AS SELECT
@@ -5501,6 +6453,81 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn test_transaction_rolls_back_custom_table() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE notes (id TEXT)").unwrap();
+        engine.execute("BEGIN").unwrap();
+        engine.execute("INSERT INTO notes VALUES ('1')").unwrap();
+        assert_eq!(engine.execute("SELECT * FROM notes").unwrap().rows.len(), 1);
+        engine.execute("ROLLBACK").unwrap();
+        assert_eq!(engine.execute("SELECT * FROM notes").unwrap().rows.len(), 0);
+    }
+
+    #[test]
+    fn test_transaction_commit_keeps_changes() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE notes (id TEXT)").unwrap();
+        engine.execute("BEGIN").unwrap();
+        engine.execute("INSERT INTO notes VALUES ('1')").unwrap();
+        engine.execute("COMMIT").unwrap();
+        assert_eq!(engine.execute("SELECT * FROM notes").unwrap().rows.len(), 1);
+        let err = engine.execute("COMMIT").unwrap_err();
+        assert!(err.to_string().contains("no transaction"));
+    }
+
+    #[test]
+    fn test_transaction_nested_begin_errors() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("BEGIN").unwrap();
+        let err = engine.execute("BEGIN").unwrap_err();
+        assert!(err.to_string().contains("already in progress"));
+        engine.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn test_transaction_rollback_without_begin_errors() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        let err = engine.execute("ROLLBACK").unwrap_err();
+        assert!(err.to_string().contains("no transaction"));
+    }
+
+    #[test]
+    fn write_back_transaction_rollback_reverts_in_memory_blocks_but_flags_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", "# Old Title\n\nBody text\n");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+
+        store.execute_sql_mut("BEGIN").unwrap();
+        store
+            .execute_sql_mut("UPDATE blocks SET content = 'New Title' WHERE block_type = 'heading'")
+            .unwrap();
+        assert!(
+            store.documents()[0]
+                .blocks
+                .iter()
+                .any(|b| b.content == "New Title")
+        );
+
+        let out = store.execute_sql_mut("ROLLBACK").unwrap();
+        assert!(out.rows[0][0].contains("cannot be reverted"));
+
+        assert!(
+            store.documents()[0]
+                .blocks
+                .iter()
+                .any(|b| b.content == "Old Title")
+        );
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "# New Title\n\nBody text\n");
     }
 
     #[test]

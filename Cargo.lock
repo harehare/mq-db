@@ -1841,6 +1841,7 @@ dependencies = [
  "mq-lang",
  "mq-markdown",
  "ratatui",
+ "regex",
  "rstest",
  "rusqlite",
  "rustc-hash",
