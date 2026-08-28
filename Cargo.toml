@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 mimalloc = {version = "0.1.48", optional = true}
 rustc-hash = "2"
 base64 = "0.22"
+regex = "1.13.1"
 
 [dev-dependencies]
 tempfile = "3"

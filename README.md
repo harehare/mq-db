@@ -44,9 +44,11 @@ flowchart TD
 - **`EXPLAIN` / `EXPLAIN ANALYZE`**: see the zone-map/index/join plan a query resolves to, with actual row/timing stats under `ANALYZE`
 - **Incremental re-indexing**: re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
 - **SQL `INSERT`/`UPDATE`/`DELETE` with write-back**: add, edit, or remove `blocks` and push the change back to the source Markdown file, opt-in via `--write-back`
-- **DDL support**: `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables
+- **DDL support**: `CREATE TABLE`, `INSERT INTO`, `DROP TABLE` for in-memory custom tables, with `NOT NULL`/`UNIQUE`/`PRIMARY KEY` constraints enforced on `INSERT`
 - **`CREATE VIEW`**: persisted, live (non-materialized) named queries, re-run on every reference
-- **Comprehensive SQL function library**: string, numeric, null-handling, `CASE`, and aggregate functions comparable to a general-purpose RDBMS
+- **`GROUP BY ... HAVING`, `LIMIT ... OFFSET`, `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`**: standard aggregate filtering, pagination, and set operations across `SELECT`s
+- **`BEGIN`/`COMMIT`/`ROLLBACK`**: transactions for custom-table and view DDL/DML
+- **Comprehensive SQL function library**: string, numeric, null-handling, date/time (`date_trunc`/`date_diff`/`date_add`/`strftime`/`EXTRACT`), regex (`REGEXP`, `regexp_replace`, `regexp_extract`), `CASE`, and aggregate functions comparable to a general-purpose RDBMS
 - **`mq()` scalar function**: run an mq program against Markdown content inline in SQL
 - **`read_csv()` / `read_json()` table functions**: query external CSV/JSON Lines files directly in `FROM`, no import step
 - **`ATTACH DATABASE` / `DETACH`**: query across multiple `.mq-db` stores as `<alias>.blocks`, session-scoped like SQLite
