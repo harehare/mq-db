@@ -1,9 +1,9 @@
 # Full-Text Search
 
-`match()`/`score()` are SQL functions backed by a persisted per-document `TermIndex` (a tokenized inverted index), for index-accelerated relevance search over block content.
+`match()`/`score()`/`bm25()` are SQL functions backed by a persisted per-document `TermIndex` (a tokenized inverted index), for index-accelerated relevance search over block content.
 
 ```sql
-SELECT content, score(content, 'error handling') AS relevance
+SELECT content, bm25(content, 'error handling') AS relevance
 FROM blocks
 WHERE match(content, 'error handling')
 ORDER BY relevance DESC;
@@ -11,6 +11,7 @@ ORDER BY relevance DESC;
 
 - `match(content, query)`: true iff every tokenized term in `query` appears in `content`. Index-accelerated when `content` is a bare column reference and `query` is a string literal.
 - `score(content, query)`: a simple term-frequency relevance score for `query` against `content` (no IDF weighting; see [Storage Format](storage-format.md)).
+- `bm25(content, query)`: Okapi BM25 relevance score, IDF-weighted across the whole store (`k1=1.2`, `b=0.75`, not configurable). Prefer this over `score()` when documents vary a lot in length or in how common a query term is.
 
 ## `find` (CLI shortcut)
 
