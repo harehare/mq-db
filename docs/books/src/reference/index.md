@@ -6,7 +6,7 @@ Technical reference for the SQL surface and the on-disk/in-memory data model.
 - [Built-in Functions](sql-functions.md): mq-db-specific, string, numeric, null-handling, and aggregate functions
 - [DDL Statements](sql-ddl.md): `CREATE TABLE`, `INSERT INTO`, `DROP TABLE`, views, `ATTACH`/`DETACH`, and friends
 - [CTEs (WITH / WITH RECURSIVE)](cte.md): named subqueries and recursive queries
-- [Full-Text Search](full-text-search.md): `match()`/`score()` and the `find` CLI shortcut
+- [Full-Text Search](full-text-search.md): `match()`/`score()`/`bm25()` and the `find` CLI shortcut
 - [EXPLAIN / EXPLAIN ANALYZE](explain.md): inspect and profile a query's index/join plan
 - [External Files](external-files.md): `read_csv()`/`read_json()` table functions
 - [Write-Back](write-back.md): `INSERT`/`UPDATE`/`DELETE` that edit the source Markdown file

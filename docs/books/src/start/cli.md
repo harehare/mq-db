@@ -52,7 +52,7 @@ mq-db list --db store.mq-db --format json
 
 ## `find`
 
-Full-text search shortcut for `match()`/`score()`, no SQL needed. See [Full-Text Search](../reference/full-text-search.md).
+Full-text search shortcut for `match()`/`bm25()`, no SQL needed. See [Full-Text Search](../reference/full-text-search.md).
 
 ```bash
 mq-db find "error handling" --db store.mq-db

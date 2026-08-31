@@ -9,6 +9,7 @@
 | `json_extract(json, path)` | Extract a value from a JSON string |
 | `match(content, query)` | Full-text search: true iff every tokenized term in `query` appears in `content`; index-accelerated when `content` is a bare column reference and `query` is a string literal. See [Full-Text Search](full-text-search.md) |
 | `score(content, query)` | Simple term-frequency relevance score for `query` against `content` (no IDF, see [Storage Format](storage-format.md)) |
+| `bm25(content, query)` | Okapi BM25 relevance score, IDF-weighted across the whole store (`k1=1.2`, `b=0.75`) |
 
 ```sql
 -- Hierarchy query: everything nested under a heading

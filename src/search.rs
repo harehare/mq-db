@@ -12,7 +12,7 @@ pub struct FindHit {
 
 /// Top `limit` hits for `query`, ranked by relevance.
 ///
-/// Adds a substring fallback to `match()`/`score()` because
+/// Adds a substring fallback to `match()`/`bm25()` because
 /// [`crate::indexes::tokenize`] treats a punctuation-free CJK run as one
 /// token, so a query for part of that run would otherwise never match.
 pub fn find_hits(
@@ -23,7 +23,7 @@ pub fn find_hits(
     let q = query.replace('\'', "''");
     let sql = format!(
         "SELECT d.path AS path, b.block_type AS type, b.content AS content, \
-         score(b.content, '{q}') AS score \
+         bm25(b.content, '{q}') AS score \
          FROM blocks b JOIN documents d ON d.id = b.document_id \
          WHERE match(b.content, '{q}') OR b.content LIKE '%{q}%' \
          ORDER BY score DESC, path ASC \

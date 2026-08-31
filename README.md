@@ -40,7 +40,7 @@ flowchart TD
 - **Zone Maps**: per-document statistics skip irrelevant files before scanning any blocks
 - **Dual query engines**: SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
 - **`WITH` / `WITH RECURSIVE` support**: common table expressions, usable in `FROM`, `JOIN`, and subqueries; recursive CTEs via iterative fixed-point evaluation
-- **Full-text search**: `match()`/`score()` SQL functions backed by a persisted per-document inverted index
+- **Full-text search**: `match()`/`score()`/`bm25()` SQL functions backed by a persisted per-document inverted index
 - **`EXPLAIN` / `EXPLAIN ANALYZE`**: see the zone-map/index/join plan a query resolves to, with actual row/timing stats under `ANALYZE`
 - **Incremental re-indexing**: re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
 - **SQL `INSERT`/`UPDATE`/`DELETE` with write-back**: add, edit, or remove `blocks` and push the change back to the source Markdown file, opt-in via `--write-back`
@@ -141,7 +141,7 @@ mq-db list --db store.mq-db --format json   # also: csv, tsv, markdown, html
 
 ### Quick full-text search
 
-`find` is a shortcut for `match()`/`score()` full-text search, no SQL needed. It falls back to a case-insensitive substring match too, so partial CJK queries still hit. Results show a snippet centred on the match, with matched terms highlighted when stdout is a terminal (respects `NO_COLOR`). See [Full-Text Search](https://db.mqlang.org/book/reference/full-text-search) for details and known limitations.
+`find` is a shortcut for `match()`/`bm25()` full-text search, no SQL needed. It falls back to a case-insensitive substring match too, so partial CJK queries still hit. Results show a snippet centred on the match, with matched terms highlighted when stdout is a terminal (respects `NO_COLOR`). See [Full-Text Search](https://db.mqlang.org/book/reference/full-text-search) for details and known limitations.
 
 ```bash
 mq-db find "error handling" --db store.mq-db
@@ -196,7 +196,7 @@ mq-db sql "SELECT mq('.h1 | to_text', content) AS title FROM blocks WHERE block_
 The SQL dialect also has CTEs, full-text search, `EXPLAIN`, external-file table functions, cross-store `ATTACH`, write-back DML, custom tables, and live views. Full reference and examples are in the book:
 
 - [CTEs (`WITH` / `WITH RECURSIVE`)](https://db.mqlang.org/book/reference/cte)
-- [Full-Text Search (`match()` / `score()`)](https://db.mqlang.org/book/reference/full-text-search)
+- [Full-Text Search (`match()` / `score()` / `bm25()`)](https://db.mqlang.org/book/reference/full-text-search)
 - [`EXPLAIN` / `EXPLAIN ANALYZE`](https://db.mqlang.org/book/reference/explain)
 - [External Files (`read_csv()` / `read_json()`)](https://db.mqlang.org/book/reference/external-files)
 - [DDL Statements (custom tables, views, `ATTACH`/`DETACH`)](https://db.mqlang.org/book/reference/sql-ddl)
