@@ -48,7 +48,7 @@ Flat Block Vector (pre/post integers)
 - **Zone Maps**: per-document statistics skip irrelevant files before scanning any blocks
 - **Dual query engines**: SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
 - **`WITH` / `WITH RECURSIVE` support**: common table expressions, see [CTEs](reference/cte.md)
-- **Full-text search**: `match()`/`score()` SQL functions, see [Full-Text Search](reference/full-text-search.md)
+- **Full-text search**: `match()`/`score()`/`bm25()` SQL functions, see [Full-Text Search](reference/full-text-search.md)
 - **`EXPLAIN` / `EXPLAIN ANALYZE`**: inspect and profile a query's plan, see [EXPLAIN](reference/explain.md)
 - **SQL `INSERT`/`UPDATE`/`DELETE` with write-back**: edit `blocks` and push the change back to the source file, see [Write-Back](reference/write-back.md)
 - **DDL support**: `CREATE TABLE`, `INSERT INTO`, `DROP TABLE`, and views, see [DDL Statements](reference/sql-ddl.md)

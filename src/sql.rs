@@ -24,6 +24,7 @@
 //! | `under(pre, post, anc_pre, anc_post)` | O(1) interval ancestor check |
 //! | `json_extract(json, path)` | Extract value from JSON string |
 //! | `mq(program, content)` | Run an mq program against Markdown content |
+//! | `bm25(content, query)` | Okapi BM25 relevance score (IDF-weighted, corpus-wide; `k1=1.2`, `b=0.75`) |
 //! | `count`/`min`/`max`/`sum`/`avg`/`group_concat`/`string_agg` | Aggregates (`count` and `group_concat`/`string_agg` support `DISTINCT`); `GROUP BY ... HAVING` filters on them |
 //! | `lower`/`upper`/`length`/`trim`/`ltrim`/`rtrim`/`concat`/`concat_ws`/`replace`/`left`/`right`/`lpad`/`rpad`/`reverse`/`repeat`/`initcap`/`ascii`/`chr`/`instr`/`split_part`/`substring`/`substr`/`position` | String functions |
 //! | `REGEXP`/`RLIKE` operator, `regexp_like`/`regexp_replace`/`regexp_extract` | Regular-expression matching |
@@ -687,6 +688,71 @@ fn ok_result() -> QueryOutput {
     }
 }
 
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
+
+// Corpus-wide stats for `bm25()`, built once per `execute()` call.
+thread_local! {
+    static BM25_CORPUS: std::cell::RefCell<Option<std::rc::Rc<Bm25Corpus>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct Bm25Corpus {
+    n: u64,
+    avgdl: f64,
+    df: FxHashMap<String, u32>,
+}
+
+impl Bm25Corpus {
+    fn build(indexes: &[DocumentIndex]) -> Self {
+        let mut n: u64 = 0;
+        let mut total_tokens: u64 = 0;
+        let mut df: FxHashMap<String, u32> = FxHashMap::default();
+        for idx in indexes {
+            n += u64::from(idx.term.block_count);
+            total_tokens += idx.term.total_token_count;
+            for (term, count) in idx.term.document_frequencies() {
+                *df.entry(term.to_string()).or_default() += count;
+            }
+        }
+        let avgdl = if n == 0 {
+            0.0
+        } else {
+            total_tokens as f64 / n as f64
+        };
+        Self { n, avgdl, df }
+    }
+
+    fn score(&self, content: &str, query: &str) -> f64 {
+        if self.n == 0 {
+            return 0.0;
+        }
+        let content_terms = tokenize(content);
+        let dl = content_terms.len() as f64;
+        if dl == 0.0 {
+            return 0.0;
+        }
+        let mut freq: FxHashMap<&str, u32> = FxHashMap::default();
+        for t in &content_terms {
+            *freq.entry(t.as_str()).or_default() += 1;
+        }
+        tokenize(query)
+            .iter()
+            .map(|qt| {
+                let f = f64::from(*freq.get(qt.as_str()).unwrap_or(&0));
+                if f == 0.0 {
+                    return 0.0;
+                }
+                let df = f64::from(*self.df.get(qt.as_str()).unwrap_or(&0));
+                let idf = ((self.n as f64 - df + 0.5) / (df + 0.5) + 1.0).ln();
+                let numer = f * (BM25_K1 + 1.0);
+                let denom = f + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / self.avgdl);
+                idf * numer / denom
+            })
+            .sum()
+    }
+}
+
 fn eval_expr(expr: &Expr, row: &Row) -> Value {
     match expr {
         Expr::Value(v) => eval_sql_value(&v.value),
@@ -1102,6 +1168,20 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
                 .map(|q| *freq.get(q.as_str()).unwrap_or(&0) as f64)
                 .sum();
             Value::Float(hits / content_terms.len() as f64)
+        }
+        "bm25" => {
+            let (Some(content), Some(query)) = (
+                args.first().and_then(Value::as_str),
+                args.get(1).and_then(Value::as_str),
+            ) else {
+                return Value::Float(0.0);
+            };
+            let score = BM25_CORPUS.with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .map(|corpus| corpus.score(content, query))
+            });
+            Value::Float(score.unwrap_or(0.0))
         }
 
         "lower" => str_fn(args, |s| s.to_lowercase()),
@@ -1959,6 +2039,22 @@ impl<'a> SqlEngine<'a> {
             .into_iter()
             .next()
             .ok_or_else(|| MqdbError::SqlParse("empty query".into()))?;
+
+        struct Bm25CorpusGuard;
+        impl Drop for Bm25CorpusGuard {
+            fn drop(&mut self) {
+                BM25_CORPUS.with(|c| *c.borrow_mut() = None);
+            }
+        }
+        let _bm25_guard = if trimmed.to_ascii_lowercase().contains("bm25(") {
+            BM25_CORPUS.with(|c| {
+                *c.borrow_mut() = Some(std::rc::Rc::new(Bm25Corpus::build(&self.indexes)))
+            });
+            Some(Bm25CorpusGuard)
+        } else {
+            None
+        };
+
         match stmt {
             Statement::Query(q) => self.exec_query(&q),
             Statement::CreateTable(ct) => self.exec_create_table(&ct),
@@ -5864,6 +5960,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out.rows[0][0], "rust rust rust other words here");
+    }
+
+    #[test]
+    fn bm25_ranks_rarer_term_higher_than_common_term() {
+        let mut store = DocumentStore::new();
+        store
+            .add_str("# Doc\n\nwidget\n\ncommon\n\ncommon\n\ncommon\n\ncommon\n")
+            .unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT content FROM blocks WHERE block_type = 'paragraph'
+                 ORDER BY bm25(content, 'widget common') DESC LIMIT 1",
+            )
+            .unwrap();
+        assert_eq!(out.rows[0][0], "widget");
+    }
+
+    #[test]
+    fn bm25_without_bm25_in_sql_text_is_unaffected() {
+        let mut store = DocumentStore::new();
+        store.add_str("# Doc\n\nfoo bar\n").unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute("SELECT content FROM blocks WHERE block_type = 'paragraph'")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "foo bar");
     }
 
     #[test]

@@ -237,26 +237,43 @@ pub fn tokenize(text: &str) -> Vec<String> {
 /// query terms).
 /// Complexity: build `O(n * avg_tokens)`, intersect `O(k)` for the rarest
 /// term's postings length.
+///
+/// `block_count`/`total_token_count` feed `bm25()`'s corpus stats in `sql.rs`.
 #[derive(Debug, Default, Clone)]
 pub struct TermIndex {
     postings: FxHashMap<String, Vec<u32>>,
+    pub block_count: u32,
+    pub total_token_count: u64,
 }
 
 impl TermIndex {
     pub fn build(blocks: &[Block]) -> Self {
         let mut postings: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+        let mut total_token_count: u64 = 0;
         for (idx, block) in blocks.iter().enumerate() {
+            let mut terms = tokenize(&block.content);
+            total_token_count += terms.len() as u64;
             // Sort + dedup the token list itself rather than allocating a
             // side `HashSet` per block — cheaper for the small token counts
             // typical of one block, and avoids an allocation per block.
-            let mut terms = tokenize(&block.content);
             terms.sort_unstable();
             terms.dedup();
             for term in terms {
                 postings.entry(term).or_default().push(idx as u32);
             }
         }
-        Self { postings }
+        Self {
+            postings,
+            block_count: blocks.len() as u32,
+            total_token_count,
+        }
+    }
+
+    /// `(term, document frequency)` pairs for this document.
+    pub fn document_frequencies(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.postings
+            .iter()
+            .map(|(term, list)| (term.as_str(), list.len() as u32))
     }
 
     /// AND-intersection of postings for `terms`. Empty `terms` → empty
@@ -423,6 +440,10 @@ impl DocumentIndex {
             }
         }
 
+        // TermIndex corpus stats
+        out.extend_from_slice(&self.term.block_count.to_le_bytes());
+        out.extend_from_slice(&self.term.total_token_count.to_le_bytes());
+
         out
     }
 
@@ -550,6 +571,14 @@ impl DocumentIndex {
             postings.insert(term, indices);
         }
 
+        // TermIndex corpus stats
+        let block_count = read_u32!();
+        let end = pos + 8;
+        if end > data.len() {
+            return Err(MqdbError::Storage("unexpected end of index data".into()));
+        }
+        let total_token_count = u64::from_le_bytes(data[pos..end].try_into().unwrap());
+
         Ok(DocumentIndex {
             bitmap: BitmapIndex { map: bitmap_map },
             btree: BTreeIndex { by_pre, by_post },
@@ -558,7 +587,11 @@ impl DocumentIndex {
                 by_lang,
                 by_depth,
             },
-            term: TermIndex { postings },
+            term: TermIndex {
+                postings,
+                block_count,
+                total_token_count,
+            },
         })
     }
 }

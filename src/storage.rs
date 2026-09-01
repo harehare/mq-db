@@ -786,6 +786,37 @@ mod tests {
     }
 
     #[test]
+    fn load_reads_v5_file_and_rebuilds_bm25_corpus_stats() {
+        use crate::SqlEngine;
+
+        let path = test_file_path("legacy-v5-load");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store
+            .add_str("# Doc\n\nThe quick brown fox jumps over the lazy dog\n")
+            .unwrap();
+        store.save(&path).unwrap();
+        patch_version(&path, 5);
+
+        let mut opened = DocumentStore::load(&path).unwrap();
+        opened.load_all_indexes().unwrap();
+        let engine = SqlEngine::new(&opened).unwrap();
+        let out = engine
+            .execute(
+                "SELECT content FROM blocks WHERE block_type = 'paragraph'
+                 ORDER BY bm25(content, 'fox') DESC LIMIT 1",
+            )
+            .unwrap();
+        assert_eq!(
+            out.rows[0][0],
+            "The quick brown fox jumps over the lazy dog"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
     fn migrate_rewrites_legacy_file_to_current_version() {
         let path = test_file_path("legacy-version-migrate");
         cleanup(&path);
