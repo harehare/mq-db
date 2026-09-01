@@ -176,22 +176,22 @@ struct Row {
 
 impl Row {
     fn get(&self, col: &str) -> Option<&Value> {
-        let col_lower = col.to_lowercase();
         if let Some(i) = self
             .columns
             .iter()
-            .position(|c| c.to_lowercase() == col_lower)
+            .position(|c| c.eq_ignore_ascii_case(col))
         {
             return self.values.get(i);
         }
-        // Try short name (strip "table." prefix from query)
-        let short = col_lower.split('.').next_back().unwrap_or(&col_lower);
-        // Match "alias.col" columns
+        let short = col.rsplit('.').next().unwrap_or(col);
         self.columns
             .iter()
             .position(|c| {
-                let cl = c.to_lowercase();
-                cl == col_lower || cl.split('.').next_back().unwrap_or(&cl) == short
+                c.eq_ignore_ascii_case(col)
+                    || c.rsplit('.')
+                        .next()
+                        .unwrap_or(c)
+                        .eq_ignore_ascii_case(short)
             })
             .and_then(|i| self.values.get(i))
     }
@@ -1905,8 +1905,19 @@ fn extract_json_key(json: &str, key: &str) -> Value {
     Value::Null
 }
 
-fn compile_regex(pattern: &str) -> Option<Regex> {
-    Regex::new(pattern).ok()
+thread_local! {
+    static REGEX_CACHE: std::cell::RefCell<FxHashMap<String, Option<std::rc::Rc<Regex>>>> =
+        std::cell::RefCell::new(FxHashMap::default());
+}
+
+fn compile_regex(pattern: &str) -> Option<std::rc::Rc<Regex>> {
+    REGEX_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(pattern.to_string())
+            .or_insert_with(|| Regex::new(pattern).ok().map(std::rc::Rc::new))
+            .clone()
+    })
 }
 
 // LIKE pattern matching (% = .*, _ = any char)
@@ -3059,7 +3070,7 @@ impl<'a> SqlEngine<'a> {
             && matches!(where_expr.map(unwrap_nested), Some(Expr::Function(_)))
             && from_names_unshadowed_blocks(&select.from[0], &self.cte_scopes.borrow());
         if !where_fully_indexed && let Some(where_expr) = &select.selection {
-            let resolved = self.resolve_subqueries(where_expr)?;
+            let resolved = fold_constants(&self.resolve_subqueries(where_expr)?);
             rows.retain(|row| eval_expr(&resolved, row).is_truthy());
         }
 
@@ -3143,7 +3154,7 @@ impl<'a> SqlEngine<'a> {
                 | JoinOperator::Join(JoinConstraint::On(on))
                 | JoinOperator::Left(JoinConstraint::On(on))
                 | JoinOperator::LeftOuter(JoinConstraint::On(on)) => {
-                    let resolved = self.resolve_subqueries(on)?;
+                    let resolved = fold_constants(&self.resolve_subqueries(on)?);
                     let left_cols = rows.first().map(|r| r.columns.clone()).unwrap_or_default();
                     let right_cols = right.first().map(|r| r.columns.clone()).unwrap_or_default();
                     rows = match find_equi_join_exprs(&resolved, &left_cols, &right_cols) {
@@ -3593,7 +3604,7 @@ fn collect_matched_edits(
         None,
     )?;
     if let Some(sel) = selection {
-        let resolved = engine.resolve_subqueries(sel)?;
+        let resolved = fold_constants(&engine.resolve_subqueries(sel)?);
         rows.retain(|row| eval_expr(&resolved, row).is_truthy());
     }
 
@@ -4376,6 +4387,71 @@ fn value_to_expr(v: &Value) -> Expr {
         Value::Str(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone()).with_empty_span()),
         Value::Null => Expr::Value(SqlValue::Null.with_empty_span()),
     }
+}
+
+fn is_constant_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(_) => true,
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Nested(expr)
+        | Expr::Cast { expr, .. } => is_constant_expr(expr),
+        Expr::BinaryOp { left, right, .. } => is_constant_expr(left) && is_constant_expr(right),
+        Expr::Between {
+            expr, low, high, ..
+        } => is_constant_expr(expr) && is_constant_expr(low) && is_constant_expr(high),
+        Expr::InList { expr, list, .. } => {
+            is_constant_expr(expr) && list.iter().all(is_constant_expr)
+        }
+        _ => false,
+    }
+}
+
+fn fold_constants(expr: &Expr) -> Expr {
+    let folded = match expr {
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(fold_constants(left)),
+            op: op.clone(),
+            right: Box::new(fold_constants(right)),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(fold_constants(expr)),
+        },
+        Expr::Nested(inner) => Expr::Nested(Box::new(fold_constants(inner))),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(fold_constants(inner))),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(fold_constants(inner))),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: Box::new(fold_constants(expr)),
+            negated: *negated,
+            low: Box::new(fold_constants(low)),
+            high: Box::new(fold_constants(high)),
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(fold_constants(expr)),
+            list: list.iter().map(fold_constants).collect(),
+            negated: *negated,
+        },
+        other => other.clone(),
+    };
+    if matches!(folded, Expr::Value(_)) || !is_constant_expr(&folded) {
+        return folded;
+    }
+    let dummy = Row {
+        columns: vec![],
+        values: vec![],
+    };
+    value_to_expr(&eval_expr(&folded, &dummy))
 }
 
 fn substitute_having_expr(
