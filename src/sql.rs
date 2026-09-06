@@ -581,18 +581,35 @@ fn output_to_rows(out: &QueryOutput, prefix: &str) -> Vec<Row> {
         .collect()
 }
 
+fn combine_rows(l: &Row, r: &Row) -> Row {
+    let mut cols = l.columns.clone();
+    cols.extend(r.columns.iter().cloned());
+    let mut vals = l.values.clone();
+    vals.extend(r.values.iter().cloned());
+    Row {
+        columns: cols,
+        values: vals,
+    }
+}
+
+/// Extends a left row with NULLs for every right-hand column, for a `LEFT
+/// JOIN` left row that found no matching partner.
+fn null_extend_row(l: &Row, right_cols: &[String]) -> Row {
+    let mut cols = l.columns.clone();
+    cols.extend(right_cols.iter().cloned());
+    let mut vals = l.values.clone();
+    vals.extend(right_cols.iter().map(|_| Value::Null));
+    Row {
+        columns: cols,
+        values: vals,
+    }
+}
+
 fn cross_join(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
     let mut out = Vec::with_capacity(left.len() * right.len());
     for l in &left {
         for r in &right {
-            let mut cols = l.columns.clone();
-            cols.extend(r.columns.iter().cloned());
-            let mut vals = l.values.clone();
-            vals.extend(r.values.iter().cloned());
-            out.push(Row {
-                columns: cols,
-                values: vals,
-            });
+            out.push(combine_rows(l, r));
         }
     }
     out
@@ -601,13 +618,17 @@ fn cross_join(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
 /// Equi-join fast path: hashes `right` by `right_key_expr` and probes it with
 /// `left_key_expr` per left row instead of the full `left * right` cross
 /// product. `full_predicate` is still checked per candidate pair, so results
-/// match `cross_join` + `.retain(full_predicate)` exactly.
+/// match `cross_join` + `.retain(full_predicate)` exactly. When `outer` is
+/// set (a `LEFT JOIN`), a left row with no matching — or no truthy-predicate
+/// — right row is still emitted once, NULL-extended over `right_cols`.
 fn hash_equi_join(
     left: Vec<Row>,
     right: Vec<Row>,
     left_key_expr: &Expr,
     right_key_expr: &Expr,
     full_predicate: &Expr,
+    outer: bool,
+    right_cols: &[String],
 ) -> Vec<Row> {
     let mut buckets: FxHashMap<JoinKey, Vec<usize>> = FxHashMap::default();
     for (i, r) in right.iter().enumerate() {
@@ -618,25 +639,20 @@ fn hash_equi_join(
 
     let mut out = Vec::new();
     for l in &left {
-        let Some(key) = value_join_key(&eval_expr(left_key_expr, l)) else {
-            continue;
-        };
-        let Some(candidates) = buckets.get(&key) else {
-            continue;
-        };
-        for &i in candidates {
-            let r = &right[i];
-            let mut cols = l.columns.clone();
-            cols.extend(r.columns.iter().cloned());
-            let mut vals = l.values.clone();
-            vals.extend(r.values.iter().cloned());
-            let combined = Row {
-                columns: cols,
-                values: vals,
-            };
-            if eval_expr(full_predicate, &combined).is_truthy() {
-                out.push(combined);
+        let mut matched = false;
+        if let Some(key) = value_join_key(&eval_expr(left_key_expr, l))
+            && let Some(candidates) = buckets.get(&key)
+        {
+            for &i in candidates {
+                let combined = combine_rows(l, &right[i]);
+                if eval_expr(full_predicate, &combined).is_truthy() {
+                    matched = true;
+                    out.push(combined);
+                }
             }
+        }
+        if outer && !matched {
+            out.push(null_extend_row(l, right_cols));
         }
     }
     out
@@ -3056,6 +3072,21 @@ impl<'a> SqlEngine<'a> {
         let zone_filter = where_expr.filter(|_| single_unjoined_from);
         let mut rows = self.materialise_from_with_hint(&select.from, &hint, zone_filter)?;
 
+        // Best-effort "does this column exist" check, against the schema of
+        // whatever FROM actually materialised (joins included). Skipped when
+        // that's empty — a `FROM`-less `SELECT` (no schema at all) or a
+        // table with zero rows (nothing to infer a schema from) — rather
+        // than false-reject; the tradeoff is a real typo against an empty
+        // table still silently passing, same as before this check existed.
+        let known_columns: Vec<String> =
+            rows.first().map(|r| r.columns.clone()).unwrap_or_default();
+        if !known_columns.is_empty() {
+            if let Some(where_expr) = &select.selection {
+                validate_expr_columns(where_expr, &known_columns)?;
+            }
+            validate_projection_columns(&select.projection, &known_columns)?;
+        }
+
         // 2. WHERE (full predicate evaluation; index only pre-filtered)
         //
         // Exception: `WHERE match(content, 'q')` with nothing else ANDed in,
@@ -3070,23 +3101,84 @@ impl<'a> SqlEngine<'a> {
             && matches!(where_expr.map(unwrap_nested), Some(Expr::Function(_)))
             && from_names_unshadowed_blocks(&select.from[0], &self.cte_scopes.borrow());
         if !where_fully_indexed && let Some(where_expr) = &select.selection {
-            let resolved = fold_constants(&self.resolve_subqueries(where_expr)?);
-            rows.retain(|row| eval_expr(&resolved, row).is_truthy());
+            if expr_has_subquery(where_expr) {
+                // A subquery may be correlated (reference this row's
+                // columns), so it must be re-resolved per row rather than
+                // once up front.
+                let mut err = None;
+                rows.retain(|row| {
+                    if err.is_some() {
+                        return false;
+                    }
+                    match self.resolve_subqueries(where_expr, Some(row)) {
+                        Ok(resolved) => eval_expr(&fold_constants(&resolved), row).is_truthy(),
+                        Err(e) => {
+                            err = Some(e);
+                            false
+                        }
+                    }
+                });
+                if let Some(e) = err {
+                    return Err(e);
+                }
+            } else {
+                let resolved = fold_constants(&self.resolve_subqueries(where_expr, None)?);
+                rows.retain(|row| eval_expr(&resolved, row).is_truthy());
+            }
         }
 
         // 3. PROJECT / GROUP / ORDER / LIMIT
-        self.project_and_aggregate(select, rows, order_by, limit, offset)
+        self.project_and_aggregate(select, rows, order_by, limit, offset, &known_columns)
     }
 
-    fn resolve_subqueries(&self, expr: &Expr) -> Result<Expr, MqdbError> {
+    /// Resolves scalar subqueries, `[NOT] IN (SELECT ...)`, and
+    /// `[NOT] EXISTS (SELECT ...)` into constant `Expr`s so the rest of the
+    /// evaluator never has to know about them. When `outer_row` is given,
+    /// the subquery is first correlated against it (see
+    /// [`substitute_outer_refs_query`]) before being executed.
+    fn resolve_subqueries(&self, expr: &Expr, outer_row: Option<&Row>) -> Result<Expr, MqdbError> {
         match expr {
             Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
-                left: Box::new(self.resolve_subqueries(left)?),
+                left: Box::new(self.resolve_subqueries(left, outer_row)?),
                 op: op.clone(),
-                right: Box::new(self.resolve_subqueries(right)?),
+                right: Box::new(self.resolve_subqueries(right, outer_row)?),
+            }),
+            Expr::UnaryOp { op, expr: inner } => Ok(Expr::UnaryOp {
+                op: *op,
+                expr: Box::new(self.resolve_subqueries(inner, outer_row)?),
+            }),
+            Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(
+                self.resolve_subqueries(inner, outer_row)?,
+            ))),
+            Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(
+                self.resolve_subqueries(inner, outer_row)?,
+            ))),
+            Expr::InList {
+                expr: e,
+                list,
+                negated,
+            } => Ok(Expr::InList {
+                expr: Box::new(self.resolve_subqueries(e, outer_row)?),
+                list: list
+                    .iter()
+                    .map(|x| self.resolve_subqueries(x, outer_row))
+                    .collect::<Result<_, _>>()?,
+                negated: *negated,
+            }),
+            Expr::Between {
+                expr: e,
+                negated,
+                low,
+                high,
+            } => Ok(Expr::Between {
+                expr: Box::new(self.resolve_subqueries(e, outer_row)?),
+                negated: *negated,
+                low: Box::new(self.resolve_subqueries(low, outer_row)?),
+                high: Box::new(self.resolve_subqueries(high, outer_row)?),
             }),
             Expr::Subquery(q) => {
-                let out = self.exec_query(q)?;
+                let q = self.correlate_subquery(q, outer_row);
+                let out = self.exec_query(&q)?;
                 let val = out
                     .rows
                     .first()
@@ -3101,7 +3193,36 @@ impl<'a> SqlEngine<'a> {
                     .unwrap_or(Expr::Value(SqlValue::Null.with_empty_span()));
                 Ok(val)
             }
-            Expr::Nested(inner) => Ok(Expr::Nested(Box::new(self.resolve_subqueries(inner)?))),
+            Expr::InSubquery {
+                expr: e,
+                subquery,
+                negated,
+            } => {
+                let q = self.correlate_subquery(subquery, outer_row);
+                let out = self.exec_query(&q)?;
+                let needle_expr = self.resolve_subqueries(e, outer_row)?;
+                let empty = Row {
+                    columns: vec![],
+                    values: vec![],
+                };
+                let needle_val = eval_expr(&needle_expr, outer_row.unwrap_or(&empty));
+                let found = out.rows.iter().any(|r| {
+                    r.first()
+                        .is_some_and(|s| parse_display_value(s) == needle_val)
+                });
+                let result = if *negated { !found } else { found };
+                Ok(Expr::Value(SqlValue::Boolean(result).with_empty_span()))
+            }
+            Expr::Exists { subquery, negated } => {
+                let q = self.correlate_subquery(subquery, outer_row);
+                let out = self.exec_query(&q)?;
+                let exists = !out.rows.is_empty();
+                let result = if *negated { !exists } else { exists };
+                Ok(Expr::Value(SqlValue::Boolean(result).with_empty_span()))
+            }
+            Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
+                self.resolve_subqueries(inner, outer_row)?,
+            ))),
             Expr::Function(f) => {
                 let new_args = match &f.args {
                     FunctionArguments::List(al) => {
@@ -3111,7 +3232,9 @@ impl<'a> SqlEngine<'a> {
                             .map(|a| match a {
                                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
                                     Ok::<FunctionArg, MqdbError>(FunctionArg::Unnamed(
-                                        FunctionArgExpr::Expr(self.resolve_subqueries(e)?),
+                                        FunctionArgExpr::Expr(
+                                            self.resolve_subqueries(e, outer_row)?,
+                                        ),
                                     ))
                                 }
                                 _ => Ok(a.clone()),
@@ -3133,6 +3256,16 @@ impl<'a> SqlEngine<'a> {
         }
     }
 
+    /// Binds a nested query's free references to the outer row it's
+    /// correlated against (a no-op clone when there is no outer row, i.e.
+    /// this subquery sits somewhere that isn't evaluated per-row).
+    fn correlate_subquery(&self, query: &Query, outer_row: Option<&Row>) -> Query {
+        match outer_row {
+            Some(row) => substitute_outer_refs_query(query, row),
+            None => query.clone(),
+        }
+    }
+
     fn materialise_from_with_hint(
         &self,
         from: &[sqlparser::ast::TableWithJoins],
@@ -3149,21 +3282,43 @@ impl<'a> SqlEngine<'a> {
         for join in &from[0].joins {
             // Joined tables always full-scan (join partner)
             let right = self.table_rows_with_hint(&join.relation, &IndexHint::FullScan, None)?;
+            let outer = matches!(
+                &join.join_operator,
+                JoinOperator::Left(_) | JoinOperator::LeftOuter(_)
+            );
             match &join.join_operator {
                 JoinOperator::Inner(JoinConstraint::On(on))
                 | JoinOperator::Join(JoinConstraint::On(on))
                 | JoinOperator::Left(JoinConstraint::On(on))
                 | JoinOperator::LeftOuter(JoinConstraint::On(on)) => {
-                    let resolved = fold_constants(&self.resolve_subqueries(on)?);
+                    let resolved = fold_constants(&self.resolve_subqueries(on, None)?);
                     let left_cols = rows.first().map(|r| r.columns.clone()).unwrap_or_default();
                     let right_cols = right.first().map(|r| r.columns.clone()).unwrap_or_default();
                     rows = match find_equi_join_exprs(&resolved, &left_cols, &right_cols) {
-                        Some((left_key, right_key)) => {
-                            hash_equi_join(rows, right, left_key, right_key, &resolved)
-                        }
+                        Some((left_key, right_key)) => hash_equi_join(
+                            rows,
+                            right,
+                            left_key,
+                            right_key,
+                            &resolved,
+                            outer,
+                            &right_cols,
+                        ),
                         None => {
-                            let mut combined = cross_join(rows, right);
-                            combined.retain(|row| eval_expr(&resolved, row).is_truthy());
+                            let mut combined = Vec::new();
+                            for l in &rows {
+                                let mut matched = false;
+                                for r in &right {
+                                    let row = combine_rows(l, r);
+                                    if eval_expr(&resolved, &row).is_truthy() {
+                                        matched = true;
+                                        combined.push(row);
+                                    }
+                                }
+                                if outer && !matched {
+                                    combined.push(null_extend_row(l, &right_cols));
+                                }
+                            }
                             combined
                         }
                     };
@@ -3376,6 +3531,7 @@ impl<'a> SqlEngine<'a> {
         order_by: &Option<sqlparser::ast::OrderBy>,
         limit: Option<&Expr>,
         offset: Option<&Expr>,
+        known_columns: &[String],
     ) -> Result<QueryOutput, MqdbError> {
         let group_by_exprs: Vec<Expr> = match &select.group_by {
             GroupByExpr::Expressions(exprs, _) => exprs.clone(),
@@ -3384,7 +3540,12 @@ impl<'a> SqlEngine<'a> {
         let is_agg = has_aggregate(&select.projection);
 
         if is_agg || !group_by_exprs.is_empty() {
-            return self.aggregate(select, rows, limit, offset, &group_by_exprs);
+            if !known_columns.is_empty() {
+                for e in &group_by_exprs {
+                    validate_expr_columns(e, known_columns)?;
+                }
+            }
+            return self.aggregate(select, rows, order_by, limit, offset, &group_by_exprs);
         }
 
         // Plain SELECT
@@ -3397,9 +3558,25 @@ impl<'a> SqlEngine<'a> {
             })
             .collect();
 
-        // ORDER BY
-        if let Some(ob) = order_by {
-            apply_order_by(&mut result, &ob.kind);
+        // ORDER BY — a plain identifier may name a `SELECT ... AS x` alias
+        // (a computed value with no column behind it, e.g. `bm25(...) AS
+        // score`) rather than an input column, so resolve that first.
+        if let Some(ob) = order_by
+            && let OrderByKind::Expressions(exprs) = &ob.kind
+        {
+            let resolved: Vec<OrderByExpr> = exprs
+                .iter()
+                .map(|oe| OrderByExpr {
+                    expr: resolve_order_expr_alias(&oe.expr, &select.projection),
+                    ..oe.clone()
+                })
+                .collect();
+            if !known_columns.is_empty() {
+                for oe in &resolved {
+                    validate_expr_columns(&oe.expr, known_columns)?;
+                }
+            }
+            apply_order_by_exprs(&mut result, &resolved);
         }
 
         // DISTINCT
@@ -3429,6 +3606,7 @@ impl<'a> SqlEngine<'a> {
         &self,
         select: &Select,
         rows: Vec<Row>,
+        order_by: &Option<sqlparser::ast::OrderBy>,
         limit: Option<&Expr>,
         offset: Option<&Expr>,
         group_by_exprs: &[Expr],
@@ -3478,13 +3656,45 @@ impl<'a> SqlEngine<'a> {
             groups[*idx].1.push(row);
         }
 
-        let out_rows: Vec<Vec<String>> = groups
+        let mut filtered: Vec<&(Vec<Value>, Vec<&Row>)> = groups
             .iter()
             .filter(|(key_vals, group_rows)| {
                 select.having.as_ref().is_none_or(|h| {
                     eval_having(h, &select.projection, group_by_exprs, key_vals, group_rows)
                 })
             })
+            .collect();
+
+        if let Some(ob) = order_by
+            && let OrderByKind::Expressions(exprs) = &ob.kind
+        {
+            let sort_keys: Vec<(Expr, bool)> = exprs
+                .iter()
+                .map(|oe| {
+                    (
+                        resolve_order_expr_alias(&oe.expr, &select.projection),
+                        oe.options.asc == Some(false),
+                    )
+                })
+                .collect();
+            filtered.sort_by(|a, b| {
+                for (expr, desc) in &sort_keys {
+                    let va = eval_agg_expr_value(expr, group_by_exprs, &a.0, &a.1);
+                    let vb = eval_agg_expr_value(expr, group_by_exprs, &b.0, &b.1);
+                    let mut ord = va.cmp_val(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    if *desc {
+                        ord = ord.reverse();
+                    }
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        let out_rows: Vec<Vec<String>> = filtered
+            .iter()
             .map(|(key_vals, group_rows)| {
                 eval_agg_row(&select.projection, group_by_exprs, key_vals, group_rows)
             })
@@ -3604,7 +3814,7 @@ fn collect_matched_edits(
         None,
     )?;
     if let Some(sel) = selection {
-        let resolved = fold_constants(&engine.resolve_subqueries(sel)?);
+        let resolved = fold_constants(&engine.resolve_subqueries(sel, None)?);
         rows.retain(|row| eval_expr(&resolved, row).is_truthy());
     }
 
@@ -4389,6 +4599,346 @@ fn value_to_expr(v: &Value) -> Expr {
     }
 }
 
+/// Is `name` one of `columns`, matched the same way [`Row::get`] matches —
+/// exact (qualified) match first, then a bare/short-name match against
+/// either side.
+fn column_known(columns: &[String], name: &str) -> bool {
+    if columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+        return true;
+    }
+    let short = name.rsplit('.').next().unwrap_or(name);
+    columns.iter().any(|c| {
+        c.rsplit('.')
+            .next()
+            .unwrap_or(c)
+            .eq_ignore_ascii_case(short)
+    })
+}
+
+/// Collects every column reference (`Identifier`/`CompoundIdentifier`) in
+/// `expr` into `out`. Mirrors the `Expr` variants [`eval_expr`] and
+/// [`fold_constants`] already walk; an unhandled variant is simply not
+/// descended into, which only means a reference buried in it goes
+/// unchecked — never a false positive.
+fn collect_column_names(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Identifier(i) => out.push(i.value.clone()),
+        Expr::CompoundIdentifier(parts) => out.push(
+            parts
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_column_names(left, out);
+            collect_column_names(right, out);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Nested(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Floor { expr, .. }
+        | Expr::Extract { expr, .. } => collect_column_names(expr, out),
+        Expr::InList { expr, list, .. } => {
+            collect_column_names(expr, out);
+            for e in list {
+                collect_column_names(e, out);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_column_names(expr, out);
+            collect_column_names(low, out);
+            collect_column_names(high, out);
+        }
+        Expr::Like { expr, pattern, .. } | Expr::RLike { expr, pattern, .. } => {
+            collect_column_names(expr, out);
+            collect_column_names(pattern, out);
+        }
+        Expr::Position { expr, r#in } => {
+            collect_column_names(expr, out);
+            collect_column_names(r#in, out);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand {
+                collect_column_names(o, out);
+            }
+            for w in conditions {
+                collect_column_names(&w.condition, out);
+                collect_column_names(&w.result, out);
+            }
+            if let Some(e) = else_result {
+                collect_column_names(e, out);
+            }
+        }
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            collect_column_names(expr, out);
+            if let Some(w) = trim_what {
+                collect_column_names(w, out);
+            }
+            if let Some(cs) = trim_characters {
+                for c in cs {
+                    collect_column_names(c, out);
+                }
+            }
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            collect_column_names(expr, out);
+            if let Some(f) = substring_from {
+                collect_column_names(f, out);
+            }
+            if let Some(f) = substring_for {
+                collect_column_names(f, out);
+            }
+        }
+        Expr::Function(f) => {
+            if let FunctionArguments::List(al) = &f.args {
+                for a in &al.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
+                        collect_column_names(e, out);
+                    }
+                }
+            }
+        }
+        // Subqueries carry their own, independently-checked scope.
+        _ => {}
+    }
+}
+
+fn validate_expr_columns(expr: &Expr, known: &[String]) -> Result<(), MqdbError> {
+    let mut names = Vec::new();
+    collect_column_names(expr, &mut names);
+    for name in names {
+        if !column_known(known, &name) {
+            return Err(MqdbError::SqlExec(format!("unknown column: {name}")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_projection_columns(
+    projection: &[SelectItem],
+    known: &[String],
+) -> Result<(), MqdbError> {
+    for item in projection {
+        match item {
+            SelectItem::UnnamedExpr(e)
+            | SelectItem::ExprWithAlias { expr: e, .. }
+            | SelectItem::ExprWithAliases { expr: e, .. } => validate_expr_columns(e, known)?,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Does `expr` contain a scalar subquery, `IN (SELECT ...)`, or `EXISTS
+/// (SELECT ...)` anywhere in its tree? Gates the (potentially correlated,
+/// re-resolved-per-row) slow path in [`SqlEngine::exec_select`]'s WHERE
+/// handling so ordinary predicates keep the fast once-only resolution.
+fn expr_has_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+        Expr::BinaryOp { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Nested(expr)
+        | Expr::Cast { expr, .. } => expr_has_subquery(expr),
+        Expr::InList { expr, list, .. } => {
+            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
+        Expr::Function(f) => matches!(&f.args, FunctionArguments::List(al) if al
+            .args
+            .iter()
+            .any(|a| matches!(a, FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) if expr_has_subquery(e)))),
+        _ => false,
+    }
+}
+
+/// The table names/aliases a `Select` binds itself, i.e. the names an
+/// identifier inside it should resolve to *locally* rather than being
+/// treated as a reference to an enclosing (correlated) query.
+fn select_own_aliases(select: &Select) -> Vec<String> {
+    fn factor_alias(factor: &TableFactor, out: &mut Vec<String>) {
+        if let TableFactor::Table { name, alias, .. } = factor {
+            out.push(match alias {
+                Some(a) => a.name.value.to_lowercase(),
+                None => name.0.last().map(ident_value).unwrap_or("").to_lowercase(),
+            });
+        }
+    }
+    let mut names = Vec::new();
+    for twj in &select.from {
+        factor_alias(&twj.relation, &mut names);
+        for j in &twj.joins {
+            factor_alias(&j.relation, &mut names);
+        }
+    }
+    names
+}
+
+/// Replaces any `<alias>.<column>` reference in `expr` with its literal
+/// value from `outer_row`, unless `<alias>` is one of `own_aliases` (i.e. it
+/// resolves locally, not to the enclosing correlated query). Only qualified
+/// references are substituted — an unqualified identifier is always left to
+/// resolve against the subquery's own rows, which is the common and
+/// unambiguous style for a correlated subquery (`WHERE b.document_id =
+/// d.id`, not a bare `id`).
+fn substitute_outer_refs(expr: &Expr, outer_row: &Row, own_aliases: &[String]) -> Expr {
+    match expr {
+        Expr::CompoundIdentifier(parts) => {
+            let alias = parts
+                .first()
+                .map(|i| i.value.to_lowercase())
+                .unwrap_or_default();
+            if own_aliases.contains(&alias) {
+                return expr.clone();
+            }
+            let full = parts
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            match outer_row.get(&full) {
+                Some(v) => value_to_expr(v),
+                None => expr.clone(),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(substitute_outer_refs(left, outer_row, own_aliases)),
+            op: op.clone(),
+            right: Box::new(substitute_outer_refs(right, outer_row, own_aliases)),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(substitute_outer_refs(expr, outer_row, own_aliases)),
+        },
+        Expr::Nested(inner) => Expr::Nested(Box::new(substitute_outer_refs(
+            inner,
+            outer_row,
+            own_aliases,
+        ))),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(substitute_outer_refs(
+            inner,
+            outer_row,
+            own_aliases,
+        ))),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(substitute_outer_refs(
+            inner,
+            outer_row,
+            own_aliases,
+        ))),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(substitute_outer_refs(expr, outer_row, own_aliases)),
+            list: list
+                .iter()
+                .map(|e| substitute_outer_refs(e, outer_row, own_aliases))
+                .collect(),
+            negated: *negated,
+        },
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: Box::new(substitute_outer_refs(expr, outer_row, own_aliases)),
+            negated: *negated,
+            low: Box::new(substitute_outer_refs(low, outer_row, own_aliases)),
+            high: Box::new(substitute_outer_refs(high, outer_row, own_aliases)),
+        },
+        Expr::Function(f) => {
+            let new_args = match &f.args {
+                FunctionArguments::List(al) => {
+                    let args =
+                        al.args
+                            .iter()
+                            .map(|a| match a {
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                        substitute_outer_refs(e, outer_row, own_aliases),
+                                    ))
+                                }
+                                other => other.clone(),
+                            })
+                            .collect();
+                    FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
+                        args,
+                        ..al.clone()
+                    })
+                }
+                other => other.clone(),
+            };
+            Expr::Function(Function {
+                args: new_args,
+                ..f.clone()
+            })
+        }
+        other => other.clone(),
+    }
+}
+
+/// Binds a (possibly correlated) subquery's free `<outer alias>.<column>`
+/// references to `outer_row`'s values before it is executed. Only rewrites
+/// a plain `SELECT` body — a nested set operation or further `WITH` is left
+/// as-is, so correlation there simply won't resolve (no worse than before).
+fn substitute_outer_refs_query(query: &Query, outer_row: &Row) -> Query {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return query.clone();
+    };
+    let own_aliases = select_own_aliases(select);
+    let mut new_select = select.clone();
+    if let Some(sel) = &select.selection {
+        new_select.selection = Some(substitute_outer_refs(sel, outer_row, &own_aliases));
+    }
+    if let Some(h) = &select.having {
+        new_select.having = Some(substitute_outer_refs(h, outer_row, &own_aliases));
+    }
+    new_select.projection = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(e) => {
+                SelectItem::UnnamedExpr(substitute_outer_refs(e, outer_row, &own_aliases))
+            }
+            SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
+                expr: substitute_outer_refs(expr, outer_row, &own_aliases),
+                alias: alias.clone(),
+            },
+            other => other.clone(),
+        })
+        .collect();
+    let mut new_query = query.clone();
+    new_query.body = Box::new(SetExpr::Select(new_select));
+    new_query
+}
+
 fn is_constant_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Value(_) => true,
@@ -4514,12 +5064,41 @@ fn eval_having(
     key_vals: &[Value],
     group_rows: &[&Row],
 ) -> bool {
-    let substituted = substitute_having_expr(having, group_by_exprs, key_vals, group_rows);
+    eval_agg_expr_value(having, group_by_exprs, key_vals, group_rows).is_truthy()
+}
+
+/// Evaluates an arbitrary expression (an `ORDER BY` key, in practice) in the
+/// same per-group substitution context as `HAVING`: aggregate calls resolve
+/// against `group_rows`, and any sub-expression structurally equal to one of
+/// `group_by_exprs` resolves to its key value.
+fn eval_agg_expr_value(
+    expr: &Expr,
+    group_by_exprs: &[Expr],
+    key_vals: &[Value],
+    group_rows: &[&Row],
+) -> Value {
+    let substituted = substitute_having_expr(expr, group_by_exprs, key_vals, group_rows);
     let dummy = Row {
         columns: vec![],
         values: vec![],
     };
-    eval_expr(&substituted, &dummy).is_truthy()
+    eval_expr(&substituted, &dummy)
+}
+
+/// An `ORDER BY <name>` after `GROUP BY` may refer to a `SELECT ... AS
+/// <name>` alias rather than an input column — resolve that one level so
+/// `eval_agg_expr_value` sees the aliased expression itself.
+fn resolve_order_expr_alias(expr: &Expr, projection: &[SelectItem]) -> Expr {
+    if let Expr::Identifier(id) = expr {
+        for item in projection {
+            if let SelectItem::ExprWithAlias { expr: inner, alias } = item
+                && alias.value.eq_ignore_ascii_case(&id.value)
+            {
+                return inner.clone();
+            }
+        }
+    }
+    expr.clone()
 }
 
 fn func_name(f: &Function) -> String {
@@ -4555,11 +5134,7 @@ fn expr_structurally_eq(a: &Expr, b: &Expr) -> bool {
     a == b
 }
 
-fn apply_order_by(rows: &mut [(Row, Vec<String>)], kind: &OrderByKind) {
-    let exprs: &[OrderByExpr] = match kind {
-        OrderByKind::Expressions(exprs) => exprs,
-        _ => return,
-    };
+fn apply_order_by_exprs(rows: &mut [(Row, Vec<String>)], exprs: &[OrderByExpr]) {
     rows.sort_by(|(ra, _), (rb, _)| {
         for ob in exprs {
             let va = eval_expr(&ob.expr, ra);
@@ -5582,6 +6157,145 @@ mod tests {
             .execute("SELECT content FROM blocks UNION SELECT content, block_type FROM blocks")
             .unwrap_err();
         assert!(err.to_string().contains("column"));
+    }
+
+    #[test]
+    fn test_sql_group_by_order_by_is_applied() {
+        let store = make_multi_doc_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT document_id, COUNT(*) AS n FROM blocks \
+                 GROUP BY document_id ORDER BY document_id DESC",
+            )
+            .unwrap();
+        let ids: Vec<i64> = out.rows.iter().map(|r| r[0].parse().unwrap()).collect();
+        assert_eq!(ids, vec![2, 1, 0]);
+    }
+
+    // `n` names the `COUNT(*) AS n` alias, not an input column — must still
+    // resolve rather than sorting as if every group were equal.
+    #[test]
+    fn test_sql_group_by_order_by_select_alias() {
+        let store = make_multi_doc_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT document_id, COUNT(*) AS n FROM blocks \
+                 GROUP BY document_id ORDER BY n DESC, document_id",
+            )
+            .unwrap();
+        let ns: Vec<i64> = out.rows.iter().map(|r| r[1].parse().unwrap()).collect();
+        let mut sorted = ns.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(ns, sorted);
+    }
+
+    #[test]
+    fn test_sql_in_subquery() {
+        let store = make_multi_doc_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT id FROM documents \
+                 WHERE id IN (SELECT document_id FROM blocks WHERE lang = 'rust') \
+                 ORDER BY id",
+            )
+            .unwrap();
+        // Docs A (0) and C (2) have a rust block; B (1) doesn't.
+        assert_eq!(out.rows, vec![vec!["0".to_string()], vec!["2".to_string()]]);
+
+        let out_not = engine
+            .execute(
+                "SELECT id FROM documents \
+                 WHERE id NOT IN (SELECT document_id FROM blocks WHERE lang = 'rust') \
+                 ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(out_not.rows, vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn test_sql_correlated_exists_and_not_exists() {
+        let store = make_multi_doc_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT d.id FROM documents d \
+                 WHERE EXISTS (SELECT 1 FROM blocks b WHERE b.document_id = d.id AND b.lang = 'rust') \
+                 ORDER BY d.id",
+            )
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["0".to_string()], vec!["2".to_string()]]);
+
+        let out_not = engine
+            .execute(
+                "SELECT d.id FROM documents d \
+                 WHERE NOT EXISTS (SELECT 1 FROM blocks b WHERE b.document_id = d.id AND b.lang = 'rust') \
+                 ORDER BY d.id",
+            )
+            .unwrap();
+        assert_eq!(out_not.rows, vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn test_sql_left_join_null_extends_unmatched_rows() {
+        let store = make_multi_doc_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine
+            .execute(
+                "SELECT d.id, r.lang FROM documents d \
+                 LEFT JOIN blocks r ON r.document_id = d.id AND r.lang = 'rust' \
+                 ORDER BY d.id",
+            )
+            .unwrap();
+        assert_eq!(
+            out.rows,
+            vec![
+                vec!["0".to_string(), "rust".to_string()],
+                vec!["1".to_string(), "NULL".to_string()],
+                vec!["2".to_string(), "rust".to_string()],
+            ]
+        );
+
+        // Anti-join: rows from the left side with no matching right row.
+        let anti = engine
+            .execute(
+                "SELECT d.id FROM documents d \
+                 LEFT JOIN blocks r ON r.document_id = d.id AND r.lang = 'rust' \
+                 WHERE r.id IS NULL",
+            )
+            .unwrap();
+        assert_eq!(anti.rows, vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn test_sql_unknown_column_errors() {
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+
+        let err = engine
+            .execute("SELECT path, no_such_column FROM documents")
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown column: no_such_column"));
+
+        let err = engine
+            .execute("SELECT path FROM documents WHERE no_such_column = 'x'")
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown column: no_such_column"));
+
+        let err = engine
+            .execute("SELECT path FROM documents ORDER BY no_such_column")
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown column: no_such_column"));
+
+        // Real columns, aliases, and ordinal ORDER BY must be unaffected.
+        engine
+            .execute("SELECT path FROM documents WHERE title IS NOT NULL")
+            .unwrap();
+        engine
+            .execute("SELECT path FROM documents ORDER BY 1")
+            .unwrap();
     }
 
     #[test]
