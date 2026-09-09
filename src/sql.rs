@@ -77,7 +77,7 @@ use crate::{
     DocumentStore, MqdbError,
     block::{Block, BlockType, Properties, PropertyValue},
     document::{Document, ZoneMaps},
-    indexes::{DocumentIndex, IndexHint, tokenize},
+    indexes::{DocumentIndex, IndexHint, TokenizerKind, tokenize},
     store::{CustomTableState, DatabaseAlias},
 };
 
@@ -713,14 +713,28 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// The executing store's tokenizer, set once per `execute()` call (see
+// `SqlEngine::execute`) so the free functions below — which have no `&self`
+// — can tokenize `match`/`score`/`bm25` arguments the same way the index
+// was built (see `indexes::tokenize`'s doc comment).
+thread_local! {
+    static QUERY_TOKENIZER: std::cell::Cell<TokenizerKind> =
+        const { std::cell::Cell::new(TokenizerKind::Word) };
+}
+
+fn query_tokenizer() -> TokenizerKind {
+    QUERY_TOKENIZER.with(std::cell::Cell::get)
+}
+
 struct Bm25Corpus {
     n: u64,
     avgdl: f64,
     df: FxHashMap<String, u32>,
+    tokenizer: TokenizerKind,
 }
 
 impl Bm25Corpus {
-    fn build(indexes: &[DocumentIndex]) -> Self {
+    fn build(indexes: &[DocumentIndex], tokenizer: TokenizerKind) -> Self {
         let mut n: u64 = 0;
         let mut total_tokens: u64 = 0;
         let mut df: FxHashMap<String, u32> = FxHashMap::default();
@@ -736,14 +750,19 @@ impl Bm25Corpus {
         } else {
             total_tokens as f64 / n as f64
         };
-        Self { n, avgdl, df }
+        Self {
+            n,
+            avgdl,
+            df,
+            tokenizer,
+        }
     }
 
     fn score(&self, content: &str, query: &str) -> f64 {
         if self.n == 0 {
             return 0.0;
         }
-        let content_terms = tokenize(content);
+        let content_terms = tokenize(content, self.tokenizer);
         let dl = content_terms.len() as f64;
         if dl == 0.0 {
             return 0.0;
@@ -752,7 +771,7 @@ impl Bm25Corpus {
         for t in &content_terms {
             *freq.entry(t.as_str()).or_default() += 1;
         }
-        tokenize(query)
+        tokenize(query, self.tokenizer)
             .iter()
             .map(|qt| {
                 let f = f64::from(*freq.get(qt.as_str()).unwrap_or(&0));
@@ -1149,8 +1168,8 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
                 return Value::Bool(false);
             };
             let content_terms: std::collections::HashSet<String> =
-                tokenize(content).into_iter().collect();
-            let query_terms = tokenize(query);
+                tokenize(content, query_tokenizer()).into_iter().collect();
+            let query_terms = tokenize(query, query_tokenizer());
             Value::Bool(
                 !query_terms.is_empty() && query_terms.iter().all(|t| content_terms.contains(t)),
             )
@@ -1162,8 +1181,8 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             ) else {
                 return Value::Float(0.0);
             };
-            let content_terms = tokenize(content);
-            let query_terms = tokenize(query);
+            let content_terms = tokenize(content, query_tokenizer());
+            let query_terms = tokenize(query, query_tokenizer());
             if content_terms.is_empty() || query_terms.is_empty() {
                 return Value::Float(0.0);
             }
@@ -1997,7 +2016,7 @@ impl<'a> SqlEngine<'a> {
                 if let Some(idx) = store.get_doc_index(i) {
                     idx.clone()
                 } else {
-                    DocumentIndex::build(&doc.blocks)
+                    DocumentIndex::build(&doc.blocks, store.tokenizer())
                 }
             })
             .collect();
@@ -2042,6 +2061,8 @@ impl<'a> SqlEngine<'a> {
     /// Supports `SELECT`, `CREATE TABLE`, `INSERT INTO`, `DROP TABLE`,
     /// `DESC`/`DESCRIBE`, and `SHOW TABLES`.
     pub fn execute(&self, sql: &str) -> Result<QueryOutput, MqdbError> {
+        QUERY_TOKENIZER.with(|c| c.set(self.store.tokenizer()));
+
         // Pre-process non-standard commands (DESC / SHOW TABLES).
         let trimmed = sql.trim().trim_end_matches(';');
         let upper = trimmed.to_ascii_uppercase();
@@ -2075,7 +2096,10 @@ impl<'a> SqlEngine<'a> {
         }
         let _bm25_guard = if trimmed.to_ascii_lowercase().contains("bm25(") {
             BM25_CORPUS.with(|c| {
-                *c.borrow_mut() = Some(std::rc::Rc::new(Bm25Corpus::build(&self.indexes)))
+                *c.borrow_mut() = Some(std::rc::Rc::new(Bm25Corpus::build(
+                    &self.indexes,
+                    self.store.tokenizer(),
+                )))
             });
             Some(Bm25CorpusGuard)
         } else {
@@ -5869,7 +5893,7 @@ fn match_terms_from_expr(expr: &Expr) -> Option<Vec<String>> {
         return None;
     }
     let query_str = expr_str_val(q)?;
-    let terms = tokenize(&query_str);
+    let terms = tokenize(&query_str, query_tokenizer());
     if terms.is_empty() { None } else { Some(terms) }
 }
 
@@ -6826,6 +6850,30 @@ mod tests {
             .execute("SELECT content FROM blocks WHERE match(content, 'architecture')")
             .unwrap();
         assert_eq!(out.rows, vec![vec!["Architecture".to_string()]]);
+    }
+
+    #[test]
+    fn trigram_store_matches_and_scores_japanese_content() {
+        let mut store = DocumentStore::new();
+        store.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        store
+            .add_str("# 日記\n\n今日は良い天気です\n\n昨日は雨でした\n")
+            .unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+
+        let out = engine
+            .execute("SELECT content FROM blocks WHERE match(content, '良い天気')")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["今日は良い天気です".to_string()]]);
+
+        let out = engine
+            .execute(
+                "SELECT content FROM blocks
+                 WHERE block_type = 'paragraph'
+                 ORDER BY bm25(content, '良い天気') DESC LIMIT 1",
+            )
+            .unwrap();
+        assert_eq!(out.rows[0][0], "今日は良い天気です");
     }
 
     #[test]

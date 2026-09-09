@@ -8,6 +8,7 @@ use crate::{
     block::Block,
     document::Document,
     error::MqdbError,
+    indexes::TokenizerKind,
     storage::{
         catalog::{
             CatalogData, CatalogEntry, CustomTableEntry, ViewEntry, read_catalog, write_catalog,
@@ -171,6 +172,7 @@ impl Storage {
         custom_tables: &[CustomTableEntry],
         content_hashes: &[(u32, u64)],
         views: &[ViewEntry],
+        tokenizer: TokenizerKind,
     ) -> Result<(), MqdbError> {
         write_catalog(
             &mut self.page_file,
@@ -178,6 +180,7 @@ impl Storage {
             custom_tables,
             content_hashes,
             views,
+            tokenizer,
         )?;
         self.page_file.sync_header()
     }
@@ -577,12 +580,12 @@ mod tests {
             index_start_page: 0,
         };
         storage
-            .flush_catalog(&[catalog_entry], &[], &[], &[])
+            .flush_catalog(&[catalog_entry], &[], &[], &[], TokenizerKind::Word)
             .unwrap();
         drop(storage);
 
         let mut reopened = Storage::open(&path).unwrap();
-        let (catalog, _, _, _) = reopened.load_catalog().unwrap();
+        let (catalog, _, _, _, _) = reopened.load_catalog().unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(
             decode_zone_map(&catalog[0].zone_map_bytes).unwrap(),
@@ -657,7 +660,7 @@ mod tests {
         // Index round-trip: verify the loaded index matches a freshly built one
         for (i, doc) in opened.documents().iter().enumerate() {
             let from_file = opened.get_doc_index(i).unwrap().clone();
-            let from_blocks = DocumentIndex::build(&doc.blocks);
+            let from_blocks = DocumentIndex::build(&doc.blocks, TokenizerKind::Word);
             assert_eq!(
                 from_file.to_bytes(),
                 from_blocks.to_bytes(),
@@ -871,7 +874,7 @@ mod tests {
 
         let doc = &opened.documents()[0];
         let from_file = opened.get_doc_index(0).unwrap().clone();
-        let from_blocks = DocumentIndex::build(&doc.blocks);
+        let from_blocks = DocumentIndex::build(&doc.blocks, TokenizerKind::Word);
         assert_eq!(from_file.to_bytes(), from_blocks.to_bytes());
 
         cleanup(&path);
@@ -913,7 +916,9 @@ mod tests {
         cleanup(&path);
 
         let mut storage = Storage::create(&path).unwrap();
-        storage.flush_catalog(&[], &[], &[], &[]).unwrap();
+        storage
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .unwrap();
 
         let batch1 = vec![
             vec!["1".to_string(), "a".to_string()],

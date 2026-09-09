@@ -207,27 +207,116 @@ impl HashIndex {
     }
 }
 
-/// Lowercase + split on non-alphanumeric (Unicode-aware via
-/// `char::is_alphanumeric`).
-///
-/// This is used both to build [`TermIndex`]'s postings at index time and to
-/// tokenize `match()`/`score()`'s arguments at query time (see `src/sql.rs`)
-/// — the two **must** use this same function. `WHERE match(...)` uses the
-/// index purely as a pre-filter with no full-scan fallback to catch a
-/// mismatch, so if the two tokenizers ever disagreed, the index would
-/// silently *drop* true matches rather than just mis-rank them.
-///
-/// Known limitations (intentional, dependency-free, documented rather than
-/// fixed): no stemming, no stopword removal, no sub-splitting of
-/// `camelCase`/`snake_case` beyond punctuation, and no CJK word segmentation
-/// (a run of CJK characters with no ASCII punctuation between them tokenizes
-/// as a single "word").
-pub fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
+/// Tokenization strategy for [`TermIndex`]/`match()`/`bm25()`, fixed per
+/// store (see `DocumentStore::set_tokenizer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TokenizerKind {
+    /// Current behavior: split on non-alphanumeric only.
+    #[default]
+    Word,
+    /// CJK runs split into overlapping 2-char n-grams; other runs as `Word`.
+    Bigram,
+    /// Like `Bigram` but 3-char n-grams.
+    Trigram,
+}
+
+impl TokenizerKind {
+    fn ngram_size(self) -> Option<usize> {
+        match self {
+            TokenizerKind::Word => None,
+            TokenizerKind::Bigram => Some(2),
+            TokenizerKind::Trigram => Some(3),
+        }
+    }
+
+    /// Persisted tag byte — don't renumber existing variants.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            TokenizerKind::Word => 0,
+            TokenizerKind::Bigram => 1,
+            TokenizerKind::Trigram => 2,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Result<Self, MqdbError> {
+        match value {
+            0 => Ok(TokenizerKind::Word),
+            1 => Ok(TokenizerKind::Bigram),
+            2 => Ok(TokenizerKind::Trigram),
+            other => Err(MqdbError::Storage(format!(
+                "invalid tokenizer kind tag: {other}"
+            ))),
+        }
+    }
+}
+
+/// Hiragana, Katakana, Han, and Hangul ranges — scripts needing n-gram
+/// tokenization instead of whole-run tokens.
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF   // Hiragana, Katakana
+        | 0x31F0..=0x31FF // Katakana phonetic extensions
+        | 0xFF66..=0xFF9D // halfwidth Katakana
+        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xAC00..=0xD7A3 // Hangul Syllables
+    )
+}
+
+/// Tokenizes `text` per `kind`. Used at both index build time and query time
+/// (`src/sql.rs`) — the two **must** pass the same `kind`, or the index
+/// silently drops true matches instead of just mis-ranking them.
+pub fn tokenize(text: &str, kind: TokenizerKind) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let Some(n) = kind.ngram_size() else {
+        return lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+    };
+
+    // A script transition (CJK <-> non-CJK) is also a run boundary, so
+    // "abc日本語" splits into "abc" + a CJK run instead of staying one token.
+    #[derive(PartialEq)]
+    enum Class {
+        Other,
+        Cjk,
+        Skip,
+    }
+    fn classify(c: char) -> Class {
+        if !c.is_alphanumeric() {
+            Class::Skip
+        } else if is_cjk(c) {
+            Class::Cjk
+        } else {
+            Class::Other
+        }
+    }
+
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = lower.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let class = classify(chars[i]);
+        let start = i;
+        while i < chars.len() && classify(chars[i]) == class {
+            i += 1;
+        }
+        if class == Class::Skip {
+            continue;
+        }
+        let run = &chars[start..i];
+        if class == Class::Other || run.len() < n {
+            tokens.push(run.iter().collect());
+        } else {
+            for w in run.windows(n) {
+                tokens.push(w.iter().collect());
+            }
+        }
+    }
+    tokens
 }
 
 /// Inverted index on tokenized `content`: term → sorted, deduped block
@@ -247,11 +336,11 @@ pub struct TermIndex {
 }
 
 impl TermIndex {
-    pub fn build(blocks: &[Block]) -> Self {
+    pub fn build(blocks: &[Block], kind: TokenizerKind) -> Self {
         let mut postings: FxHashMap<String, Vec<u32>> = FxHashMap::default();
         let mut total_token_count: u64 = 0;
         for (idx, block) in blocks.iter().enumerate() {
-            let mut terms = tokenize(&block.content);
+            let mut terms = tokenize(&block.content, kind);
             total_token_count += terms.len() as u64;
             // Sort + dedup the token list itself rather than allocating a
             // side `HashSet` per block — cheaper for the small token counts
@@ -342,12 +431,12 @@ pub struct DocumentIndex {
 }
 
 impl DocumentIndex {
-    pub fn build(blocks: &[Block]) -> Self {
+    pub fn build(blocks: &[Block], kind: TokenizerKind) -> Self {
         Self {
             bitmap: BitmapIndex::build(blocks),
             btree: BTreeIndex::build(blocks),
             hash: HashIndex::build(blocks),
-            term: TermIndex::build(blocks),
+            term: TermIndex::build(blocks, kind),
         }
     }
 
@@ -698,7 +787,7 @@ mod tests {
     #[test]
     fn test_bitmap_heading_lookup() {
         let blocks = blocks_from("# H1\n\n## H2\n\nParagraph\n\n```rust\ncode\n```\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
 
         let headings = idx.bitmap.get(&BlockType::Heading);
         assert_eq!(headings.len(), 2);
@@ -713,7 +802,7 @@ mod tests {
     #[test]
     fn test_bitmap_get_any() {
         let blocks = blocks_from("# H1\n\nParagraph\n\n```rust\ncode\n```\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
 
         let result = idx.bitmap.get_any(&[BlockType::Heading, BlockType::Code]);
         assert_eq!(result.len(), 2);
@@ -722,7 +811,7 @@ mod tests {
     #[test]
     fn test_btree_pre_lookup() {
         let blocks = blocks_from("# H1\n\nParagraph\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
 
         // Every block's pre must be findable
         for (i, block) in blocks.iter().enumerate() {
@@ -739,7 +828,7 @@ mod tests {
     #[test]
     fn test_btree_pre_range() {
         let blocks = blocks_from("# A\n\n## B\n\n### C\n\nParagraph\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
 
         let max_pre = blocks.iter().map(|b| b.pre).max().unwrap_or(0);
         let all: Vec<u32> = idx.btree.range_by_pre(0, max_pre).collect();
@@ -753,7 +842,7 @@ mod tests {
     #[test]
     fn test_hash_content_lookup() {
         let blocks = blocks_from("## Architecture\n\nDetails\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
 
         let found = idx.hash.by_content("architecture");
         assert_eq!(found.len(), 1);
@@ -763,7 +852,7 @@ mod tests {
     #[test]
     fn test_hash_lang_lookup() {
         let blocks = blocks_from("```rust\nfn main(){}\n```\n\n```python\npass\n```\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
 
         assert_eq!(idx.hash.by_lang("rust").len(), 1);
         assert_eq!(idx.hash.by_lang("python").len(), 1);
@@ -773,7 +862,7 @@ mod tests {
     #[test]
     fn test_hash_depth_lookup() {
         let blocks = blocks_from("# H1\n\n## H2\n\n## H2b\n\n### H3\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
 
         assert_eq!(idx.hash.by_depth(1).len(), 1);
         assert_eq!(idx.hash.by_depth(2).len(), 2);
@@ -783,7 +872,7 @@ mod tests {
     #[test]
     fn test_index_hint_resolve_block_type() {
         let blocks = blocks_from("# H1\n\nPara\n\n```rust\ncode\n```\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
 
         let hint = IndexHint::BlockType(vec![BlockType::Heading]);
         let result = hint.resolve(&idx).unwrap();
@@ -794,7 +883,7 @@ mod tests {
     #[test]
     fn test_index_hint_fullscan_returns_none() {
         let blocks = blocks_from("# H1\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
         assert!(IndexHint::FullScan.resolve(&idx).is_none());
     }
 
@@ -806,7 +895,7 @@ mod tests {
     #[case(BlockType::Blockquote, 0)]
     fn test_bitmap_block_type_count_param(#[case] block_type: BlockType, #[case] expected: usize) {
         let blocks = blocks_from("# H1\n\n## H2\n\nParagraph\n\n```rust\ncode\n```\n\n- item\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
         assert_eq!(idx.bitmap.get(&block_type).len(), expected);
     }
 
@@ -817,7 +906,7 @@ mod tests {
     #[case(4, 0)]
     fn test_hash_depth_count_param(#[case] depth: u8, #[case] expected: usize) {
         let blocks = blocks_from("# H1\n\n## H2a\n\n## H2b\n\n### H3\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
         assert_eq!(idx.hash.by_depth(depth).len(), expected);
     }
 
@@ -827,7 +916,7 @@ mod tests {
     #[case("go", 0)]
     fn test_hash_lang_count_param(#[case] lang: &str, #[case] expected: usize) {
         let blocks = blocks_from("```rust\nfn main(){}\n```\n\n```python\npass\n```\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
         assert_eq!(idx.hash.by_lang(lang).len(), expected);
     }
 
@@ -841,7 +930,7 @@ mod tests {
         #[case] expected: usize,
     ) {
         let blocks = blocks_from("# H1\n\n## H2\n\nParagraph\n\n```rust\ncode\n```\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
         let result = IndexHint::BlockType(types).resolve(&idx).unwrap();
         assert_eq!(result.len(), expected);
     }
@@ -853,13 +942,74 @@ mod tests {
     #[case("CamelCase HTML_tag", vec!["camelcase", "html", "tag"])]
     fn test_tokenize_param(#[case] input: &str, #[case] expected: Vec<&str>) {
         let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
-        assert_eq!(tokenize(input), expected);
+        assert_eq!(tokenize(input, TokenizerKind::Word), expected);
+    }
+
+    #[test]
+    fn test_tokenize_word_lumps_cjk_run_into_one_token() {
+        assert_eq!(
+            tokenize("検索エンジンについて", TokenizerKind::Word),
+            vec!["検索エンジンについて"]
+        );
+    }
+
+    #[rstest]
+    #[case("検索エンジン", vec!["検索", "索エ", "エン", "ンジ", "ジン"])]
+    #[case("犬", vec!["犬"])]
+    #[case("abc日本語", vec!["abc", "日本", "本語"])]
+    #[case("hello world", vec!["hello", "world"])]
+    #[case("", vec![])]
+    fn test_tokenize_bigram_param(#[case] input: &str, #[case] expected: Vec<&str>) {
+        let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        assert_eq!(tokenize(input, TokenizerKind::Bigram), expected);
+    }
+
+    #[rstest]
+    #[case("検索エンジン", vec!["検索エ", "索エン", "エンジ", "ンジン"])]
+    #[case("犬", vec!["犬"])]
+    #[case("日本", vec!["日本"])]
+    #[case("abc日本語です", vec!["abc", "日本語", "本語で", "語です"])]
+    fn test_tokenize_trigram_param(#[case] input: &str, #[case] expected: Vec<&str>) {
+        let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        assert_eq!(tokenize(input, TokenizerKind::Trigram), expected);
+    }
+
+    #[test]
+    fn test_trigram_match_finds_japanese_content() {
+        let blocks = blocks_from("# 日記\n\n今日は良い天気です\n");
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Trigram);
+        let query = tokenize("良い天気", TokenizerKind::Trigram);
+        let hits = idx.term.intersect(&query);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_document_index_to_bytes_from_bytes_roundtrip_with_trigram() {
+        let blocks = blocks_from("# 日記\n\n今日は良い天気です\n");
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Trigram);
+        let restored = DocumentIndex::from_bytes(&idx.to_bytes()).unwrap();
+
+        let mut original: Vec<(String, Vec<u32>)> = idx
+            .term
+            .postings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut round_tripped: Vec<(String, Vec<u32>)> = restored
+            .term
+            .postings
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        original.sort();
+        round_tripped.sort();
+        assert_eq!(original, round_tripped);
     }
 
     #[test]
     fn test_term_index_build_and_postings() {
         let blocks = blocks_from("# Hello World\n\nSome prose about Rust\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
         let hits = idx.term.intersect(&["rust".to_string()]);
         assert_eq!(hits.len(), 1);
         assert!(blocks[hits[0] as usize].content.contains("Rust"));
@@ -868,7 +1018,7 @@ mod tests {
     #[test]
     fn test_term_index_intersect_and_semantics() {
         let blocks = blocks_from("# H1\n\nfoo bar baz\n\nfoo only\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
 
         let both = idx.term.intersect(&["foo".to_string(), "bar".to_string()]);
         assert_eq!(both.len(), 1);
@@ -885,7 +1035,7 @@ mod tests {
     fn test_document_index_to_bytes_from_bytes_roundtrip_includes_term_index() {
         let blocks =
             blocks_from("# Title\n\nSome prose here.\n\n```rust\nfn main() { let x = 1; }\n```\n");
-        let idx = DocumentIndex::build(&blocks);
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Word);
         let restored = DocumentIndex::from_bytes(&idx.to_bytes()).unwrap();
 
         let mut original: Vec<(String, Vec<u32>)> = idx

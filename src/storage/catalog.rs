@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     error::MqdbError,
+    indexes::TokenizerKind,
     storage::page::{
         PAGE_BODY_SIZE, PAGE_HEADER_SIZE, PAGE_TYPE_CATALOG, PageFile, make_page, parse_page_header,
     },
@@ -43,12 +44,14 @@ pub struct ViewEntry {
     pub sql: String,
 }
 
-/// Catalog entries, custom tables, content hashes, and views read from a page file.
+/// Catalog entries, custom tables, content hashes, views, and the store's
+/// tokenizer kind, read from a page file.
 pub type CatalogData = (
     Vec<CatalogEntry>,
     Vec<CustomTableEntry>,
     Vec<(u32, u64)>,
     Vec<ViewEntry>,
+    TokenizerKind,
 );
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {
@@ -131,6 +134,7 @@ fn serialize_catalog(
     custom_tables: &[CustomTableEntry],
     content_hashes: &[(u32, u64)],
     views: &[ViewEntry],
+    tokenizer: TokenizerKind,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&as_u32(entries.len(), "catalog entry count").to_le_bytes());
@@ -186,6 +190,9 @@ fn serialize_catalog(
         out.extend_from_slice(view.sql.as_bytes());
     }
 
+    // Store's tokenizer choice — one tag byte, absent in older blobs.
+    out.push(tokenizer.to_u8());
+
     out
 }
 
@@ -195,12 +202,13 @@ pub fn write_catalog(
     custom_tables: &[CustomTableEntry],
     content_hashes: &[(u32, u64)],
     views: &[ViewEntry],
+    tokenizer: TokenizerKind,
 ) -> Result<(), MqdbError> {
     if pf.num_pages < 2 {
         return Err(invalid_data("catalog start page is missing"));
     }
 
-    let bytes = serialize_catalog(entries, custom_tables, content_hashes, views);
+    let bytes = serialize_catalog(entries, custom_tables, content_hashes, views, tokenizer);
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
         vec![&[]]
     } else {
@@ -345,7 +353,14 @@ pub fn read_catalog(pf: &mut PageFile) -> Result<CatalogData, MqdbError> {
         vec![]
     };
 
-    Ok((entries, custom_tables, content_hashes, views))
+    // Older blobs have no trailing byte here — they were always `Word`.
+    let tokenizer = if decoder.remaining() >= 1 {
+        TokenizerKind::from_u8(decoder.read_u8()?)?
+    } else {
+        TokenizerKind::Word
+    };
+
+    Ok((entries, custom_tables, content_hashes, views, tokenizer))
 }
 
 #[cfg(test)]
@@ -422,12 +437,14 @@ mod tests {
         drop(pf);
 
         let mut reopened = PageFile::open(&path).unwrap();
-        let (entries, custom_tables, content_hashes, views) = read_catalog(&mut reopened).unwrap();
+        let (entries, custom_tables, content_hashes, views, tokenizer) =
+            read_catalog(&mut reopened).unwrap();
 
         assert_eq!(entries, vec![entry]);
         assert!(custom_tables.is_empty());
         assert!(content_hashes.is_empty());
         assert!(views.is_empty());
+        assert_eq!(tokenizer, TokenizerKind::Word);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -451,12 +468,21 @@ mod tests {
         // Reserve page 1 the same way `Storage::create` does.
         let placeholder = make_page(PAGE_TYPE_CATALOG, 1, 0, &0u32.to_le_bytes());
         pf.append_page(&placeholder).unwrap();
-        write_catalog(&mut pf, std::slice::from_ref(&entry), &[], &hashes, &[]).unwrap();
+        write_catalog(
+            &mut pf,
+            std::slice::from_ref(&entry),
+            &[],
+            &hashes,
+            &[],
+            TokenizerKind::Word,
+        )
+        .unwrap();
         pf.sync_header().unwrap();
         drop(pf);
 
         let mut reopened = PageFile::open(&path).unwrap();
-        let (entries, custom_tables, read_hashes, views) = read_catalog(&mut reopened).unwrap();
+        let (entries, custom_tables, read_hashes, views, tokenizer) =
+            read_catalog(&mut reopened).unwrap();
 
         assert_eq!(entries, vec![entry]);
         assert!(custom_tables.is_empty());
@@ -466,6 +492,7 @@ mod tests {
         let mut expected = hashes;
         expected.sort();
         assert_eq!(read_hashes, expected);
+        assert_eq!(tokenizer, TokenizerKind::Word);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -497,19 +524,62 @@ mod tests {
         let mut pf = PageFile::create(&path).unwrap();
         let placeholder = make_page(PAGE_TYPE_CATALOG, 1, 0, &0u32.to_le_bytes());
         pf.append_page(&placeholder).unwrap();
-        write_catalog(&mut pf, std::slice::from_ref(&entry), &[], &[], &views).unwrap();
+        write_catalog(
+            &mut pf,
+            std::slice::from_ref(&entry),
+            &[],
+            &[],
+            &views,
+            TokenizerKind::Word,
+        )
+        .unwrap();
         pf.sync_header().unwrap();
         drop(pf);
 
         let mut reopened = PageFile::open(&path).unwrap();
-        let (entries, custom_tables, content_hashes, read_views) =
+        let (entries, custom_tables, content_hashes, read_views, tokenizer) =
             read_catalog(&mut reopened).unwrap();
 
         assert_eq!(entries, vec![entry]);
         assert!(custom_tables.is_empty());
         assert!(content_hashes.is_empty());
         assert_eq!(read_views, views);
+        assert_eq!(tokenizer, TokenizerKind::Word);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_then_read_catalog_round_trips_tokenizer_kind() {
+        for kind in [
+            TokenizerKind::Word,
+            TokenizerKind::Bigram,
+            TokenizerKind::Trigram,
+        ] {
+            let path = test_file_path("tokenizer-round-trip");
+            let _ = std::fs::remove_file(&path);
+
+            let entry = CatalogEntry {
+                document_id: 1,
+                path: Some("a.md".to_string()),
+                first_block_page: 1,
+                num_blocks: 2,
+                zone_map_bytes: vec![],
+                index_start_page: 0,
+            };
+
+            let mut pf = PageFile::create(&path).unwrap();
+            let placeholder = make_page(PAGE_TYPE_CATALOG, 1, 0, &0u32.to_le_bytes());
+            pf.append_page(&placeholder).unwrap();
+            write_catalog(&mut pf, std::slice::from_ref(&entry), &[], &[], &[], kind).unwrap();
+            pf.sync_header().unwrap();
+            drop(pf);
+
+            let mut reopened = PageFile::open(&path).unwrap();
+            let (_, _, _, _, read_kind) = read_catalog(&mut reopened).unwrap();
+            assert_eq!(read_kind, kind);
+
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
