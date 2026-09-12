@@ -723,11 +723,12 @@ thread_local! {
         std::cell::RefCell::new(FxHashMap::default());
 }
 
-// Corpus cache keyed by attached schema name (`None` = this store), shared
-// across the whole top-level `execute()` call so correlated subqueries
-// re-run per row don't each rebuild the same corpus.
+// Corpus cache keyed by store identity (the `DocumentStore`'s address), not
+// a schema name — a nested `SqlEngine` for an attached view/table sees its
+// own store as local too, so a name-relative key like `None` would collide
+// across engines. Shared across the whole top-level `execute()` call.
 thread_local! {
-    static BM25_CACHE: std::cell::RefCell<FxHashMap<Option<String>, std::rc::Rc<Bm25Corpus>>> =
+    static BM25_CACHE: std::cell::RefCell<FxHashMap<usize, std::rc::Rc<Bm25Corpus>>> =
         std::cell::RefCell::new(FxHashMap::default());
 }
 
@@ -1206,19 +1207,23 @@ fn arith_op(
 }
 
 /// The alias/table qualifier of a function's first argument, e.g. `o` for
-/// `match(o.content, …)` — `None` for an unqualified `match(content, …)`.
-/// Used to resolve `match`/`score`/`bm25` against the *referenced* table's
-/// tokenizer/corpus instead of always the FROM's driving (first) table.
+/// `match(o.content, …)` or `match(lower(o.content), …)` — `None` if
+/// unqualified or if columns from more than one alias are mixed in.
 fn first_arg_alias(f: &Function) -> Option<String> {
     let FunctionArguments::List(al) = &f.args else {
         return None;
     };
-    match al.args.first() {
-        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts)))) => {
-            parts.first().map(|i| i.value.to_lowercase())
-        }
-        _ => None,
-    }
+    let expr = match al.args.first() {
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => e,
+        _ => return None,
+    };
+    let mut names = Vec::new();
+    collect_column_names(expr, &mut names);
+    let mut aliases = names
+        .iter()
+        .filter_map(|n| Some(n.split_once('.')?.0.to_lowercase()));
+    let first = aliases.next()?;
+    aliases.all(|a| a == first).then_some(first)
 }
 
 fn eval_function_call(f: &Function, row: &Row) -> Value {
@@ -3504,17 +3509,23 @@ impl<'a> SqlEngine<'a> {
         map
     }
 
-    /// The `Bm25Corpus` for `schema` (`None` = this store), built once per
-    /// top-level `execute()` call and cached in `BM25_CACHE` — repeated
-    /// lookups (joins referencing the same store, or a correlated subquery
-    /// re-running per row) reuse it instead of rescanning every index.
+    /// The `Bm25Corpus` for `schema` (`None` = this store), cached in
+    /// `BM25_CACHE` under the resolved store's address (see its comment).
     fn bm25_corpus_for_schema(
         &self,
         schema: Option<&str>,
     ) -> Result<std::rc::Rc<Bm25Corpus>, MqdbError> {
-        if let Some(cached) =
-            BM25_CACHE.with(|c| c.borrow().get(&schema.map(str::to_string)).cloned())
-        {
+        let key = match schema {
+            None => self.store as *const DocumentStore as usize,
+            Some(schema) => {
+                let guard = self.store.attached.read().unwrap();
+                let other = guard
+                    .get(schema)
+                    .ok_or_else(|| MqdbError::SqlExec(format!("unknown database '{schema}'")))?;
+                other as *const DocumentStore as usize
+            }
+        };
+        if let Some(cached) = BM25_CACHE.with(|c| c.borrow().get(&key).cloned()) {
             return Ok(cached);
         }
         let corpus = match schema {
@@ -3528,10 +3539,7 @@ impl<'a> SqlEngine<'a> {
                 std::rc::Rc::new(Bm25Corpus::build(&engine.indexes, other.tokenizer()))
             }
         };
-        BM25_CACHE.with(|c| {
-            c.borrow_mut()
-                .insert(schema.map(str::to_string), corpus.clone())
-        });
+        BM25_CACHE.with(|c| c.borrow_mut().insert(key, corpus.clone()));
         Ok(corpus)
     }
 
@@ -8910,6 +8918,90 @@ mod tests {
                 "SELECT bm25(o.content, '良い天気') FROM blocks b \
                  JOIN other.blocks o ON b.block_type = o.block_type \
                  WHERE o.block_type = 'paragraph'",
+            )
+            .unwrap();
+        assert!(!out.rows.is_empty());
+        for row in &out.rows {
+            let score: f64 = row[0].parse().unwrap();
+            assert!(score > 0.0, "expected positive bm25 score, got {score}");
+        }
+    }
+
+    #[test]
+    fn attach_match_on_wrapped_joined_column_uses_its_own_tokenizer() {
+        use crate::indexes::TokenizerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = DocumentStore::new();
+        other.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        other.add_str("# Doc\n\n今日は良い天気です\n").unwrap();
+        let other_path = dir.path().join("other.mq-db");
+        other.save(&other_path).unwrap();
+
+        // Same table setup as `attach_match_on_non_driving_joined_table_uses_its_own_tokenizer`,
+        // but the reference to `o.content` is wrapped in `lower(...)` instead
+        // of appearing bare — must still resolve to `other`'s tokenizer.
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let out = engine
+            .execute(
+                "SELECT o.content FROM blocks b JOIN other.blocks o \
+                 ON b.block_type = o.block_type \
+                 WHERE match(lower(o.content), '良い天気')",
+            )
+            .unwrap();
+        assert!(!out.rows.is_empty());
+        assert!(
+            out.rows
+                .iter()
+                .all(|r| r == &vec!["今日は良い天気です".to_string()])
+        );
+    }
+
+    #[test]
+    fn attach_view_bm25_does_not_reuse_local_corpus() {
+        use crate::indexes::TokenizerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = DocumentStore::new();
+        other.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        other.add_str("# Doc\n\n今日は良い天気です\n").unwrap();
+        {
+            let view_engine = SqlEngine::new(&other).unwrap();
+            view_engine
+                .execute(
+                    "CREATE VIEW ranked AS SELECT block_type, bm25(content, '良い天気') AS score FROM blocks",
+                )
+                .unwrap();
+        }
+        let other_path = dir.path().join("other.mq-db");
+        other.save(&other_path).unwrap();
+
+        // The outer, local (Word-tokenized) query's own `bm25()` call caches
+        // its corpus under the top-level engine's key first; `other.ranked`'s
+        // own unqualified `bm25()` then runs in a nested `SqlEngine` and must
+        // not receive that cached local corpus.
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let out = engine
+            .execute(
+                "SELECT r.score FROM blocks b JOIN other.ranked r \
+                 ON b.block_type = r.block_type \
+                 WHERE bm25(b.content, 'Details') >= 0 AND r.block_type = 'paragraph'",
             )
             .unwrap();
         assert!(!out.rows.is_empty());
