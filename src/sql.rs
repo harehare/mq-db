@@ -713,10 +713,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-// The executing store's tokenizer, set once per `execute()` call (see
-// `SqlEngine::execute`) so the free functions below — which have no `&self`
-// — can tokenize `match`/`score`/`bm25` arguments the same way the index
-// was built (see `indexes::tokenize`'s doc comment).
+// Tokenizer for the free `match`/`score`/`bm25` functions below (no `&self`
+// access). `exec_select` overrides it per-call via `TokenizerScope` for
+// attached tables with a different tokenizer than this store's.
 thread_local! {
     static QUERY_TOKENIZER: std::cell::Cell<TokenizerKind> =
         const { std::cell::Cell::new(TokenizerKind::Word) };
@@ -724,6 +723,24 @@ thread_local! {
 
 fn query_tokenizer() -> TokenizerKind {
     QUERY_TOKENIZER.with(std::cell::Cell::get)
+}
+
+/// RAII override of `QUERY_TOKENIZER`, restored on drop — nests correctly
+/// across correlated subqueries.
+struct TokenizerScope(TokenizerKind);
+
+impl TokenizerScope {
+    fn set(new: TokenizerKind) -> Self {
+        let prev = query_tokenizer();
+        QUERY_TOKENIZER.with(|c| c.set(new));
+        Self(prev)
+    }
+}
+
+impl Drop for TokenizerScope {
+    fn drop(&mut self) {
+        QUERY_TOKENIZER.with(|c| c.set(self.0));
+    }
 }
 
 struct Bm25Corpus {
@@ -3085,6 +3102,9 @@ impl<'a> SqlEngine<'a> {
         limit: Option<&Expr>,
         offset: Option<&Expr>,
     ) -> Result<QueryOutput, MqdbError> {
+        // Match FROM's own tokenizer, not necessarily this engine's.
+        let _tokenizer_scope = TokenizerScope::set(self.tokenizer_for_from(&select.from));
+
         // 1. Materialise FROM — with cost-based index predicate pushdown
         let where_expr = select.selection.as_ref();
         let hint = where_expr
@@ -3288,6 +3308,21 @@ impl<'a> SqlEngine<'a> {
             Some(row) => substitute_outer_refs_query(query, row),
             None => query.clone(),
         }
+    }
+
+    /// Tokenizer of `from`'s driving (first) table — an attached store's own
+    /// tokenizer for `<alias>.<table>`, not this engine's.
+    fn tokenizer_for_from(&self, from: &[sqlparser::ast::TableWithJoins]) -> TokenizerKind {
+        if let Some(twj) = from.first()
+            && let TableFactor::Table { name, .. } = &twj.relation
+            && name.0.len() >= 2
+        {
+            let schema = ident_value(&name.0[name.0.len() - 2]).to_lowercase();
+            if let Some(other) = self.store.attached.read().unwrap().get(schema.as_str()) {
+                return other.tokenizer();
+            }
+        }
+        self.store.tokenizer()
     }
 
     fn materialise_from_with_hint(
@@ -8508,6 +8543,32 @@ mod tests {
             )
             .unwrap();
         assert!(!out.rows.is_empty());
+    }
+
+    #[test]
+    fn attach_match_uses_other_stores_tokenizer() {
+        use crate::indexes::TokenizerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = DocumentStore::new();
+        other.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        other.add_str("# Doc\n\n今日は良い天気です\n").unwrap();
+        let other_path = dir.path().join("other.mq-db");
+        other.save(&other_path).unwrap();
+
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let out = engine
+            .execute("SELECT content FROM other.blocks WHERE match(content, '良い天気')")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["今日は良い天気です".to_string()]]);
     }
 
     #[test]
