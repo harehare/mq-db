@@ -254,13 +254,18 @@ impl TokenizerKind {
 /// tokenization instead of whole-run tokens.
 fn is_cjk(c: char) -> bool {
     matches!(c as u32,
-        0x3040..=0x30FF   // Hiragana, Katakana
-        | 0x31F0..=0x31FF // Katakana phonetic extensions
-        | 0xFF66..=0xFF9D // halfwidth Katakana
-        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
-        | 0x4E00..=0x9FFF // CJK Unified Ideographs
-        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
-        | 0xAC00..=0xD7A3 // Hangul Syllables
+        0x3040..=0x30FF     // Hiragana, Katakana
+        | 0x31F0..=0x31FF   // Katakana phonetic extensions
+        | 0xFF66..=0xFF9D   // halfwidth Katakana
+        | 0x3400..=0x4DBF   // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF   // CJK Unified Ideographs
+        | 0xF900..=0xFAFF   // CJK Compatibility Ideographs
+        | 0xAC00..=0xD7A3   // Hangul Syllables
+        | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
+        | 0x2A700..=0x2EBEF // CJK Unified Ideographs Extension C-F
+        | 0x2F800..=0x2FA1F // CJK Compatibility Ideographs Supplement
+        | 0x30000..=0x3134F // CJK Unified Ideographs Extension G
+        | 0x31350..=0x323AF // CJK Unified Ideographs Extension H
     )
 }
 
@@ -308,11 +313,16 @@ pub fn tokenize(text: &str, kind: TokenizerKind) -> Vec<String> {
             continue;
         }
         let run = &chars[start..i];
-        if class == Class::Other || run.len() < n {
+        if class == Class::Other {
             tokens.push(run.iter().collect());
         } else {
-            for w in run.windows(n) {
-                tokens.push(w.iter().collect());
+            // All window sizes up to n, not just n, so a query shorter than
+            // n (e.g. one character against Bigram) can still match inside
+            // a longer indexed run.
+            for w in 1..=n.min(run.len()) {
+                for win in run.windows(w) {
+                    tokens.push(win.iter().collect());
+                }
             }
         }
     }
@@ -954,9 +964,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case("検索エンジン", vec!["検索", "索エ", "エン", "ンジ", "ジン"])]
+    #[case("検索エンジン", vec!["検", "索", "エ", "ン", "ジ", "ン", "検索", "索エ", "エン", "ンジ", "ジン"])]
     #[case("犬", vec!["犬"])]
-    #[case("abc日本語", vec!["abc", "日本", "本語"])]
+    #[case("abc日本語", vec!["abc", "日", "本", "語", "日本", "本語"])]
     #[case("hello world", vec!["hello", "world"])]
     #[case("", vec![])]
     fn test_tokenize_bigram_param(#[case] input: &str, #[case] expected: Vec<&str>) {
@@ -965,10 +975,19 @@ mod tests {
     }
 
     #[rstest]
-    #[case("検索エンジン", vec!["検索エ", "索エン", "エンジ", "ンジン"])]
+    #[case("検索エンジン", vec![
+        "検", "索", "エ", "ン", "ジ", "ン",
+        "検索", "索エ", "エン", "ンジ", "ジン",
+        "検索エ", "索エン", "エンジ", "ンジン",
+    ])]
     #[case("犬", vec!["犬"])]
-    #[case("日本", vec!["日本"])]
-    #[case("abc日本語です", vec!["abc", "日本語", "本語で", "語です"])]
+    #[case("日本", vec!["日", "本", "日本"])]
+    #[case("abc日本語です", vec![
+        "abc",
+        "日", "本", "語", "で", "す",
+        "日本", "本語", "語で", "です",
+        "日本語", "本語で", "語です",
+    ])]
     fn test_tokenize_trigram_param(#[case] input: &str, #[case] expected: Vec<&str>) {
         let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
         assert_eq!(tokenize(input, TokenizerKind::Trigram), expected);
@@ -981,6 +1000,32 @@ mod tests {
         let query = tokenize("良い天気", TokenizerKind::Trigram);
         let hits = idx.term.intersect(&query);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_bigram_match_finds_one_char_query_within_longer_run() {
+        let blocks = blocks_from("# Doc\n\n私は日本人です\n");
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Bigram);
+        let query = tokenize("日", TokenizerKind::Bigram);
+        assert_eq!(idx.term.intersect(&query).len(), 1);
+    }
+
+    #[rstest]
+    #[case("日")]
+    #[case("日本")]
+    fn test_trigram_match_finds_short_query_within_longer_run(#[case] q: &str) {
+        let blocks = blocks_from("# Doc\n\n私は日本人です\n");
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Trigram);
+        let query = tokenize(q, TokenizerKind::Trigram);
+        assert_eq!(idx.term.intersect(&query).len(), 1);
+    }
+
+    #[test]
+    fn test_supplementary_han_stays_in_same_cjk_run_as_bmp_han() {
+        assert_eq!(
+            tokenize("𠮷野家", TokenizerKind::Bigram),
+            vec!["𠮷", "野", "家", "𠮷野", "野家"]
+        );
     }
 
     #[test]
