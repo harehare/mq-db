@@ -419,7 +419,7 @@ impl Storage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
@@ -705,7 +705,7 @@ mod tests {
     /// Patches a saved file's header version field down to `version` and
     /// recomputes the header checksum, so the file is otherwise well-formed —
     /// isolating the version check for the tests below.
-    fn patch_version(path: &Path, version: u32) {
+    pub(crate) fn patch_version(path: &Path, version: u32) {
         use crate::storage::page::{PAGE_HEADER_SIZE, PAGE_SIZE, compute_checksum};
 
         let mut bytes = std::fs::read(path).unwrap();

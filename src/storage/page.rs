@@ -19,8 +19,10 @@ pub(crate) const PAGE_TYPE_INDEX: u32 = 5;
 pub(crate) const PAGE_TYPE_TABLE_DATA: u32 = 6;
 
 const FILE_MAGIC: u32 = 0x4D51_4442;
-pub const FILE_VERSION: u32 = 6;
-const LEGACY_VERSIONS: &[u32] = &[4, 5];
+// v7 adds the persisted tokenizer tag; a v6 reader ignores it and always
+// queries as Word, so it must not accept a Bigram/Trigram store as v6.
+pub const FILE_VERSION: u32 = 7;
+const LEGACY_VERSIONS: &[u32] = &[4, 5, 6];
 const CATALOG_START_PAGE: u32 = 1;
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {

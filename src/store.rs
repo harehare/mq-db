@@ -1597,4 +1597,31 @@ mod tokenizer_tests {
         let loaded = DocumentStore::load(&db_path).unwrap();
         assert_eq!(loaded.tokenizer(), TokenizerKind::Trigram);
     }
+
+    #[test]
+    fn saving_non_word_tokenizer_bumps_past_pre_tokenizer_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        store.add_str("# Doc\n\n今日は良い天気です\n").unwrap();
+        store.save(&db_path).unwrap();
+
+        assert_ne!(DocumentStore::file_version(&db_path).unwrap(), 6);
+    }
+
+    #[test]
+    fn load_reads_legacy_v6_file_without_tokenizer_tag_as_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.add_str("# Doc\n\nHello world\n").unwrap();
+        store.save(&db_path).unwrap();
+        crate::storage::tests::patch_version(&db_path, 6);
+
+        let loaded = DocumentStore::load(&db_path).unwrap();
+        assert_eq!(loaded.tokenizer(), TokenizerKind::Word);
+    }
 }
