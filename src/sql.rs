@@ -1221,9 +1221,11 @@ fn first_arg_alias(f: &Function) -> Option<String> {
     collect_column_names(expr, &mut names);
     let mut aliases = names
         .iter()
-        .filter_map(|n| Some(n.split_once('.')?.0.to_lowercase()));
-    let first = aliases.next()?;
-    aliases.all(|a| a == first).then_some(first)
+        .map(|n| n.split_once('.').map(|(alias, _)| alias.to_lowercase()));
+    let first = aliases.next()??;
+    aliases
+        .all(|alias| alias.as_deref() == Some(first.as_str()))
+        .then_some(first)
 }
 
 fn eval_function_call(f: &Function, row: &Row) -> Value {
