@@ -254,13 +254,17 @@ impl TokenizerKind {
 /// tokenization instead of whole-run tokens.
 fn is_cjk(c: char) -> bool {
     matches!(c as u32,
-        0x3040..=0x30FF     // Hiragana, Katakana
+        0x1100..=0x11FF     // Hangul Jamo (decomposed Korean)
+        | 0x3040..=0x30FF     // Hiragana, Katakana
+        | 0x3130..=0x318F   // Hangul Compatibility Jamo
         | 0x31F0..=0x31FF   // Katakana phonetic extensions
+        | 0xA960..=0xA97F   // Hangul Jamo Extended-A
+        | 0xAC00..=0xD7A3   // Hangul Syllables
+        | 0xD7B0..=0xD7FF   // Hangul Jamo Extended-B
         | 0xFF66..=0xFF9D   // halfwidth Katakana
         | 0x3400..=0x4DBF   // CJK Unified Ideographs Extension A
         | 0x4E00..=0x9FFF   // CJK Unified Ideographs
         | 0xF900..=0xFAFF   // CJK Compatibility Ideographs
-        | 0xAC00..=0xD7A3   // Hangul Syllables
         | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
         | 0x2A700..=0x2EBEF // CJK Unified Ideographs Extension C-F
         | 0x2F800..=0x2FA1F // CJK Compatibility Ideographs Supplement
@@ -1026,6 +1030,33 @@ mod tests {
             tokenize("𠮷野家", TokenizerKind::Bigram),
             vec!["𠮷", "野", "家", "𠮷野", "野家"]
         );
+    }
+
+    #[test]
+    fn test_tokenize_bigram_decomposed_hangul_jamo() {
+        // 한 (NFD): choseong ㅎ + jungseong ㅏ + jongseong ㄴ
+        let han_nfd = "\u{1112}\u{1161}\u{11AB}";
+        assert_eq!(
+            tokenize(han_nfd, TokenizerKind::Bigram),
+            vec![
+                "\u{1112}",
+                "\u{1161}",
+                "\u{11ab}",
+                "\u{1112}\u{1161}",
+                "\u{1161}\u{11ab}",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bigram_match_finds_decomposed_hangul_partial_query() {
+        // Content "한" and query "하" (a prefix of 한) in decomposed (NFD) form.
+        let han_nfd = "\u{1112}\u{1161}\u{11AB}";
+        let ha_nfd = "\u{1112}\u{1161}";
+        let blocks = blocks_from(&format!("# Doc\n\n{han_nfd}\n"));
+        let idx = DocumentIndex::build(&blocks, TokenizerKind::Bigram);
+        let query = tokenize(ha_nfd, TokenizerKind::Bigram);
+        assert_eq!(idx.term.intersect(&query).len(), 1);
     }
 
     #[test]
