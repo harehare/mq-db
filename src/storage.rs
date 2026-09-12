@@ -8,6 +8,7 @@ use crate::{
     block::Block,
     document::Document,
     error::MqdbError,
+    indexes::TokenizerKind,
     storage::{
         catalog::{
             CatalogData, CatalogEntry, CustomTableEntry, ViewEntry, read_catalog, write_catalog,
@@ -171,6 +172,7 @@ impl Storage {
         custom_tables: &[CustomTableEntry],
         content_hashes: &[(u32, u64)],
         views: &[ViewEntry],
+        tokenizer: TokenizerKind,
     ) -> Result<(), MqdbError> {
         write_catalog(
             &mut self.page_file,
@@ -178,6 +180,7 @@ impl Storage {
             custom_tables,
             content_hashes,
             views,
+            tokenizer,
         )?;
         self.page_file.sync_header()
     }
@@ -416,7 +419,7 @@ impl Storage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
@@ -577,12 +580,12 @@ mod tests {
             index_start_page: 0,
         };
         storage
-            .flush_catalog(&[catalog_entry], &[], &[], &[])
+            .flush_catalog(&[catalog_entry], &[], &[], &[], TokenizerKind::Word)
             .unwrap();
         drop(storage);
 
         let mut reopened = Storage::open(&path).unwrap();
-        let (catalog, _, _, _) = reopened.load_catalog().unwrap();
+        let (catalog, _, _, _, _) = reopened.load_catalog().unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(
             decode_zone_map(&catalog[0].zone_map_bytes).unwrap(),
@@ -657,7 +660,7 @@ mod tests {
         // Index round-trip: verify the loaded index matches a freshly built one
         for (i, doc) in opened.documents().iter().enumerate() {
             let from_file = opened.get_doc_index(i).unwrap().clone();
-            let from_blocks = DocumentIndex::build(&doc.blocks);
+            let from_blocks = DocumentIndex::build(&doc.blocks, TokenizerKind::Word);
             assert_eq!(
                 from_file.to_bytes(),
                 from_blocks.to_bytes(),
@@ -702,7 +705,7 @@ mod tests {
     /// Patches a saved file's header version field down to `version` and
     /// recomputes the header checksum, so the file is otherwise well-formed —
     /// isolating the version check for the tests below.
-    fn patch_version(path: &Path, version: u32) {
+    pub(crate) fn patch_version(path: &Path, version: u32) {
         use crate::storage::page::{PAGE_HEADER_SIZE, PAGE_SIZE, compute_checksum};
 
         let mut bytes = std::fs::read(path).unwrap();
@@ -871,7 +874,7 @@ mod tests {
 
         let doc = &opened.documents()[0];
         let from_file = opened.get_doc_index(0).unwrap().clone();
-        let from_blocks = DocumentIndex::build(&doc.blocks);
+        let from_blocks = DocumentIndex::build(&doc.blocks, TokenizerKind::Word);
         assert_eq!(from_file.to_bytes(), from_blocks.to_bytes());
 
         cleanup(&path);
@@ -913,7 +916,9 @@ mod tests {
         cleanup(&path);
 
         let mut storage = Storage::create(&path).unwrap();
-        storage.flush_catalog(&[], &[], &[], &[]).unwrap();
+        storage
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .unwrap();
 
         let batch1 = vec![
             vec!["1".to_string(), "a".to_string()],

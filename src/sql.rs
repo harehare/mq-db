@@ -77,7 +77,7 @@ use crate::{
     DocumentStore, MqdbError,
     block::{Block, BlockType, Properties, PropertyValue},
     document::{Document, ZoneMaps},
-    indexes::{DocumentIndex, IndexHint, tokenize},
+    indexes::{DocumentIndex, IndexHint, TokenizerKind, tokenize},
     store::{CustomTableState, DatabaseAlias},
 };
 
@@ -707,20 +707,133 @@ fn ok_result() -> QueryOutput {
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
 
-// Corpus-wide stats for `bm25()`, built once per `execute()` call.
+// Corpus-wide stats for `bm25()` — the corpus for the FROM's driving (first)
+// table, mirroring `QUERY_TOKENIZER` below. Rebuilt per `exec_select` (via
+// `Bm25CorpusScope`), sourced from `BM25_CACHE` so repeated/correlated
+// selects against the same store don't rebuild it.
 thread_local! {
     static BM25_CORPUS: std::cell::RefCell<Option<std::rc::Rc<Bm25Corpus>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+// Per-alias override of `BM25_CORPUS`, for a `bm25()` call whose column
+// belongs to a *non-driving* joined table (see `QUERY_TABLE_TOKENIZERS`).
+thread_local! {
+    static QUERY_TABLE_BM25: std::cell::RefCell<FxHashMap<String, std::rc::Rc<Bm25Corpus>>> =
+        std::cell::RefCell::new(FxHashMap::default());
+}
+
+// Corpus cache keyed by store identity (the `DocumentStore`'s address), not
+// a schema name — a nested `SqlEngine` for an attached view/table sees its
+// own store as local too, so a name-relative key like `None` would collide
+// across engines. Shared across the whole top-level `execute()` call.
+thread_local! {
+    static BM25_CACHE: std::cell::RefCell<FxHashMap<usize, std::rc::Rc<Bm25Corpus>>> =
+        std::cell::RefCell::new(FxHashMap::default());
+}
+
+// Set once per top-level `execute()` call (cheap text scan) so `exec_select`
+// knows whether it's worth resolving/building any `Bm25Corpus` at all.
+thread_local! {
+    static QUERY_HAS_BM25: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Tokenizer for the free `match`/`score`/`bm25` functions below (no `&self`
+// access). `exec_select` sets the default via `TokenizerScope` — the FROM's
+// driving (first) table's tokenizer — for a plain, unqualified column
+// reference. `QUERY_TABLE_TOKENIZERS` overrides it per-call when the
+// referenced column is qualified by a *non-driving* joined table's alias,
+// so `match(o.content, …)` against a later-joined, differently-tokenized
+// attached table still tokenizes with `o`'s own tokenizer.
+thread_local! {
+    static QUERY_TOKENIZER: std::cell::Cell<TokenizerKind> =
+        const { std::cell::Cell::new(TokenizerKind::Word) };
+}
+
+thread_local! {
+    static QUERY_TABLE_TOKENIZERS: std::cell::RefCell<FxHashMap<String, TokenizerKind>> =
+        std::cell::RefCell::new(FxHashMap::default());
+}
+
+fn query_tokenizer() -> TokenizerKind {
+    QUERY_TOKENIZER.with(std::cell::Cell::get)
+}
+
+/// RAII override of `QUERY_TOKENIZER`, restored on drop — nests correctly
+/// across correlated subqueries.
+struct TokenizerScope(TokenizerKind);
+
+impl TokenizerScope {
+    fn set(new: TokenizerKind) -> Self {
+        let prev = query_tokenizer();
+        QUERY_TOKENIZER.with(|c| c.set(new));
+        Self(prev)
+    }
+}
+
+impl Drop for TokenizerScope {
+    fn drop(&mut self) {
+        QUERY_TOKENIZER.with(|c| c.set(self.0));
+    }
+}
+
+/// RAII override of `QUERY_TABLE_TOKENIZERS`, restored on drop.
+struct TableTokenizersScope(FxHashMap<String, TokenizerKind>);
+
+impl TableTokenizersScope {
+    fn set(new: FxHashMap<String, TokenizerKind>) -> Self {
+        let prev = QUERY_TABLE_TOKENIZERS.with(|c| c.replace(new));
+        Self(prev)
+    }
+}
+
+impl Drop for TableTokenizersScope {
+    fn drop(&mut self) {
+        QUERY_TABLE_TOKENIZERS.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+
+/// RAII override of `BM25_CORPUS`, restored on drop.
+struct Bm25CorpusScope(Option<std::rc::Rc<Bm25Corpus>>);
+
+impl Bm25CorpusScope {
+    fn set(new: Option<std::rc::Rc<Bm25Corpus>>) -> Self {
+        let prev = BM25_CORPUS.with(|c| c.replace(new));
+        Self(prev)
+    }
+}
+
+impl Drop for Bm25CorpusScope {
+    fn drop(&mut self) {
+        BM25_CORPUS.with(|c| *c.borrow_mut() = self.0.take());
+    }
+}
+
+/// RAII override of `QUERY_TABLE_BM25`, restored on drop.
+struct TableBm25Scope(FxHashMap<String, std::rc::Rc<Bm25Corpus>>);
+
+impl TableBm25Scope {
+    fn set(new: FxHashMap<String, std::rc::Rc<Bm25Corpus>>) -> Self {
+        let prev = QUERY_TABLE_BM25.with(|c| c.replace(new));
+        Self(prev)
+    }
+}
+
+impl Drop for TableBm25Scope {
+    fn drop(&mut self) {
+        QUERY_TABLE_BM25.with(|c| *c.borrow_mut() = std::mem::take(&mut self.0));
+    }
 }
 
 struct Bm25Corpus {
     n: u64,
     avgdl: f64,
     df: FxHashMap<String, u32>,
+    tokenizer: TokenizerKind,
 }
 
 impl Bm25Corpus {
-    fn build(indexes: &[DocumentIndex]) -> Self {
+    fn build(indexes: &[DocumentIndex], tokenizer: TokenizerKind) -> Self {
         let mut n: u64 = 0;
         let mut total_tokens: u64 = 0;
         let mut df: FxHashMap<String, u32> = FxHashMap::default();
@@ -736,14 +849,19 @@ impl Bm25Corpus {
         } else {
             total_tokens as f64 / n as f64
         };
-        Self { n, avgdl, df }
+        Self {
+            n,
+            avgdl,
+            df,
+            tokenizer,
+        }
     }
 
     fn score(&self, content: &str, query: &str) -> f64 {
         if self.n == 0 {
             return 0.0;
         }
-        let content_terms = tokenize(content);
+        let content_terms = tokenize(content, self.tokenizer);
         let dl = content_terms.len() as f64;
         if dl == 0.0 {
             return 0.0;
@@ -752,7 +870,7 @@ impl Bm25Corpus {
         for t in &content_terms {
             *freq.entry(t.as_str()).or_default() += 1;
         }
-        tokenize(query)
+        tokenize(query, self.tokenizer)
             .iter()
             .map(|qt| {
                 let f = f64::from(*freq.get(qt.as_str()).unwrap_or(&0));
@@ -1088,10 +1206,33 @@ fn arith_op(
     }
 }
 
+/// The alias/table qualifier of a function's first argument, e.g. `o` for
+/// `match(o.content, …)` or `match(lower(o.content), …)` — `None` if
+/// unqualified or if columns from more than one alias are mixed in.
+fn first_arg_alias(f: &Function) -> Option<String> {
+    let FunctionArguments::List(al) = &f.args else {
+        return None;
+    };
+    let expr = match al.args.first() {
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => e,
+        _ => return None,
+    };
+    let mut names = Vec::new();
+    collect_column_names(expr, &mut names);
+    let mut aliases = names
+        .iter()
+        .map(|n| n.split_once('.').map(|(alias, _)| alias.to_lowercase()));
+    let first = aliases.next()??;
+    aliases
+        .all(|alias| alias.as_deref() == Some(first.as_str()))
+        .then_some(first)
+}
+
 fn eval_function_call(f: &Function, row: &Row) -> Value {
     let name = f.name.0.last().map(ident_value).unwrap_or("");
+    let name_lower = name.to_lowercase();
     // Aggregates return placeholder; resolved later
-    if is_aggregate_name(&name.to_lowercase()) {
+    if is_aggregate_name(&name_lower) {
         return Value::Int(1);
     }
     let args: Vec<Value> = match &f.args {
@@ -1105,7 +1246,21 @@ fn eval_function_call(f: &Function, row: &Row) -> Value {
             .collect(),
         _ => vec![],
     };
-    eval_scalar_function(name, &args)
+    match name_lower.as_str() {
+        "match" | "score" => {
+            let _scope = first_arg_alias(f)
+                .and_then(|alias| QUERY_TABLE_TOKENIZERS.with(|m| m.borrow().get(&alias).copied()))
+                .map(TokenizerScope::set);
+            eval_scalar_function(name, &args)
+        }
+        "bm25" => {
+            let _scope = first_arg_alias(f)
+                .and_then(|alias| QUERY_TABLE_BM25.with(|m| m.borrow().get(&alias).cloned()))
+                .map(|corpus| Bm25CorpusScope::set(Some(corpus)));
+            eval_scalar_function(name, &args)
+        }
+        _ => eval_scalar_function(name, &args),
+    }
 }
 
 fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
@@ -1149,8 +1304,8 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
                 return Value::Bool(false);
             };
             let content_terms: std::collections::HashSet<String> =
-                tokenize(content).into_iter().collect();
-            let query_terms = tokenize(query);
+                tokenize(content, query_tokenizer()).into_iter().collect();
+            let query_terms = tokenize(query, query_tokenizer());
             Value::Bool(
                 !query_terms.is_empty() && query_terms.iter().all(|t| content_terms.contains(t)),
             )
@@ -1162,8 +1317,8 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             ) else {
                 return Value::Float(0.0);
             };
-            let content_terms = tokenize(content);
-            let query_terms = tokenize(query);
+            let content_terms = tokenize(content, query_tokenizer());
+            let query_terms = tokenize(query, query_tokenizer());
             if content_terms.is_empty() || query_terms.is_empty() {
                 return Value::Float(0.0);
             }
@@ -1997,7 +2152,7 @@ impl<'a> SqlEngine<'a> {
                 if let Some(idx) = store.get_doc_index(i) {
                     idx.clone()
                 } else {
-                    DocumentIndex::build(&doc.blocks)
+                    DocumentIndex::build(&doc.blocks, store.tokenizer())
                 }
             })
             .collect();
@@ -2042,6 +2197,8 @@ impl<'a> SqlEngine<'a> {
     /// Supports `SELECT`, `CREATE TABLE`, `INSERT INTO`, `DROP TABLE`,
     /// `DESC`/`DESCRIBE`, and `SHOW TABLES`.
     pub fn execute(&self, sql: &str) -> Result<QueryOutput, MqdbError> {
+        QUERY_TOKENIZER.with(|c| c.set(self.store.tokenizer()));
+
         // Pre-process non-standard commands (DESC / SHOW TABLES).
         let trimmed = sql.trim().trim_end_matches(';');
         let upper = trimmed.to_ascii_uppercase();
@@ -2067,20 +2224,19 @@ impl<'a> SqlEngine<'a> {
             .next()
             .ok_or_else(|| MqdbError::SqlParse("empty query".into()))?;
 
-        struct Bm25CorpusGuard;
-        impl Drop for Bm25CorpusGuard {
+        // Cheap text scan gating whether `exec_select` bothers resolving any
+        // `Bm25Corpus` at all; the corpora themselves are built lazily,
+        // per referenced store, in `exec_select` (see `BM25_CACHE`).
+        struct Bm25QueryScope(bool);
+        impl Drop for Bm25QueryScope {
             fn drop(&mut self) {
-                BM25_CORPUS.with(|c| *c.borrow_mut() = None);
+                QUERY_HAS_BM25.with(|c| c.set(self.0));
+                BM25_CACHE.with(|c| c.borrow_mut().clear());
             }
         }
-        let _bm25_guard = if trimmed.to_ascii_lowercase().contains("bm25(") {
-            BM25_CORPUS.with(|c| {
-                *c.borrow_mut() = Some(std::rc::Rc::new(Bm25Corpus::build(&self.indexes)))
-            });
-            Some(Bm25CorpusGuard)
-        } else {
-            None
-        };
+        let prev_has_bm25 = QUERY_HAS_BM25.with(std::cell::Cell::get);
+        QUERY_HAS_BM25.with(|c| c.set(trimmed.to_ascii_lowercase().contains("bm25(")));
+        let _bm25_guard = Bm25QueryScope(prev_has_bm25);
 
         match stmt {
             Statement::Query(q) => self.exec_query(&q),
@@ -3061,14 +3217,47 @@ impl<'a> SqlEngine<'a> {
         limit: Option<&Expr>,
         offset: Option<&Expr>,
     ) -> Result<QueryOutput, MqdbError> {
+        // Match FROM's own tokenizer, not necessarily this engine's — the
+        // default for an unqualified column, overridden per-alias below for
+        // `match`/`score`/`bm25` calls against a non-driving joined table.
+        let _tokenizer_scope = TokenizerScope::set(self.tokenizer_for_from(&select.from));
+        let _table_tokenizers_scope =
+            TableTokenizersScope::set(self.tokenizer_map_for_from(&select.from));
+
+        // Same driving-table-default + per-alias-override split for
+        // `bm25()`'s corpus, gated on whether the statement uses `bm25()` at
+        // all (set once in `execute()`) so a plain query never pays for
+        // resolving/building a corpus it doesn't need.
+        let (default_bm25, table_bm25) = if QUERY_HAS_BM25.with(std::cell::Cell::get) {
+            (
+                Some(self.bm25_corpus_for_from(&select.from)?),
+                self.bm25_corpus_map_for_from(&select.from)?,
+            )
+        } else {
+            (None, FxHashMap::default())
+        };
+        let _bm25_scope = Bm25CorpusScope::set(default_bm25);
+        let _table_bm25_scope = TableBm25Scope::set(table_bm25);
+
         // 1. Materialise FROM — with cost-based index predicate pushdown
         let where_expr = select.selection.as_ref();
-        let hint = where_expr
-            .map(|we| self.choose_best_hint(candidate_hints_for_where(we)))
-            .unwrap_or(IndexHint::FullScan);
+        // A hint built from the whole WHERE clause is only sound to push
+        // into `from[0]`'s own scan when there's exactly one FROM table: a
+        // JOIN's WHERE may reference a same-named column on a *different*
+        // table (e.g. `match(o.content, …)` when `from[0]` also has a
+        // `content` column), and pre-filtering `from[0]` by a predicate
+        // that isn't actually about `from[0]` can drop rows that should
+        // have survived the join. Same reasoning as `zone_filter` below.
+        let single_unjoined_from = select.from.len() == 1 && select.from[0].joins.is_empty();
+        let hint = if single_unjoined_from {
+            where_expr
+                .map(|we| self.choose_best_hint(candidate_hints_for_where(we)))
+                .unwrap_or(IndexHint::FullScan)
+        } else {
+            IndexHint::FullScan
+        };
         // Unlike `hint`, a skip has no later row-by-row recheck, so only
         // allow it for a single un-joined FROM table (no alias ambiguity).
-        let single_unjoined_from = select.from.len() == 1 && select.from[0].joins.is_empty();
         let zone_filter = where_expr.filter(|_| single_unjoined_from);
         let mut rows = self.materialise_from_with_hint(&select.from, &hint, zone_filter)?;
 
@@ -3264,6 +3453,160 @@ impl<'a> SqlEngine<'a> {
             Some(row) => substitute_outer_refs_query(query, row),
             None => query.clone(),
         }
+    }
+
+    /// Tokenizer of `from`'s driving (first) table — an attached store's own
+    /// tokenizer for `<alias>.<table>`, not this engine's.
+    fn tokenizer_for_from(&self, from: &[sqlparser::ast::TableWithJoins]) -> TokenizerKind {
+        if let Some(twj) = from.first()
+            && let TableFactor::Table { name, .. } = &twj.relation
+            && name.0.len() >= 2
+        {
+            let schema = ident_value(&name.0[name.0.len() - 2]).to_lowercase();
+            if let Some(other) = self.store.attached.read().unwrap().get(schema.as_str()) {
+                return other.tokenizer();
+            }
+        }
+        self.store.tokenizer()
+    }
+
+    /// `alias -> TokenizerKind` for every table in `from` — driving table
+    /// and every join — each resolved to its own attached store's tokenizer
+    /// where applicable. Overrides `tokenizer_for_from`'s single default for
+    /// a `match`/`score` call whose column is qualified by a non-driving
+    /// table's alias.
+    fn tokenizer_map_for_from(
+        &self,
+        from: &[sqlparser::ast::TableWithJoins],
+    ) -> FxHashMap<String, TokenizerKind> {
+        let mut map = FxHashMap::default();
+        let mut add = |factor: &TableFactor| {
+            let TableFactor::Table { name, alias, .. } = factor else {
+                return;
+            };
+            let key = match alias {
+                Some(a) => a.name.value.to_lowercase(),
+                None => name.0.last().map(ident_value).unwrap_or("").to_lowercase(),
+            };
+            let tokenizer = if name.0.len() >= 2 {
+                let schema = ident_value(&name.0[name.0.len() - 2]).to_lowercase();
+                self.store
+                    .attached
+                    .read()
+                    .unwrap()
+                    .get(schema.as_str())
+                    .map(|other| other.tokenizer())
+            } else {
+                None
+            }
+            .unwrap_or_else(|| self.store.tokenizer());
+            map.insert(key, tokenizer);
+        };
+        for twj in from {
+            add(&twj.relation);
+            for j in &twj.joins {
+                add(&j.relation);
+            }
+        }
+        map
+    }
+
+    /// The `Bm25Corpus` for `schema` (`None` = this store), cached in
+    /// `BM25_CACHE` under the resolved store's address (see its comment).
+    fn bm25_corpus_for_schema(
+        &self,
+        schema: Option<&str>,
+    ) -> Result<std::rc::Rc<Bm25Corpus>, MqdbError> {
+        let key = match schema {
+            None => self.store as *const DocumentStore as usize,
+            Some(schema) => {
+                let guard = self.store.attached.read().unwrap();
+                let other = guard
+                    .get(schema)
+                    .ok_or_else(|| MqdbError::SqlExec(format!("unknown database '{schema}'")))?;
+                other as *const DocumentStore as usize
+            }
+        };
+        if let Some(cached) = BM25_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+            return Ok(cached);
+        }
+        let corpus = match schema {
+            None => std::rc::Rc::new(Bm25Corpus::build(&self.indexes, self.store.tokenizer())),
+            Some(schema) => {
+                let guard = self.store.attached.read().unwrap();
+                let other = guard
+                    .get(schema)
+                    .ok_or_else(|| MqdbError::SqlExec(format!("unknown database '{schema}'")))?;
+                let engine = SqlEngine::new(other)?;
+                std::rc::Rc::new(Bm25Corpus::build(&engine.indexes, other.tokenizer()))
+            }
+        };
+        BM25_CACHE.with(|c| c.borrow_mut().insert(key, corpus.clone()));
+        Ok(corpus)
+    }
+
+    /// `Bm25Corpus` for `from`'s driving (first) table — the default used by
+    /// an unqualified `bm25(content, …)` call, mirroring `tokenizer_for_from`.
+    fn bm25_corpus_for_from(
+        &self,
+        from: &[sqlparser::ast::TableWithJoins],
+    ) -> Result<std::rc::Rc<Bm25Corpus>, MqdbError> {
+        if let Some(twj) = from.first()
+            && let TableFactor::Table { name, .. } = &twj.relation
+            && name.0.len() >= 2
+        {
+            let schema = ident_value(&name.0[name.0.len() - 2]).to_lowercase();
+            if self
+                .store
+                .attached
+                .read()
+                .unwrap()
+                .contains_key(schema.as_str())
+            {
+                return self.bm25_corpus_for_schema(Some(&schema));
+            }
+        }
+        self.bm25_corpus_for_schema(None)
+    }
+
+    /// `alias -> Bm25Corpus` for every table in `from` — driving table and
+    /// every join — so `bm25(o.content, …)` against a non-driving joined
+    /// table uses that table's own store's corpus (indexes, statistics,
+    /// tokenizer) instead of the driving table's.
+    fn bm25_corpus_map_for_from(
+        &self,
+        from: &[sqlparser::ast::TableWithJoins],
+    ) -> Result<FxHashMap<String, std::rc::Rc<Bm25Corpus>>, MqdbError> {
+        let mut map = FxHashMap::default();
+        let mut add = |factor: &TableFactor| -> Result<(), MqdbError> {
+            let TableFactor::Table { name, alias, .. } = factor else {
+                return Ok(());
+            };
+            let key = match alias {
+                Some(a) => a.name.value.to_lowercase(),
+                None => name.0.last().map(ident_value).unwrap_or("").to_lowercase(),
+            };
+            let schema = if name.0.len() >= 2 {
+                let s = ident_value(&name.0[name.0.len() - 2]).to_lowercase();
+                self.store
+                    .attached
+                    .read()
+                    .unwrap()
+                    .contains_key(s.as_str())
+                    .then_some(s)
+            } else {
+                None
+            };
+            map.insert(key, self.bm25_corpus_for_schema(schema.as_deref())?);
+            Ok(())
+        };
+        for twj in from {
+            add(&twj.relation)?;
+            for j in &twj.joins {
+                add(&j.relation)?;
+            }
+        }
+        Ok(map)
     }
 
     fn materialise_from_with_hint(
@@ -5869,7 +6212,7 @@ fn match_terms_from_expr(expr: &Expr) -> Option<Vec<String>> {
         return None;
     }
     let query_str = expr_str_val(q)?;
-    let terms = tokenize(&query_str);
+    let terms = tokenize(&query_str, query_tokenizer());
     if terms.is_empty() { None } else { Some(terms) }
 }
 
@@ -6826,6 +7169,30 @@ mod tests {
             .execute("SELECT content FROM blocks WHERE match(content, 'architecture')")
             .unwrap();
         assert_eq!(out.rows, vec![vec!["Architecture".to_string()]]);
+    }
+
+    #[test]
+    fn trigram_store_matches_and_scores_japanese_content() {
+        let mut store = DocumentStore::new();
+        store.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        store
+            .add_str("# 日記\n\n今日は良い天気です\n\n昨日は雨でした\n")
+            .unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+
+        let out = engine
+            .execute("SELECT content FROM blocks WHERE match(content, '良い天気')")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["今日は良い天気です".to_string()]]);
+
+        let out = engine
+            .execute(
+                "SELECT content FROM blocks
+                 WHERE block_type = 'paragraph'
+                 ORDER BY bm25(content, '良い天気') DESC LIMIT 1",
+            )
+            .unwrap();
+        assert_eq!(out.rows[0][0], "今日は良い天気です");
     }
 
     #[test]
@@ -8460,6 +8827,190 @@ mod tests {
             )
             .unwrap();
         assert!(!out.rows.is_empty());
+    }
+
+    #[test]
+    fn attach_match_uses_other_stores_tokenizer() {
+        use crate::indexes::TokenizerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = DocumentStore::new();
+        other.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        other.add_str("# Doc\n\n今日は良い天気です\n").unwrap();
+        let other_path = dir.path().join("other.mq-db");
+        other.save(&other_path).unwrap();
+
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let out = engine
+            .execute("SELECT content FROM other.blocks WHERE match(content, '良い天気')")
+            .unwrap();
+        assert_eq!(out.rows, vec![vec!["今日は良い天気です".to_string()]]);
+    }
+
+    #[test]
+    fn attach_match_on_non_driving_joined_table_uses_its_own_tokenizer() {
+        use crate::indexes::TokenizerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = DocumentStore::new();
+        other.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        other.add_str("# Doc\n\n今日は良い天気です\n").unwrap();
+        let other_path = dir.path().join("other.mq-db");
+        other.save(&other_path).unwrap();
+
+        // Driving table `b` is the local (Word-tokenized) store; the
+        // matched column belongs to the non-driving joined `other` table.
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let out = engine
+            .execute(
+                "SELECT o.content FROM blocks b JOIN other.blocks o \
+                 ON b.block_type = o.block_type \
+                 WHERE match(o.content, '良い天気')",
+            )
+            .unwrap();
+        assert!(!out.rows.is_empty());
+        assert!(
+            out.rows
+                .iter()
+                .all(|r| r == &vec!["今日は良い天気です".to_string()])
+        );
+    }
+
+    #[test]
+    fn attach_bm25_on_non_driving_joined_table_uses_its_own_corpus() {
+        use crate::indexes::TokenizerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = DocumentStore::new();
+        other.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        other.add_str("# Doc\n\n今日は良い天気です\n").unwrap();
+        let other_path = dir.path().join("other.mq-db");
+        other.save(&other_path).unwrap();
+
+        // Driving table `b` is the local (Word-tokenized) store; `bm25()`
+        // scores content from the non-driving joined `other` table, so it
+        // must use `other`'s own corpus stats/tokenizer, not the local one.
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let out = engine
+            .execute(
+                "SELECT bm25(o.content, '良い天気') FROM blocks b \
+                 JOIN other.blocks o ON b.block_type = o.block_type \
+                 WHERE o.block_type = 'paragraph'",
+            )
+            .unwrap();
+        assert!(!out.rows.is_empty());
+        for row in &out.rows {
+            let score: f64 = row[0].parse().unwrap();
+            assert!(score > 0.0, "expected positive bm25 score, got {score}");
+        }
+    }
+
+    #[test]
+    fn attach_match_on_wrapped_joined_column_uses_its_own_tokenizer() {
+        use crate::indexes::TokenizerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = DocumentStore::new();
+        other.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        other.add_str("# Doc\n\n今日は良い天気です\n").unwrap();
+        let other_path = dir.path().join("other.mq-db");
+        other.save(&other_path).unwrap();
+
+        // Same table setup as `attach_match_on_non_driving_joined_table_uses_its_own_tokenizer`,
+        // but the reference to `o.content` is wrapped in `lower(...)` instead
+        // of appearing bare — must still resolve to `other`'s tokenizer.
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let out = engine
+            .execute(
+                "SELECT o.content FROM blocks b JOIN other.blocks o \
+                 ON b.block_type = o.block_type \
+                 WHERE match(lower(o.content), '良い天気')",
+            )
+            .unwrap();
+        assert!(!out.rows.is_empty());
+        assert!(
+            out.rows
+                .iter()
+                .all(|r| r == &vec!["今日は良い天気です".to_string()])
+        );
+    }
+
+    #[test]
+    fn attach_view_bm25_does_not_reuse_local_corpus() {
+        use crate::indexes::TokenizerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = DocumentStore::new();
+        other.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        other.add_str("# Doc\n\n今日は良い天気です\n").unwrap();
+        {
+            let view_engine = SqlEngine::new(&other).unwrap();
+            view_engine
+                .execute(
+                    "CREATE VIEW ranked AS SELECT block_type, bm25(content, '良い天気') AS score FROM blocks",
+                )
+                .unwrap();
+        }
+        let other_path = dir.path().join("other.mq-db");
+        other.save(&other_path).unwrap();
+
+        // The outer, local (Word-tokenized) query's own `bm25()` call caches
+        // its corpus under the top-level engine's key first; `other.ranked`'s
+        // own unqualified `bm25()` then runs in a nested `SqlEngine` and must
+        // not receive that cached local corpus.
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let out = engine
+            .execute(
+                "SELECT r.score FROM blocks b JOIN other.ranked r \
+                 ON b.block_type = r.block_type \
+                 WHERE bm25(b.content, 'Details') >= 0 AND r.block_type = 'paragraph'",
+            )
+            .unwrap();
+        assert!(!out.rows.is_empty());
+        for row in &out.rows {
+            let score: f64 = row[0].parse().unwrap();
+            assert!(score > 0.0, "expected positive bm25 score, got {score}");
+        }
     }
 
     #[test]

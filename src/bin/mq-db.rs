@@ -21,7 +21,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
 use mq_db::{
     DatabaseAlias, DocumentStore, MqEngine, QueryOutput, SqlEngine, block::BlockType,
-    sql::html_escape,
+    indexes::TokenizerKind, sql::html_escape,
 };
 use serde::Deserialize;
 
@@ -40,6 +40,24 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+/// CLI-facing mirror of [`TokenizerKind`] (`clap::ValueEnum` needs a local type).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TokenizerArg {
+    Word,
+    Bigram,
+    Trigram,
+}
+
+impl From<TokenizerArg> for TokenizerKind {
+    fn from(arg: TokenizerArg) -> Self {
+        match arg {
+            TokenizerArg::Word => TokenizerKind::Word,
+            TokenizerArg::Bigram => TokenizerKind::Bigram,
+            TokenizerArg::Trigram => TokenizerKind::Trigram,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -61,6 +79,12 @@ enum Commands {
         /// Do not store source line/column spans (saves ~21 bytes per block)
         #[arg(long)]
         no_spans: bool,
+
+        /// Full-text tokenizer for a new store (default: word). Ignored when
+        /// --output already exists — its original choice, from the catalog,
+        /// is used instead.
+        #[arg(long, value_enum)]
+        tokenizer: Option<TokenizerArg>,
 
         /// Remove catalogued documents whose path is no longer present in
         /// the indexed paths (only applies when --output already exists)
@@ -504,6 +528,7 @@ async fn main() -> anyhow::Result<()> {
             output,
             recursive,
             no_spans,
+            tokenizer,
             prune,
         } => {
             let files = mq_db::discover::collect_markdown_files(&paths, recursive);
@@ -517,11 +542,27 @@ async fn main() -> anyhow::Result<()> {
                 if no_spans {
                     store.set_store_spans(false);
                 }
+                if let Some(tokenizer) = tokenizer {
+                    store
+                        .set_tokenizer(tokenizer.into())
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
                 store
             } else {
                 maybe_migrate(&output)?;
-                DocumentStore::open(&output)
-                    .map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?
+                let store = DocumentStore::open(&output)
+                    .map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?;
+                if let Some(arg) = tokenizer {
+                    let requested: TokenizerKind = arg.into();
+                    if requested != store.tokenizer() {
+                        eprintln!(
+                            "warning: --tokenizer {arg:?} ignored; {} already uses {:?}",
+                            output.display(),
+                            store.tokenizer()
+                        );
+                    }
+                }
+                store
             };
 
             let report = store

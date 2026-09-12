@@ -84,7 +84,7 @@ use crate::{
     document::Document,
     error::MqdbError,
     index,
-    indexes::DocumentIndex,
+    indexes::{DocumentIndex, TokenizerKind},
     query::Query,
     storage::{
         Storage,
@@ -200,6 +200,8 @@ pub struct DocumentStore {
     next_doc_id: DocumentId,
     /// When `false`, source line/column spans are discarded after parsing.
     store_spans: bool,
+    /// Full-text tokenizer strategy, fixed at creation (see `set_tokenizer`).
+    tokenizer: TokenizerKind,
     /// Open storage file kept for lazy block / index loading. `None` when the
     /// store was built entirely in memory or fully loaded via `load()`.
     /// Wrapped in `Mutex` so DDL operations (which hold only `&DocumentStore`)
@@ -234,6 +236,7 @@ impl Default for DocumentStore {
             documents: Vec::new(),
             next_doc_id: 0,
             store_spans: true,
+            tokenizer: TokenizerKind::Word,
             storage: Mutex::new(None),
             doc_indexes: Vec::new(),
             custom_tables: RwLock::new(FxHashMap::default()),
@@ -311,6 +314,23 @@ impl DocumentStore {
     /// block added after this call. Reduces memory by ~21 bytes per block.
     pub fn set_store_spans(&mut self, val: bool) {
         self.store_spans = val;
+    }
+
+    /// This store's full-text tokenizer strategy (see [`TokenizerKind`]).
+    pub fn tokenizer(&self) -> TokenizerKind {
+        self.tokenizer
+    }
+
+    /// Sets the tokenizer. Errors if the store already has documents, since
+    /// `save()` may reuse indexes cached under the old tokenizer otherwise.
+    pub fn set_tokenizer(&mut self, kind: TokenizerKind) -> Result<(), MqdbError> {
+        if !self.documents.is_empty() {
+            return Err(MqdbError::Storage(
+                "cannot change tokenizer on a store that already has documents".into(),
+            ));
+        }
+        self.tokenizer = kind;
+        Ok(())
     }
 
     /// Register a custom virtual table that can be queried via SQL.
@@ -463,7 +483,7 @@ impl DocumentStore {
                 let first_block_page = storage.write_document(&doc)?;
                 doc.first_block_page = first_block_page;
 
-                let idx = DocumentIndex::build(&doc.blocks);
+                let idx = DocumentIndex::build(&doc.blocks, self.tokenizer);
                 let index_start_page = storage.write_index(&idx.to_bytes())?;
                 doc.index_start_page = index_start_page;
 
@@ -547,7 +567,7 @@ impl DocumentStore {
                 let first_block_page = storage.write_document(&doc)?;
                 doc.first_block_page = first_block_page;
 
-                let idx = DocumentIndex::build(&doc.blocks);
+                let idx = DocumentIndex::build(&doc.blocks, self.tokenizer);
                 let index_start_page = storage.write_index(&idx.to_bytes())?;
                 doc.index_start_page = index_start_page;
 
@@ -759,7 +779,10 @@ impl DocumentStore {
             }
         }
 
-        Ok(DocumentIndex::build(&self.documents[i].blocks))
+        Ok(DocumentIndex::build(
+            &self.documents[i].blocks,
+            self.tokenizer,
+        ))
     }
 
     /// Returns the cached `DocumentIndex` for the document at position `i`.
@@ -872,6 +895,7 @@ impl DocumentStore {
                     &custom,
                     &self.content_hash_pairs(),
                     &self.views_entries(),
+                    self.tokenizer,
                 );
             }
         }
@@ -932,6 +956,7 @@ impl DocumentStore {
             &custom,
             &self.content_hash_pairs(),
             &self.views_entries(),
+            self.tokenizer,
         );
     }
 
@@ -968,7 +993,7 @@ impl DocumentStore {
                 let idx = if let Some(cached) = self.doc_indexes.get(i).and_then(|o| o.as_ref()) {
                     std::borrow::Cow::Borrowed(cached)
                 } else {
-                    std::borrow::Cow::Owned(DocumentIndex::build(&doc.blocks))
+                    std::borrow::Cow::Owned(DocumentIndex::build(&doc.blocks, self.tokenizer))
                 };
                 let bytes = idx.to_bytes();
                 entries[i].index_start_page = storage.write_index(&bytes)?;
@@ -997,6 +1022,7 @@ impl DocumentStore {
                 &custom,
                 &self.content_hash_pairs(),
                 &self.views_entries(),
+                self.tokenizer,
             )?;
             Ok(())
         })();
@@ -1060,7 +1086,7 @@ impl DocumentStore {
                 storage.file_version()
             )));
         }
-        let (entries, custom_table_entries, content_hashes, view_entries) =
+        let (entries, custom_table_entries, content_hashes, view_entries, tokenizer) =
             storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
@@ -1104,6 +1130,7 @@ impl DocumentStore {
             documents,
             next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
             store_spans: true,
+            tokenizer,
             storage: Mutex::new(Some(storage)),
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(custom_tables),
@@ -1120,7 +1147,7 @@ impl DocumentStore {
     /// here — [`crate::SqlEngine`] builds them lazily on construction.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open(path.as_ref())?;
-        let (entries, custom_table_entries, content_hashes, view_entries) =
+        let (entries, custom_table_entries, content_hashes, view_entries, tokenizer) =
             storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
@@ -1160,6 +1187,7 @@ impl DocumentStore {
             documents,
             next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
             store_spans: true,
+            tokenizer,
             storage: Mutex::new(None),
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(custom_tables),
@@ -1177,7 +1205,7 @@ impl DocumentStore {
     /// `list`), avoiding the cost of deserialising all block data.
     pub fn load_catalog_only(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open(path.as_ref())?;
-        let (entries, _custom_table_entries, content_hashes, _view_entries) =
+        let (entries, _custom_table_entries, content_hashes, _view_entries, tokenizer) =
             storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
@@ -1201,6 +1229,7 @@ impl DocumentStore {
             documents,
             next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
             store_spans: true,
+            tokenizer,
             storage: Mutex::new(None),
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(FxHashMap::default()),
@@ -1537,5 +1566,62 @@ mod vacuum_tests {
         // live handle vacuum() reopened) sees the same state.
         let reloaded = DocumentStore::load(&db_path).unwrap();
         assert_eq!(reloaded.documents().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_tests {
+    use super::*;
+
+    #[test]
+    fn set_tokenizer_rejects_non_empty_store() {
+        let mut store = DocumentStore::new();
+        store.add_str("# A\n\nHello\n").unwrap();
+        let err = store.set_tokenizer(TokenizerKind::Trigram).unwrap_err();
+        assert!(err.to_string().contains("cannot change tokenizer"));
+    }
+
+    #[test]
+    fn save_then_open_round_trips_tokenizer_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        store.add_str("# 日記\n\n今日は良い天気です\n").unwrap();
+        store.save(&db_path).unwrap();
+
+        let opened = DocumentStore::open(&db_path).unwrap();
+        assert_eq!(opened.tokenizer(), TokenizerKind::Trigram);
+
+        let loaded = DocumentStore::load(&db_path).unwrap();
+        assert_eq!(loaded.tokenizer(), TokenizerKind::Trigram);
+    }
+
+    #[test]
+    fn saving_non_word_tokenizer_bumps_past_pre_tokenizer_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.set_tokenizer(TokenizerKind::Trigram).unwrap();
+        store.add_str("# Doc\n\n今日は良い天気です\n").unwrap();
+        store.save(&db_path).unwrap();
+
+        assert_ne!(DocumentStore::file_version(&db_path).unwrap(), 6);
+    }
+
+    #[test]
+    fn load_reads_legacy_v6_file_without_tokenizer_tag_as_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.add_str("# Doc\n\nHello world\n").unwrap();
+        store.save(&db_path).unwrap();
+        crate::storage::tests::patch_version(&db_path, 6);
+
+        let loaded = DocumentStore::load(&db_path).unwrap();
+        assert_eq!(loaded.tokenizer(), TokenizerKind::Word);
     }
 }

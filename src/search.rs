@@ -12,9 +12,9 @@ pub struct FindHit {
 
 /// Top `limit` hits for `query`, ranked by relevance.
 ///
-/// Adds a substring fallback to `match()`/`bm25()` because
-/// [`crate::indexes::tokenize`] treats a punctuation-free CJK run as one
-/// token, so a query for part of that run would otherwise never match.
+/// Adds a substring fallback to `match()`/`bm25()` for stores using the
+/// `Word` tokenizer, which lumps a punctuation-free CJK run into one token
+/// (a `Bigram`/`Trigram` store doesn't need it, but the fallback is harmless).
 pub fn find_hits(
     store: &DocumentStore,
     query: &str,
