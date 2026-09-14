@@ -21,8 +21,11 @@ pub(crate) const PAGE_TYPE_TABLE_DATA: u32 = 6;
 const FILE_MAGIC: u32 = 0x4D51_4442;
 // v7 adds the persisted tokenizer tag; a v6 reader ignores it and always
 // queries as Word, so it must not accept a Bigram/Trigram store as v6.
-pub const FILE_VERSION: u32 = 7;
-const LEGACY_VERSIONS: &[u32] = &[4, 5, 6];
+// v8 replaces the mutable catalog head with a copy-on-write catalog rooted
+// from one of two alternating superblocks.  This is deliberately a format
+// bump: a v7 reader would otherwise mistake a superblock for catalog data.
+pub const FILE_VERSION: u32 = 8;
+const LEGACY_VERSIONS: &[u32] = &[4, 5, 6, 7];
 const CATALOG_START_PAGE: u32 = 1;
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {
@@ -81,7 +84,9 @@ pub struct PageFile {
     file: File,
     pub num_pages: u32,
     /// `true` if `num_pages` has advanced since the header page was last
-    /// written to disk; `append_page` no longer writes it eagerly.
+    /// written to disk.  v8 deliberately never rewrites the header during a
+    /// commit; the physical file length is authoritative and the selected
+    /// superblock bounds the committed logical file.
     header_dirty: bool,
     /// File-format version read from the header. `FILE_VERSION` for files
     /// created by this build; an older value if `open` accepted a legacy
@@ -161,9 +166,18 @@ impl PageFile {
             ));
         }
 
+        // A v8 crash can leave unreachable pages after the last committed
+        // superblock, so use physical length to inspect and recover the
+        // newest valid root.
+        let physical_pages = u32::try_from(file_len / PAGE_SIZE as u64)
+            .map_err(|_| invalid_data("database file has too many pages"))?;
         Ok(Self {
             file,
-            num_pages,
+            // The physical length is also a safe upper bound for legacy
+            // files.  Their catalog root remains page 1, while this permits
+            // v8 recovery even when a deliberately downgraded header is
+            // inspected by migration tooling.
+            num_pages: physical_pages,
             header_dirty: false,
             version,
         })
@@ -221,10 +235,22 @@ impl PageFile {
     /// Persists `num_pages` if it changed since the last write. Must run
     /// before the file is reopened from disk (see `Storage::flush_catalog`).
     pub fn sync_header(&mut self) -> Result<(), MqdbError> {
+        if self.version == FILE_VERSION {
+            // The v8 commit record is a superblock, not page 0.  Still make
+            // the data durable for callers that use PageFile directly.
+            self.file.sync_all()?;
+            return Ok(());
+        }
         if self.header_dirty {
             self.write_file_header()?;
             self.header_dirty = false;
         }
+        Ok(())
+    }
+
+    /// Durably flush appended data before publishing a new catalog root.
+    pub fn sync_all(&self) -> Result<(), MqdbError> {
+        self.file.sync_all()?;
         Ok(())
     }
 

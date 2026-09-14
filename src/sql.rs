@@ -2738,7 +2738,7 @@ impl<'a> SqlEngine<'a> {
                     unique: vec![],
                 },
             );
-            self.store.try_flush_catalog_to_storage();
+            self.store.flush_catalog_to_storage()?;
             return Ok(QueryOutput {
                 columns: vec!["rows".to_string()],
                 rows: vec![vec![n.to_string()]],
@@ -2781,7 +2781,7 @@ impl<'a> SqlEngine<'a> {
                 unique,
             },
         );
-        self.store.try_flush_catalog_to_storage();
+        self.store.flush_catalog_to_storage()?;
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec!["ok".to_string()]],
@@ -2840,7 +2840,7 @@ impl<'a> SqlEngine<'a> {
             .write()
             .unwrap()
             .insert(view_name, sql_text);
-        self.store.try_flush_catalog_to_storage();
+        self.store.flush_catalog_to_storage()?;
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec!["ok".to_string()]],
@@ -2872,7 +2872,7 @@ impl<'a> SqlEngine<'a> {
             }
             dropped
         };
-        self.store.try_flush_catalog_to_storage();
+        self.store.flush_catalog_to_storage()?;
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec![format!("{dropped} view(s) dropped")]],
@@ -2984,7 +2984,7 @@ impl<'a> SqlEngine<'a> {
         // the whole table, so INSERT cost stays proportional to the rows
         // being added rather than the table's total size.
         self.store
-            .try_append_table_rows_to_storage(&table_name, &new_rows);
+            .append_table_rows_to_storage(&table_name, &new_rows)?;
         Ok(QueryOutput {
             columns: vec!["rows_affected".to_string()],
             rows: vec![vec![inserted.to_string()]],
@@ -3016,7 +3016,7 @@ impl<'a> SqlEngine<'a> {
             }
             dropped
         }; // write lock released before flush
-        self.store.try_flush_catalog_to_storage();
+        self.store.flush_catalog_to_storage()?;
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec![format!("{dropped} table(s) dropped")]],
