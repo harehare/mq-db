@@ -1,7 +1,7 @@
-/* mq-db theme — matching docs/index.html (paper / ink / accent / mark) */
+/* mq-db theme, matching docs/index.html (paper / ink / accent / mark) */
 
 :root {
-    /* mq-db brand colors — light ("paper" manuscript) */
+    /* mq-db brand colors: light ("paper" manuscript) */
     --mqdb-paper: #faf6ef;
     --mqdb-paper-alt: #f2ebdb;
     --mqdb-paper-deep: #e2d6bf;
@@ -47,7 +47,7 @@
 }
 
 .coal {
-    /* mq-db brand colors — dark ("manuscript by candlelight") */
+    /* mq-db brand colors: dark ("manuscript by candlelight") */
     --mqdb-paper: #1b1714;
     --mqdb-paper-alt: #231e1a;
     --mqdb-paper-deep: #383028;
@@ -110,7 +110,7 @@ body {
     border-bottom: 1px solid rgba(56, 48, 40, 0.6);
 }
 
-/* Title — Space Grotesk, matching index.html hero */
+/* Title: Space Grotesk, matching index.html hero */
 .menu-title {
     font-family: "Space Grotesk", sans-serif;
     font-weight: 700;
@@ -172,7 +172,7 @@ body {
     line-height: 1.7;
 }
 
-/* Headings — Space Grotesk, matching index.html */
+/* Headings: Space Grotesk, matching index.html */
 h1,
 h2,
 h3,
@@ -226,7 +226,7 @@ pre {
     border-color: var(--mqdb-paper-deep);
 }
 
-/* inline code only — not code inside pre */
+/* inline code only, not code inside pre */
 :not(pre) > code {
     display: inline;
     font-family: "JetBrains Mono", "Consolas", "Monaco", monospace;
@@ -364,7 +364,7 @@ table tbody tr:hover {
     color: var(--mqdb-paper);
 }
 
-/* Syntax highlighting — scoped per theme */
+/* Syntax highlighting: scoped per theme */
 .coal .hljs {
     display: block;
     overflow-x: auto;

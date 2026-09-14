@@ -1,7 +1,7 @@
 # MQDB Storage Format
 
-This document has moved into the mdbook documentation:
+This document moved into the book:
 
-**[Storage Format Reference](book/reference/storage-format.html)** (Reference → Storage Format)
+**[Storage Format Reference](https://db.mqlang.org/book/reference/storage-format)**
 
-(Locally: `docs/books/src/reference/storage-format.md`, built to `docs/book/reference/storage-format.html`.)
+Source: `docs/books/src/reference/storage-format.md`.
