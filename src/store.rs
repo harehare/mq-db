@@ -371,8 +371,7 @@ impl DocumentStore {
                 "database alias '{alias}' is already attached — DETACH it first"
             )));
         }
-        let mut other = DocumentStore::open(path)?;
-        other.load_all_blocks()?;
+        let mut other = DocumentStore::load(path)?;
         other.load_all_indexes()?;
         self.attached.write().unwrap().insert(alias, other);
         Ok(())
@@ -957,6 +956,17 @@ impl DocumentStore {
         Ok(())
     }
 
+    pub(crate) fn rollback_appended_rows(&self, table_name: &str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut guard = self.custom_tables.write().unwrap();
+        if let Some(state) = guard.get_mut(table_name) {
+            let new_len = state.rows.len().saturating_sub(count);
+            state.rows.truncate(new_len);
+        }
+    }
+
     // Persistence
 
     /// Persist all in-memory documents to a `.mq-db` file, including secondary
@@ -1075,6 +1085,13 @@ impl DocumentStore {
                         .into(),
                 ));
             };
+            if !storage.same_backing_file(path)? {
+                return Err(MqdbError::Storage(format!(
+                    "vacuum target {} is not the file this store was opened from — \
+                     vacuum only rewrites its own backing file in place",
+                    path.display()
+                )));
+            }
             storage.num_pages()
         };
 
@@ -1567,6 +1584,25 @@ mod vacuum_tests {
     }
 
     #[test]
+    fn vacuum_rejects_a_different_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let md_path = write_md(&dir, "a.md", "# A\n\nHello\n");
+        let db_path = dir.path().join("store.mq-db");
+        let other_path = dir.path().join("other.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&md_path).unwrap();
+        store.save(&db_path).unwrap();
+
+        let mut opened = open_for_writes(&db_path);
+        let err = opened.vacuum(&other_path).unwrap_err();
+        assert!(err.to_string().contains("not the file"));
+
+        let report = opened.vacuum(&db_path).unwrap();
+        assert_eq!(report.pages_before, report.pages_after);
+    }
+
+    #[test]
     fn vacuum_preserves_views_and_custom_tables() {
         let dir = tempfile::tempdir().unwrap();
         let md_path = write_md(&dir, "a.md", "# A\n\nHello\n");
@@ -1598,6 +1634,41 @@ mod vacuum_tests {
         // live handle vacuum() reopened) sees the same state.
         let reloaded = DocumentStore::load(&db_path).unwrap();
         assert_eq!(reloaded.documents().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_appended_rows_truncates_the_tail() {
+        let store = DocumentStore::new();
+        store.custom_tables.write().unwrap().insert(
+            "t".to_string(),
+            CustomTableState {
+                columns: vec!["x".to_string()],
+                rows: vec![vec!["a".to_string()], vec!["b".to_string()], vec![
+                    "c".to_string(),
+                ]],
+                first_row_page: 0,
+                last_row_page: 0,
+                not_null: vec![],
+                unique: vec![],
+            },
+        );
+
+        store.rollback_appended_rows("t", 2);
+
+        let rows = store.custom_tables.read().unwrap()["t"].rows.clone();
+        assert_eq!(rows, vec![vec!["a".to_string()]]);
+    }
+
+    #[test]
+    fn rollback_appended_rows_ignores_unknown_table_and_zero_count() {
+        let store = DocumentStore::new();
+        store.rollback_appended_rows("missing", 3);
+        store.rollback_appended_rows("missing", 0);
     }
 }
 
