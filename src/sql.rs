@@ -2728,7 +2728,7 @@ impl<'a> SqlEngine<'a> {
             let result = self.exec_query(query)?;
             let n = result.rows.len();
             self.store.custom_tables.write().unwrap().insert(
-                table_name,
+                table_name.clone(),
                 CustomTableState {
                     columns: result.columns,
                     rows: result.rows,
@@ -2738,7 +2738,10 @@ impl<'a> SqlEngine<'a> {
                     unique: vec![],
                 },
             );
-            self.store.try_flush_catalog_to_storage();
+            if let Err(err) = self.store.flush_catalog_to_storage() {
+                self.store.custom_tables.write().unwrap().remove(&table_name);
+                return Err(err);
+            }
             return Ok(QueryOutput {
                 columns: vec!["rows".to_string()],
                 rows: vec![vec![n.to_string()]],
@@ -2771,7 +2774,7 @@ impl<'a> SqlEngine<'a> {
         }
         let (not_null, unique) = table_constraints(&columns, &ct.columns, &ct.constraints);
         self.store.custom_tables.write().unwrap().insert(
-            table_name,
+            table_name.clone(),
             CustomTableState {
                 columns,
                 rows: vec![],
@@ -2781,7 +2784,10 @@ impl<'a> SqlEngine<'a> {
                 unique,
             },
         );
-        self.store.try_flush_catalog_to_storage();
+        if let Err(err) = self.store.flush_catalog_to_storage() {
+            self.store.custom_tables.write().unwrap().remove(&table_name);
+            return Err(err);
+        }
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec!["ok".to_string()]],
@@ -2839,8 +2845,11 @@ impl<'a> SqlEngine<'a> {
             .views
             .write()
             .unwrap()
-            .insert(view_name, sql_text);
-        self.store.try_flush_catalog_to_storage();
+            .insert(view_name.clone(), sql_text);
+        if let Err(err) = self.store.flush_catalog_to_storage() {
+            self.store.views.write().unwrap().remove(&view_name);
+            return Err(err);
+        }
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec!["ok".to_string()]],
@@ -2852,6 +2861,7 @@ impl<'a> SqlEngine<'a> {
         names: &[ObjectName],
         if_exists: bool,
     ) -> Result<QueryOutput, MqdbError> {
+        let mut removed = Vec::new();
         let dropped = {
             let mut guard = self.store.views.write().unwrap();
             let mut dropped = 0usize;
@@ -2862,17 +2872,28 @@ impl<'a> SqlEngine<'a> {
                         "cannot drop built-in table '{view_name}'"
                     )));
                 }
-                if guard.remove(&view_name).is_some() {
-                    dropped += 1;
-                } else if !if_exists {
-                    return Err(MqdbError::SqlExec(format!(
-                        "view '{view_name}' does not exist"
-                    )));
+                match guard.remove(&view_name) {
+                    Some(sql) => {
+                        removed.push((view_name, sql));
+                        dropped += 1;
+                    }
+                    None if !if_exists => {
+                        return Err(MqdbError::SqlExec(format!(
+                            "view '{view_name}' does not exist"
+                        )));
+                    }
+                    None => {}
                 }
             }
             dropped
         };
-        self.store.try_flush_catalog_to_storage();
+        if let Err(err) = self.store.flush_catalog_to_storage() {
+            let mut guard = self.store.views.write().unwrap();
+            for (name, sql) in removed {
+                guard.insert(name, sql);
+            }
+            return Err(err);
+        }
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec![format!("{dropped} view(s) dropped")]],
@@ -2983,8 +3004,13 @@ impl<'a> SqlEngine<'a> {
         // Append only the new rows to the on-disk chain instead of rewriting
         // the whole table, so INSERT cost stays proportional to the rows
         // being added rather than the table's total size.
-        self.store
-            .try_append_table_rows_to_storage(&table_name, &new_rows);
+        if let Err(err) = self
+            .store
+            .append_table_rows_to_storage(&table_name, &new_rows)
+        {
+            self.store.rollback_appended_rows(&table_name, inserted);
+            return Err(err);
+        }
         Ok(QueryOutput {
             columns: vec!["rows_affected".to_string()],
             rows: vec![vec![inserted.to_string()]],
@@ -2996,6 +3022,7 @@ impl<'a> SqlEngine<'a> {
         names: &[ObjectName],
         if_exists: bool,
     ) -> Result<QueryOutput, MqdbError> {
+        let mut removed = Vec::new();
         let dropped = {
             let mut guard = self.store.custom_tables.write().unwrap();
             let mut dropped = 0usize;
@@ -3006,17 +3033,28 @@ impl<'a> SqlEngine<'a> {
                         "cannot drop built-in table '{table_name}'"
                     )));
                 }
-                if guard.remove(&table_name).is_some() {
-                    dropped += 1;
-                } else if !if_exists {
-                    return Err(MqdbError::SqlExec(format!(
-                        "table '{table_name}' does not exist"
-                    )));
+                match guard.remove(&table_name) {
+                    Some(state) => {
+                        removed.push((table_name, state));
+                        dropped += 1;
+                    }
+                    None if !if_exists => {
+                        return Err(MqdbError::SqlExec(format!(
+                            "table '{table_name}' does not exist"
+                        )));
+                    }
+                    None => {}
                 }
             }
             dropped
         }; // write lock released before flush
-        self.store.try_flush_catalog_to_storage();
+        if let Err(err) = self.store.flush_catalog_to_storage() {
+            let mut guard = self.store.custom_tables.write().unwrap();
+            for (name, state) in removed {
+                guard.insert(name, state);
+            }
+            return Err(err);
+        }
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec![format!("{dropped} table(s) dropped")]],
@@ -9047,6 +9085,26 @@ mod tests {
 
         let err = engine.execute(&attach_sql).unwrap_err();
         assert!(err.to_string().contains("already attached"));
+    }
+
+    #[test]
+    fn attach_does_not_block_a_concurrent_writer_on_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_path = saved_store(&dir, "other.mq-db", "# Other Doc\n\nOther body\n");
+
+        let _writer = DocumentStore::open(&other_path).unwrap();
+
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let result = engine.execute("SELECT content FROM other.blocks").unwrap();
+        assert!(!result.rows.is_empty());
     }
 
     #[test]

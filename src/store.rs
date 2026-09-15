@@ -99,7 +99,7 @@ use crate::{
 ///
 /// Tables that already have a row-page chain are left untouched here — their
 /// pages were already written by an earlier flush or incremental `INSERT`
-/// append (see [`DocumentStore::try_append_table_rows_to_storage`]).
+/// append (see [`DocumentStore::append_table_rows_to_storage`]).
 fn persist_unsaved_table_rows(
     storage: &mut Storage,
     custom_tables: &RwLock<FxHashMap<String, CustomTableState>>,
@@ -371,8 +371,7 @@ impl DocumentStore {
                 "database alias '{alias}' is already attached — DETACH it first"
             )));
         }
-        let mut other = DocumentStore::open(path)?;
-        other.load_all_blocks()?;
+        let mut other = DocumentStore::load(path)?;
         other.load_all_indexes()?;
         self.attached.write().unwrap().insert(alias, other);
         Ok(())
@@ -496,7 +495,7 @@ impl DocumentStore {
         self.documents.push(doc);
 
         if flush {
-            self.try_flush_catalog_to_storage();
+            self.flush_catalog_to_storage()?;
         }
         Ok(doc_id)
     }
@@ -581,7 +580,7 @@ impl DocumentStore {
         self.doc_indexes[pos] = idx_opt;
 
         if flush {
-            self.try_flush_catalog_to_storage();
+            self.flush_catalog_to_storage()?;
         }
         Ok(())
     }
@@ -671,7 +670,7 @@ impl DocumentStore {
             }
         }
 
-        self.try_flush_catalog_to_storage();
+        self.flush_catalog_to_storage()?;
         Ok(report)
     }
 
@@ -830,7 +829,7 @@ impl DocumentStore {
     /// Any table whose rows have never been persisted is written out in full
     /// here (a one-time cost). Tables already backed by a row-page chain keep
     /// their existing pages untouched — see
-    /// [`try_append_table_rows_to_storage`](DocumentStore::try_append_table_rows_to_storage)
+    /// [`append_table_rows_to_storage`](DocumentStore::append_table_rows_to_storage)
     /// for the incremental `INSERT` path.
     pub(crate) fn begin_transaction(&self) -> Result<(), MqdbError> {
         let mut guard = self.tx_snapshot.lock().unwrap();
@@ -864,7 +863,7 @@ impl DocumentStore {
             .ok_or_else(|| MqdbError::SqlExec("no transaction is in progress".into()))?;
         *self.custom_tables.write().unwrap() = snapshot.custom_tables;
         *self.views.write().unwrap() = snapshot.views;
-        self.try_flush_catalog_to_storage();
+        self.flush_catalog_to_storage()?;
         Ok(())
     }
 
@@ -881,24 +880,27 @@ impl DocumentStore {
         self.content_hashes = snapshot.content_hashes;
         *self.custom_tables.write().unwrap() = snapshot.custom_tables;
         *self.views.write().unwrap() = snapshot.views;
-        self.try_flush_catalog_to_storage();
+        self.flush_catalog_to_storage()?;
         Ok(unrevertable_paths)
     }
 
-    pub(crate) fn try_flush_catalog_to_storage(&self) {
+    /// Publish the complete in-memory metadata as a durable COW catalog.
+    /// Errors are deliberately propagated: reporting success after a failed
+    /// commit is worse than leaving the caller to retry.
+    pub(crate) fn flush_catalog_to_storage(&self) -> Result<(), MqdbError> {
         let mut guard = self.storage.lock().unwrap();
         if let Some(storage) = guard.as_mut() {
             let entries = self.catalog_entries();
-            if let Ok(custom) = persist_unsaved_table_rows(storage, &self.custom_tables) {
-                let _ = storage.flush_catalog(
-                    &entries,
-                    &custom,
-                    &self.content_hash_pairs(),
-                    &self.views_entries(),
-                    self.tokenizer,
-                );
-            }
+            let custom = persist_unsaved_table_rows(storage, &self.custom_tables)?;
+            storage.flush_catalog(
+                &entries,
+                &custom,
+                &self.content_hash_pairs(),
+                &self.views_entries(),
+                self.tokenizer,
+            )?;
         }
+        Ok(())
     }
 
     /// Append `new_rows` to `table_name`'s on-disk row chain and flush a
@@ -907,34 +909,27 @@ impl DocumentStore {
     ///
     /// This is what makes `INSERT INTO <table>` incremental: the cost is
     /// proportional to the rows being inserted, not to the table's total size.
-    pub(crate) fn try_append_table_rows_to_storage(
+    pub(crate) fn append_table_rows_to_storage(
         &self,
         table_name: &str,
-        new_rows: &[Vec<String>],
-    ) {
+        _new_rows: &[Vec<String>],
+    ) -> Result<(), MqdbError> {
         let mut guard = self.storage.lock().unwrap();
         let storage = match guard.as_mut() {
             Some(s) => s,
-            None => return,
+            None => return Ok(()),
         };
 
         {
             let mut ct_guard = self.custom_tables.write().unwrap();
             if let Some(state) = ct_guard.get_mut(table_name) {
-                let persisted = if state.first_row_page == 0 {
-                    // Nothing persisted yet for this table — write everything
-                    // currently in memory (covers rows seeded via
-                    // `register_table` plus the ones just inserted).
-                    storage.write_table_rows(&state.rows)
-                } else {
-                    storage
-                        .append_table_rows(state.last_row_page, new_rows)
-                        .map(|last| (state.first_row_page, last))
-                };
-                if let Ok((first, last)) = persisted {
-                    state.first_row_page = first;
-                    state.last_row_page = last;
-                }
+                // A table chain's tail link used to be patched in place here.
+                // That makes an uncommitted append reachable after a crash.
+                // Until table pages gain their own immutable segment map, make
+                // the chain COW as well and publish it only with the catalog.
+                let (first, last) = storage.write_table_rows(&state.rows)?;
+                state.first_row_page = first;
+                state.last_row_page = last;
             }
         }
 
@@ -951,13 +946,25 @@ impl DocumentStore {
             })
             .collect();
         drop(ct_guard);
-        let _ = storage.flush_catalog(
+        storage.flush_catalog(
             &entries,
             &custom,
             &self.content_hash_pairs(),
             &self.views_entries(),
             self.tokenizer,
-        );
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn rollback_appended_rows(&self, table_name: &str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut guard = self.custom_tables.write().unwrap();
+        if let Some(state) = guard.get_mut(table_name) {
+            let new_len = state.rows.len().saturating_sub(count);
+            state.rows.truncate(new_len);
+        }
     }
 
     // Persistence
@@ -965,7 +972,28 @@ impl DocumentStore {
     /// Persist all in-memory documents to a `.mq-db` file, including secondary
     /// indexes. Writes atomically: writes to `path.tmp` then renames to `path`.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), MqdbError> {
-        let path = path.as_ref();
+        self.save_inner(path.as_ref(), false)
+    }
+
+    /// `write_lock_held` is used by migration, whose snapshot and replacement
+    /// must be one writer-critical section rather than two separately locked
+    /// operations.
+    fn save_inner(&self, path: &Path, write_lock_held: bool) -> Result<(), MqdbError> {
+        // `save` publishes via rename, so lock a stable sidecar for the
+        // whole build-and-publish window.  An already-open store holds that
+        // same lock for its lifetime; do not attempt to lock it twice.
+        let save_lock = {
+            let guard = self.storage.lock().unwrap();
+            if write_lock_held
+                || guard
+                    .as_ref()
+                    .is_some_and(|storage| storage.holds_lock_for(path))
+            {
+                None
+            } else {
+                Some(Storage::acquire_write_lock(path)?)
+            }
+        };
         let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
         if tmp_path.exists() {
             std::fs::remove_file(&tmp_path)?;
@@ -1033,6 +1061,11 @@ impl DocumentStore {
         }
 
         std::fs::rename(&tmp_path, path)?;
+        // A rename is only power-loss durable after the containing directory
+        // is synced as well.
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)?.sync_all()?;
+        drop(save_lock);
         Ok(())
     }
 
@@ -1052,12 +1085,25 @@ impl DocumentStore {
                         .into(),
                 ));
             };
+            if !storage.same_backing_file(path)? {
+                return Err(MqdbError::Storage(format!(
+                    "vacuum target {} is not the file this store was opened from — \
+                     vacuum only rewrites its own backing file in place",
+                    path.display()
+                )));
+            }
             storage.num_pages()
         };
 
         self.save(path)?;
 
-        let reopened = Storage::open(path)?;
+        let previous = self
+            .storage
+            .lock()
+            .unwrap()
+            .take()
+            .expect("vacuum checked that storage was open");
+        let reopened = Storage::reopen_after_replace(path, previous)?;
         let pages_after = reopened.num_pages();
         *self.storage.lock().unwrap() = Some(reopened);
 
@@ -1146,7 +1192,7 @@ impl DocumentStore {
     /// All block data is read from disk. Secondary indexes are **not** built
     /// here — [`crate::SqlEngine`] builds them lazily on construction.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
-        let mut storage = Storage::open(path.as_ref())?;
+        let mut storage = Storage::open_read_only(path.as_ref())?;
         let (entries, custom_table_entries, content_hashes, view_entries, tokenizer) =
             storage.load_catalog()?;
         let cap = entries.len();
@@ -1204,7 +1250,7 @@ impl DocumentStore {
     /// is empty. Useful for commands that only need zone-map metadata (e.g.
     /// `list`), avoiding the cost of deserialising all block data.
     pub fn load_catalog_only(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
-        let mut storage = Storage::open(path.as_ref())?;
+        let mut storage = Storage::open_read_only(path.as_ref())?;
         let (entries, _custom_table_entries, content_hashes, _view_entries, tokenizer) =
             storage.load_catalog()?;
         let cap = entries.len();
@@ -1244,7 +1290,7 @@ impl DocumentStore {
     /// catalog. Use this to decide whether [`DocumentStore::migrate`] is
     /// needed before calling [`DocumentStore::open`].
     pub fn file_version(path: impl AsRef<Path>) -> Result<u32, MqdbError> {
-        Ok(Storage::open(path.as_ref())?.file_version())
+        Ok(Storage::open_read_only(path.as_ref())?.file_version())
     }
 
     /// Rewrites a store written by an older but still-recognised file
@@ -1260,12 +1306,15 @@ impl DocumentStore {
     /// before calling this.
     pub fn migrate(path: impl AsRef<Path>) -> Result<u32, MqdbError> {
         let path = path.as_ref();
-        let old_version = Self::file_version(path)?;
+        // Keep the writer lock from reading the old snapshot through the
+        // final rename, otherwise another writer could be silently replaced.
+        let _migration_lock = Storage::acquire_write_lock(path)?;
+        let old_version = Storage::open_read_only(path)?.file_version();
         if old_version == FILE_VERSION {
             return Ok(old_version);
         }
         let store = Self::load(path)?;
-        store.save(path)?;
+        store.save_inner(path, true)?;
         Ok(old_version)
     }
 }
@@ -1535,6 +1584,25 @@ mod vacuum_tests {
     }
 
     #[test]
+    fn vacuum_rejects_a_different_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let md_path = write_md(&dir, "a.md", "# A\n\nHello\n");
+        let db_path = dir.path().join("store.mq-db");
+        let other_path = dir.path().join("other.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&md_path).unwrap();
+        store.save(&db_path).unwrap();
+
+        let mut opened = open_for_writes(&db_path);
+        let err = opened.vacuum(&other_path).unwrap_err();
+        assert!(err.to_string().contains("not the file"));
+
+        let report = opened.vacuum(&db_path).unwrap();
+        assert_eq!(report.pages_before, report.pages_after);
+    }
+
+    #[test]
     fn vacuum_preserves_views_and_custom_tables() {
         let dir = tempfile::tempdir().unwrap();
         let md_path = write_md(&dir, "a.md", "# A\n\nHello\n");
@@ -1566,6 +1634,41 @@ mod vacuum_tests {
         // live handle vacuum() reopened) sees the same state.
         let reloaded = DocumentStore::load(&db_path).unwrap();
         assert_eq!(reloaded.documents().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_appended_rows_truncates_the_tail() {
+        let store = DocumentStore::new();
+        store.custom_tables.write().unwrap().insert(
+            "t".to_string(),
+            CustomTableState {
+                columns: vec!["x".to_string()],
+                rows: vec![vec!["a".to_string()], vec!["b".to_string()], vec![
+                    "c".to_string(),
+                ]],
+                first_row_page: 0,
+                last_row_page: 0,
+                not_null: vec![],
+                unique: vec![],
+            },
+        );
+
+        store.rollback_appended_rows("t", 2);
+
+        let rows = store.custom_tables.read().unwrap()["t"].rows.clone();
+        assert_eq!(rows, vec![vec!["a".to_string()]]);
+    }
+
+    #[test]
+    fn rollback_appended_rows_ignores_unknown_table_and_zero_count() {
+        let store = DocumentStore::new();
+        store.rollback_appended_rows("missing", 3);
+        store.rollback_appended_rows("missing", 0);
     }
 }
 

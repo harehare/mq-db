@@ -234,13 +234,68 @@ pub fn write_catalog(
     Ok(())
 }
 
+/// Append an immutable catalog chain and return its first page id.
+///
+/// No reachable page is overwritten.  The caller must make the pages durable
+/// and then publish this returned root through its commit record.
+pub fn append_catalog(
+    pf: &mut PageFile,
+    entries: &[CatalogEntry],
+    custom_tables: &[CustomTableEntry],
+    content_hashes: &[(u32, u64)],
+    views: &[ViewEntry],
+    tokenizer: TokenizerKind,
+) -> Result<u32, MqdbError> {
+    let bytes = serialize_catalog(entries, custom_tables, content_hashes, views, tokenizer);
+    let chunks: Vec<&[u8]> = if bytes.is_empty() {
+        vec![&[]]
+    } else {
+        bytes.chunks(PAGE_BODY_SIZE).collect()
+    };
+    let first_page = pf.num_pages;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let page_id = first_page
+            .checked_add(
+                u32::try_from(index).map_err(|_| invalid_data("catalog page count overflow"))?,
+            )
+            .ok_or_else(|| invalid_data("catalog page id overflow"))?;
+        let next_page = if index + 1 < chunks.len() {
+            page_id
+                .checked_add(1)
+                .ok_or_else(|| invalid_data("catalog next page overflow"))?
+        } else {
+            0
+        };
+        let page = make_page(PAGE_TYPE_CATALOG, page_id, next_page, chunk);
+        let appended = pf.append_page(&page)?;
+        if appended != page_id {
+            return Err(invalid_data("catalog page allocation was not contiguous"));
+        }
+    }
+    Ok(first_page)
+}
+
+/// Read a catalog chain from an explicit root.  v8 obtains that root from a
+/// checksummed superblock; legacy files still use page 1 via `read_catalog`.
+pub fn read_catalog_at(pf: &mut PageFile, start_page: u32) -> Result<CatalogData, MqdbError> {
+    if start_page == 0 || start_page >= pf.num_pages {
+        return Err(invalid_data("catalog start page is missing"));
+    }
+
+    read_catalog_from(pf, start_page)
+}
+
 pub fn read_catalog(pf: &mut PageFile) -> Result<CatalogData, MqdbError> {
     if pf.num_pages < 2 {
         return Err(invalid_data("catalog start page is missing"));
     }
 
+    read_catalog_from(pf, 1)
+}
+
+fn read_catalog_from(pf: &mut PageFile, start_page: u32) -> Result<CatalogData, MqdbError> {
     let mut bytes = Vec::new();
-    let mut page_id = 1u32;
+    let mut page_id = start_page;
     let mut visited = HashSet::new();
 
     loop {
