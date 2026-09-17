@@ -52,9 +52,28 @@ pub(crate) struct DatabaseLock {
     _file: File,
 }
 
+fn resolve_identity(path: &Path) -> Result<PathBuf, MqdbError> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(canonical);
+    }
+    let file_name = path.file_name().ok_or_else(|| {
+        invalid_data(format!(
+            "database path has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let canonical_parent = match parent {
+        Some(parent) => parent.canonicalize()?,
+        None => std::env::current_dir()?,
+    };
+    Ok(canonical_parent.join(file_name))
+}
+
 impl DatabaseLock {
     fn acquire(path: &Path) -> Result<Self, MqdbError> {
-        let lock_path = PathBuf::from(format!("{}.lock", path.to_string_lossy()));
+        let identity = resolve_identity(path)?;
+        let lock_path = PathBuf::from(format!("{}.lock", identity.to_string_lossy()));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -211,6 +230,10 @@ impl Storage {
 
     pub fn holds_lock_for(&self, path: &Path) -> bool {
         self.path == path
+    }
+
+    pub(crate) fn same_backing_file(&self, path: &Path) -> Result<bool, MqdbError> {
+        Ok(resolve_identity(&self.path)? == resolve_identity(path)?)
     }
 
     fn into_lock(self) -> DatabaseLock {
@@ -1213,6 +1236,26 @@ pub(crate) mod tests {
         drop(storage);
 
         Storage::open(&path).unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writable_open_is_exclusive_through_a_symlink_alias() {
+        let path = test_file_path("symlink-lock-target");
+        cleanup(&path);
+        let alias = test_file_path("symlink-lock-alias");
+        let _ = std::fs::remove_file(&alias);
+
+        let storage = Storage::create(&path).unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let err = Storage::open(&alias)
+            .err()
+            .expect("second writer through the symlink must fail");
+        assert!(err.to_string().contains("already open for writing"));
+
+        drop(storage);
+        std::fs::remove_file(&alias).unwrap();
         cleanup(&path);
     }
 
