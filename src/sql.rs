@@ -2849,13 +2849,22 @@ impl<'a> SqlEngine<'a> {
             ));
         }
 
-        self.store
+        let previous = self
+            .store
             .views
             .write()
             .unwrap()
             .insert(view_name.clone(), sql_text);
         if let Err(err) = self.store.flush_catalog_to_storage() {
-            self.store.views.write().unwrap().remove(&view_name);
+            let mut views = self.store.views.write().unwrap();
+            match previous {
+                Some(previous_sql) => {
+                    views.insert(view_name, previous_sql);
+                }
+                None => {
+                    views.remove(&view_name);
+                }
+            }
             return Err(err);
         }
         Ok(QueryOutput {

@@ -494,8 +494,11 @@ impl DocumentStore {
         self.doc_indexes.push(idx_opt);
         self.documents.push(doc);
 
-        if flush {
-            self.flush_catalog_to_storage()?;
+        if flush && let Err(err) = self.flush_catalog_to_storage() {
+            self.documents.pop();
+            self.doc_indexes.pop();
+            self.next_doc_id -= 1;
+            return Err(err);
         }
         Ok(doc_id)
     }
@@ -576,11 +579,13 @@ impl DocumentStore {
             }
         };
 
-        self.documents[pos] = doc;
-        self.doc_indexes[pos] = idx_opt;
+        let previous_doc = std::mem::replace(&mut self.documents[pos], doc);
+        let previous_idx = std::mem::replace(&mut self.doc_indexes[pos], idx_opt);
 
-        if flush {
-            self.flush_catalog_to_storage()?;
+        if flush && let Err(err) = self.flush_catalog_to_storage() {
+            self.documents[pos] = previous_doc;
+            self.doc_indexes[pos] = previous_idx;
+            return Err(err);
         }
         Ok(())
     }
@@ -605,6 +610,8 @@ impl DocumentStore {
         let mut report = ReindexReport::default();
         let mut seen: HashSet<PathBuf> = HashSet::with_capacity(files.len());
         let contents = read_files_parallel(files);
+        let documents_snapshot = self.documents.clone();
+        let content_hashes_snapshot = self.content_hashes.clone();
 
         // Path -> (DocumentId, position), for O(1) lookup instead of an
         // O(N) scan per file below.
@@ -670,7 +677,12 @@ impl DocumentStore {
             }
         }
 
-        self.flush_catalog_to_storage()?;
+        if let Err(err) = self.flush_catalog_to_storage() {
+            self.documents = documents_snapshot;
+            self.doc_indexes = vec![None; self.documents.len()];
+            self.content_hashes = content_hashes_snapshot;
+            return Err(err);
+        }
         Ok(report)
     }
 
@@ -984,11 +996,12 @@ impl DocumentStore {
         // same lock for its lifetime; do not attempt to lock it twice.
         let save_lock = {
             let guard = self.storage.lock().unwrap();
-            if write_lock_held
-                || guard
-                    .as_ref()
-                    .is_some_and(|storage| storage.holds_lock_for(path))
-            {
+            let already_locked = write_lock_held
+                || match guard.as_ref() {
+                    Some(storage) => storage.same_backing_file(path)?,
+                    None => false,
+                };
+            if already_locked {
                 None
             } else {
                 Some(Storage::acquire_write_lock(path)?)

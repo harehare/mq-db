@@ -50,9 +50,47 @@ const SUPERBLOCK_B: u32 = 2;
 
 pub(crate) struct DatabaseLock {
     _file: File,
+    /// Second lock keyed by inode, held in addition to `_file` whenever the
+    /// database file exists yet, so hard-link aliases (different paths,
+    /// same inode) still contend for one lock. `create` runs its acquire
+    /// before the file exists, so it can only take the path-keyed lock —
+    /// this field stays `None` in that case.
+    _inode_file: Option<File>,
 }
 
-fn resolve_identity(path: &Path) -> Result<PathBuf, MqdbError> {
+/// Filesystem identity of a database path; hard-link aliases share `Inode`.
+#[derive(Clone, PartialEq, Eq)]
+enum FileIdentity {
+    /// Device + inode (Unix) / volume + file index (Windows) of an existing file.
+    Inode(String),
+    /// Normalized path, used only when the file doesn't exist yet.
+    Path(PathBuf),
+}
+
+#[cfg(unix)]
+fn inode_key(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(format!("u{:x}.{:x}", meta.dev(), meta.ino()))
+}
+
+#[cfg(windows)]
+fn inode_key(path: &Path) -> Option<String> {
+    use std::os::windows::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(format!(
+        "w{:x}.{:x}",
+        meta.volume_serial_number()?,
+        meta.file_index()?
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inode_key(_path: &Path) -> Option<String> {
+    None
+}
+
+fn normalized_path_identity(path: &Path) -> Result<PathBuf, MqdbError> {
     if let Ok(canonical) = path.canonicalize() {
         return Ok(canonical);
     }
@@ -70,25 +108,64 @@ fn resolve_identity(path: &Path) -> Result<PathBuf, MqdbError> {
     Ok(canonical_parent.join(file_name))
 }
 
+fn resolve_identity(path: &Path) -> Result<FileIdentity, MqdbError> {
+    if let Some(key) = inode_key(path) {
+        return Ok(FileIdentity::Inode(key));
+    }
+    Ok(FileIdentity::Path(normalized_path_identity(path)?))
+}
+
+fn open_and_lock(lock_path: &Path) -> Result<File, MqdbError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        // The lock file is a stable coordination inode; never erase it
+        // when another process is merely attempting to acquire its lock.
+        .truncate(false)
+        .open(lock_path)?;
+    file.try_lock_exclusive().map_err(|err| {
+        MqdbError::Storage(format!(
+            "database is already open for writing (lock: {}): {err}",
+            lock_path.display()
+        ))
+    })?;
+    Ok(file)
+}
+
 impl DatabaseLock {
     fn acquire(path: &Path) -> Result<Self, MqdbError> {
-        let identity = resolve_identity(path)?;
-        let lock_path = PathBuf::from(format!("{}.lock", identity.to_string_lossy()));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            // The lock file is a stable coordination inode; never erase it
-            // when another process is merely attempting to acquire its lock.
-            .truncate(false)
-            .open(&lock_path)?;
-        file.try_lock_exclusive().map_err(|err| {
-            MqdbError::Storage(format!(
-                "database is already open for writing (lock: {}): {err}",
-                lock_path.display()
-            ))
-        })?;
-        Ok(Self { _file: file })
+        let path_identity = normalized_path_identity(path)?;
+        let file = open_and_lock(&PathBuf::from(format!(
+            "{}.lock",
+            path_identity.to_string_lossy()
+        )))?;
+        let mut lock = Self {
+            _file: file,
+            _inode_file: None,
+        };
+        lock.acquire_inode_lock(path)?;
+        Ok(lock)
+    }
+
+    /// Take the inode-keyed lock too, once the database file exists. A
+    /// no-op if already held, or if `path` still doesn't exist (e.g. called
+    /// from `acquire` by `Storage::create`, before the file is made) — the
+    /// caller retries this after creating the file.
+    fn acquire_inode_lock(&mut self, path: &Path) -> Result<(), MqdbError> {
+        if self._inode_file.is_some() {
+            return Ok(());
+        }
+        let Some(key) = inode_key(path) else {
+            return Ok(());
+        };
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        let dir = match parent {
+            Some(parent) => parent.canonicalize()?,
+            None => std::env::current_dir()?,
+        };
+        self._inode_file = Some(open_and_lock(&dir.join(format!(".{key}.mq-db.lock")))?);
+        Ok(())
     }
 }
 
@@ -173,8 +250,9 @@ impl Storage {
     }
     /// Create a new empty database file. Writes file header + empty catalog.
     pub fn create(path: &Path) -> Result<Self, MqdbError> {
-        let lock = DatabaseLock::acquire(path)?;
+        let mut lock = DatabaseLock::acquire(path)?;
         let mut page_file = PageFile::create(path)?;
+        lock.acquire_inode_lock(path)?;
         // Reserve two fixed commit records before appending the first root.
         // A zero-magic page is invalid and therefore never selected during
         // recovery.
@@ -226,10 +304,6 @@ impl Storage {
     /// Total pages in the file, including the header and catalog pages.
     pub fn num_pages(&self) -> u32 {
         self.page_file.num_pages
-    }
-
-    pub fn holds_lock_for(&self, path: &Path) -> bool {
-        self.path == path
     }
 
     pub(crate) fn same_backing_file(&self, path: &Path) -> Result<bool, MqdbError> {
@@ -1252,6 +1326,26 @@ pub(crate) mod tests {
         let err = Storage::open(&alias)
             .err()
             .expect("second writer through the symlink must fail");
+        assert!(err.to_string().contains("already open for writing"));
+
+        drop(storage);
+        std::fs::remove_file(&alias).unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writable_open_is_exclusive_through_a_hard_link_alias() {
+        let path = test_file_path("hardlink-lock-target");
+        cleanup(&path);
+        let alias = test_file_path("hardlink-lock-alias");
+        let _ = std::fs::remove_file(&alias);
+
+        let storage = Storage::create(&path).unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        let err = Storage::open(&alias)
+            .err()
+            .expect("second writer through the hard link must fail");
         assert!(err.to_string().contains("already open for writing"));
 
         drop(storage);
