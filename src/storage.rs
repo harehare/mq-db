@@ -175,18 +175,15 @@ impl DatabaseLock {
         Ok(())
     }
 
-    /// Replace the inode-keyed lock with one for `path`'s current inode.
-    /// Used by [`Storage::reopen_after_replace`] after vacuum's rename
-    /// changes which inode the stable path lock guards: the new inode's
-    /// lock is acquired before the old one is dropped, so the replacement
-    /// inode is never briefly unlocked.
-    fn refresh_inode_lock(&mut self, path: &Path) -> Result<(), MqdbError> {
-        let Some(key) = inode_key(path) else {
-            self._inode_file = None;
-            return Ok(());
-        };
-        self._inode_file = Some(open_and_lock(&inode_lock_path(&key))?);
-        Ok(())
+    /// Take the inode-keyed lock file, leaving `self` without one.
+    fn take_inode_lock(&mut self) -> Option<File> {
+        self._inode_file.take()
+    }
+
+    /// Adopt an already-held inode lock in place of whatever `self` has.
+    /// Avoids a re-acquire gap: see [`Storage::reopen_after_replace`].
+    fn adopt_inode_lock(&mut self, inode_file: Option<File>) {
+        self._inode_file = inode_file;
     }
 }
 
@@ -337,13 +334,18 @@ impl Storage {
     }
 
     /// Reopen after an atomic replacement while retaining the sidecar lock.
-    /// Used by vacuum so there is no unlocked interval around `rename`. The
-    /// stable path lock is kept as-is; the inode lock is refreshed to match
-    /// the replacement file's (new) inode so hard-link aliases of it still
-    /// contend for a lock.
-    pub fn reopen_after_replace(path: &Path, previous: Self) -> Result<Self, MqdbError> {
+    /// Used by vacuum so there is no unlocked interval around `rename`: the
+    /// stable path lock comes from `previous`, and the inode lock is
+    /// transplanted from `replacement` (held since before the rename), so
+    /// the replacement inode is never briefly unlocked.
+    pub fn reopen_after_replace(
+        path: &Path,
+        previous: Self,
+        replacement: Self,
+    ) -> Result<Self, MqdbError> {
         let mut lock = previous.into_lock();
-        lock.refresh_inode_lock(path)?;
+        let mut replacement_lock = replacement.into_lock();
+        lock.adopt_inode_lock(replacement_lock.take_inode_lock());
         Self::open_with_lock(path, Some(lock))
     }
 
@@ -1322,6 +1324,57 @@ pub(crate) mod tests {
             "must retain the previous committed root"
         );
         drop(recovered);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_read_only_tolerates_a_partial_trailing_page_on_v8() {
+        use crate::storage::page::PAGE_SIZE;
+        use std::io::{Seek, SeekFrom, Write};
+
+        let path = test_file_path("v8-partial-tail");
+        cleanup(&path);
+
+        let mut storage = Storage::create(&path).unwrap();
+        storage
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .unwrap();
+        drop(storage);
+
+        // Simulate a concurrent writer mid-append: extra bytes past the
+        // committed length, short of a full page and unreferenced by any
+        // superblock.
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&[0u8; PAGE_SIZE / 2]).unwrap();
+        drop(file);
+
+        Storage::open_read_only(&path).expect("v8 open must tolerate a torn tail");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_rejects_unaligned_legacy_file() {
+        use crate::storage::page::PAGE_SIZE;
+        use std::io::{Seek, SeekFrom, Write};
+
+        let path = test_file_path("legacy-unaligned-tail");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store.add_str("# Hello\n\nBody\n").unwrap();
+        store.save(&path).unwrap();
+        patch_version(&path, 4);
+
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&[0u8; PAGE_SIZE / 2]).unwrap();
+        drop(file);
+
+        let err = Storage::open_read_only(&path)
+            .err()
+            .expect("legacy formats still require page-aligned files");
+        assert!(err.to_string().contains("not aligned"));
         cleanup(&path);
     }
 

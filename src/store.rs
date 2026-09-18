@@ -228,6 +228,10 @@ pub struct DocumentStore {
     /// reindex".
     content_hashes: FxHashMap<DocumentId, u64>,
     pub(crate) tx_snapshot: Mutex<Option<TxSnapshot>>,
+    /// Serializes mutate-then-flush-or-rollback DDL/DML as one operation, so
+    /// a failing flush can't roll back into a catalog another thread already
+    /// committed durably.
+    pub(crate) catalog_commit: Mutex<()>,
 }
 
 impl Default for DocumentStore {
@@ -244,6 +248,7 @@ impl Default for DocumentStore {
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: FxHashMap::default(),
             tx_snapshot: Mutex::new(None),
+            catalog_commit: Mutex::new(()),
         }
     }
 }
@@ -873,6 +878,7 @@ impl DocumentStore {
             .unwrap()
             .take()
             .ok_or_else(|| MqdbError::SqlExec("no transaction is in progress".into()))?;
+        let _catalog_guard = self.catalog_commit.lock().unwrap();
         *self.custom_tables.write().unwrap() = snapshot.custom_tables;
         *self.views.write().unwrap() = snapshot.views;
         self.flush_catalog_to_storage()?;
@@ -984,13 +990,17 @@ impl DocumentStore {
     /// Persist all in-memory documents to a `.mq-db` file, including secondary
     /// indexes. Writes atomically: writes to `path.tmp` then renames to `path`.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), MqdbError> {
-        self.save_inner(path.as_ref(), false)
+        self.save_inner(path.as_ref(), false).map(|_| ())
     }
 
     /// `write_lock_held` is used by migration, whose snapshot and replacement
     /// must be one writer-critical section rather than two separately locked
     /// operations.
-    fn save_inner(&self, path: &Path, write_lock_held: bool) -> Result<(), MqdbError> {
+    ///
+    /// Returns the temp storage the new file was written through, still
+    /// holding its inode lock, so [`vacuum`](Self::vacuum) can carry that
+    /// lock into the reopened storage without a re-acquire gap.
+    fn save_inner(&self, path: &Path, write_lock_held: bool) -> Result<Storage, MqdbError> {
         // `save` publishes via rename, so lock a stable sidecar for the
         // whole build-and-publish window.  An already-open store holds that
         // same lock for its lifetime; do not attempt to lock it twice.
@@ -1012,7 +1022,7 @@ impl DocumentStore {
             std::fs::remove_file(&tmp_path)?;
         }
 
-        let write_result = (|| -> Result<(), MqdbError> {
+        let write_result = (|| -> Result<Storage, MqdbError> {
             let mut storage = Storage::create(&tmp_path)?;
             let mut entries = Vec::with_capacity(self.documents.len());
 
@@ -1065,13 +1075,16 @@ impl DocumentStore {
                 &self.views_entries(),
                 self.tokenizer,
             )?;
-            Ok(())
+            Ok(storage)
         })();
 
-        if let Err(err) = write_result {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
-        }
+        let temp_storage = match write_result {
+            Ok(storage) => storage,
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+        };
 
         std::fs::rename(&tmp_path, path)?;
         // A rename is only power-loss durable after the containing directory
@@ -1079,7 +1092,7 @@ impl DocumentStore {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::File::open(parent)?.sync_all()?;
         drop(save_lock);
-        Ok(())
+        Ok(temp_storage)
     }
 
     /// Rewrites the backing `.mq-db` file at `path` from scratch (same
@@ -1108,7 +1121,7 @@ impl DocumentStore {
             storage.num_pages()
         };
 
-        self.save(path)?;
+        let replacement = self.save_inner(path, false)?;
 
         let previous = self
             .storage
@@ -1116,7 +1129,7 @@ impl DocumentStore {
             .unwrap()
             .take()
             .expect("vacuum checked that storage was open");
-        let reopened = Storage::reopen_after_replace(path, previous)?;
+        let reopened = Storage::reopen_after_replace(path, previous, replacement)?;
         let pages_after = reopened.num_pages();
         *self.storage.lock().unwrap() = Some(reopened);
 
@@ -1197,6 +1210,7 @@ impl DocumentStore {
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
             tx_snapshot: Mutex::new(None),
+            catalog_commit: Mutex::new(()),
         })
     }
 
@@ -1254,6 +1268,7 @@ impl DocumentStore {
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
             tx_snapshot: Mutex::new(None),
+            catalog_commit: Mutex::new(()),
         })
     }
 
@@ -1296,6 +1311,7 @@ impl DocumentStore {
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
             tx_snapshot: Mutex::new(None),
+            catalog_commit: Mutex::new(()),
         })
     }
 

@@ -2723,6 +2723,9 @@ impl<'a> SqlEngine<'a> {
             )));
         }
 
+        // Serialize mutate+flush+rollback against other catalog writers.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
+
         if let Some(query) = &ct.query {
             // CREATE TABLE name AS SELECT ...
             let already_exists = self
@@ -2847,6 +2850,9 @@ impl<'a> SqlEngine<'a> {
             ));
         }
 
+        // Serialize mutate+flush+rollback against other catalog writers.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
+
         let already_exists = self.store.views.read().unwrap().contains_key(&view_name);
         if already_exists && !cv.or_replace {
             if cv.if_not_exists {
@@ -2910,6 +2916,9 @@ impl<'a> SqlEngine<'a> {
             view_names.push(view_name);
         }
 
+        // Serialize mutate+flush+rollback against other catalog writers.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
+
         let mut removed = Vec::new();
         let dropped = {
             let mut guard = self.store.views.write().unwrap();
@@ -2957,6 +2966,9 @@ impl<'a> SqlEngine<'a> {
             .as_ref()
             .ok_or_else(|| MqdbError::SqlExec("INSERT requires VALUES or SELECT".into()))?;
         let values_out = self.exec_query(source)?;
+
+        // Serialize mutate+flush+rollback against other catalog writers.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
 
         // Determine column mapping
         let col_indices: Option<Vec<usize>> = if ins.columns.is_empty() {
@@ -3078,6 +3090,9 @@ impl<'a> SqlEngine<'a> {
             }
             table_names.push(table_name);
         }
+
+        // Serialize mutate+flush+rollback against other catalog writers.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
 
         let mut removed = Vec::new();
         let dropped = {
@@ -7136,6 +7151,38 @@ mod tests {
         assert!(err.to_string().contains("does not exist"));
         // 'a' must not have been dropped by the time 'missing' failed.
         engine.execute("SELECT * FROM a").unwrap();
+    }
+
+    #[test]
+    fn concurrent_create_table_statements_all_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("store.mq-db");
+        DocumentStore::new().save(&db_path).unwrap();
+        let store = DocumentStore::open(&db_path).unwrap();
+
+        const N: usize = 16;
+        std::thread::scope(|scope| {
+            for i in 0..N {
+                let store = &store;
+                scope.spawn(move || {
+                    let engine = SqlEngine::new(store).unwrap();
+                    engine
+                        .execute(&format!("CREATE TABLE t{i} (x INT)"))
+                        .unwrap();
+                });
+            }
+        });
+        drop(store);
+
+        let reopened = DocumentStore::open(&db_path).unwrap();
+        let engine = SqlEngine::new(&reopened).unwrap();
+        let out = engine.execute("SHOW TABLES").unwrap();
+        for i in 0..N {
+            assert!(
+                out.rows.iter().any(|r| r[0] == format!("t{i}")),
+                "table t{i} missing after reopen — a concurrent flush lost it"
+            );
+        }
     }
 
     // DESC blocks (built-in)

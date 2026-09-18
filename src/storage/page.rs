@@ -155,7 +155,12 @@ impl PageFile {
         }
 
         let file_len = file.metadata()?.len();
-        if file_len % PAGE_SIZE as u64 != 0 {
+        // v8's mutable catalog head doesn't depend on the file ending on a
+        // page boundary — a concurrent append can leave a partial tail page
+        // that a lock-free `open_read_only` would otherwise wrongly reject,
+        // even though the committed superblock never references it. Legacy
+        // formats' catalog protocol does depend on that boundary.
+        if version != FILE_VERSION && file_len % PAGE_SIZE as u64 != 0 {
             return Err(invalid_data(
                 "database file size is not aligned to page size",
             ));
@@ -168,7 +173,8 @@ impl PageFile {
 
         // A v8 crash can leave unreachable pages after the last committed
         // superblock, so use physical length to inspect and recover the
-        // newest valid root.
+        // newest valid root. Floor division also drops any partial tail
+        // page left by a concurrent in-flight append.
         let physical_pages = u32::try_from(file_len / PAGE_SIZE as u64)
             .map_err(|_| invalid_data("database file has too many pages"))?;
         Ok(Self {
