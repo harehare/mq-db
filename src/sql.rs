@@ -2725,9 +2725,26 @@ impl<'a> SqlEngine<'a> {
 
         if let Some(query) = &ct.query {
             // CREATE TABLE name AS SELECT ...
+            let already_exists = self
+                .store
+                .custom_tables
+                .read()
+                .unwrap()
+                .contains_key(&table_name);
+            if already_exists && !ct.or_replace {
+                if ct.if_not_exists {
+                    return Ok(QueryOutput {
+                        columns: vec!["result".to_string()],
+                        rows: vec![vec!["already exists".to_string()]],
+                    });
+                }
+                return Err(MqdbError::SqlExec(format!(
+                    "table '{table_name}' already exists"
+                )));
+            }
             let result = self.exec_query(query)?;
             let n = result.rows.len();
-            self.store.custom_tables.write().unwrap().insert(
+            let previous = self.store.custom_tables.write().unwrap().insert(
                 table_name.clone(),
                 CustomTableState {
                     columns: result.columns,
@@ -2739,11 +2756,15 @@ impl<'a> SqlEngine<'a> {
                 },
             );
             if let Err(err) = self.store.flush_catalog_to_storage() {
-                self.store
-                    .custom_tables
-                    .write()
-                    .unwrap()
-                    .remove(&table_name);
+                let mut tables = self.store.custom_tables.write().unwrap();
+                match previous {
+                    Some(previous_state) => {
+                        tables.insert(table_name, previous_state);
+                    }
+                    None => {
+                        tables.remove(&table_name);
+                    }
+                }
                 return Err(err);
             }
             return Ok(QueryOutput {
@@ -2878,28 +2899,36 @@ impl<'a> SqlEngine<'a> {
         names: &[ObjectName],
         if_exists: bool,
     ) -> Result<QueryOutput, MqdbError> {
+        let mut view_names = Vec::with_capacity(names.len());
+        for name in names {
+            let view_name = require_unqualified(name)?;
+            if matches!(view_name.as_str(), "blocks" | "documents") {
+                return Err(MqdbError::SqlExec(format!(
+                    "cannot drop built-in table '{view_name}'"
+                )));
+            }
+            view_names.push(view_name);
+        }
+
         let mut removed = Vec::new();
         let dropped = {
             let mut guard = self.store.views.write().unwrap();
-            let mut dropped = 0usize;
-            for name in names {
-                let view_name = require_unqualified(name)?;
-                if matches!(view_name.as_str(), "blocks" | "documents") {
-                    return Err(MqdbError::SqlExec(format!(
-                        "cannot drop built-in table '{view_name}'"
-                    )));
-                }
-                match guard.remove(&view_name) {
-                    Some(sql) => {
-                        removed.push((view_name, sql));
-                        dropped += 1;
-                    }
-                    None if !if_exists => {
+            // Validate every target before mutating so a missing name later
+            // in the list can't leave earlier names partially dropped.
+            if !if_exists {
+                for view_name in &view_names {
+                    if !guard.contains_key(view_name) {
                         return Err(MqdbError::SqlExec(format!(
                             "view '{view_name}' does not exist"
                         )));
                     }
-                    None => {}
+                }
+            }
+            let mut dropped = 0usize;
+            for view_name in view_names {
+                if let Some(sql) = guard.remove(&view_name) {
+                    removed.push((view_name, sql));
+                    dropped += 1;
                 }
             }
             dropped
@@ -3039,28 +3068,36 @@ impl<'a> SqlEngine<'a> {
         names: &[ObjectName],
         if_exists: bool,
     ) -> Result<QueryOutput, MqdbError> {
+        let mut table_names = Vec::with_capacity(names.len());
+        for name in names {
+            let table_name = require_unqualified(name)?;
+            if matches!(table_name.as_str(), "blocks" | "documents") {
+                return Err(MqdbError::SqlExec(format!(
+                    "cannot drop built-in table '{table_name}'"
+                )));
+            }
+            table_names.push(table_name);
+        }
+
         let mut removed = Vec::new();
         let dropped = {
             let mut guard = self.store.custom_tables.write().unwrap();
-            let mut dropped = 0usize;
-            for name in names {
-                let table_name = require_unqualified(name)?;
-                if matches!(table_name.as_str(), "blocks" | "documents") {
-                    return Err(MqdbError::SqlExec(format!(
-                        "cannot drop built-in table '{table_name}'"
-                    )));
-                }
-                match guard.remove(&table_name) {
-                    Some(state) => {
-                        removed.push((table_name, state));
-                        dropped += 1;
-                    }
-                    None if !if_exists => {
+            // Validate every target before mutating so a missing name later
+            // in the list can't leave earlier names partially dropped.
+            if !if_exists {
+                for table_name in &table_names {
+                    if !guard.contains_key(table_name) {
                         return Err(MqdbError::SqlExec(format!(
                             "table '{table_name}' does not exist"
                         )));
                     }
-                    None => {}
+                }
+            }
+            let mut dropped = 0usize;
+            for table_name in table_names {
+                if let Some(state) = guard.remove(&table_name) {
+                    removed.push((table_name, state));
+                    dropped += 1;
                 }
             }
             dropped
@@ -7019,6 +7056,45 @@ mod tests {
         assert_eq!(out.rows.len(), 2);
     }
 
+    #[test]
+    fn test_ddl_create_as_select_rejects_existing_table() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE t AS SELECT 1 AS x").unwrap();
+        let err = engine
+            .execute("CREATE TABLE t AS SELECT 2 AS x")
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        // The original table must survive the rejected statement.
+        let out = engine.execute("SELECT x FROM t").unwrap();
+        assert_eq!(out.rows, vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn test_ddl_create_as_select_if_not_exists_keeps_existing() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE t AS SELECT 1 AS x").unwrap();
+        let out = engine
+            .execute("CREATE TABLE IF NOT EXISTS t AS SELECT 2 AS x")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "already exists");
+        let sel = engine.execute("SELECT x FROM t").unwrap();
+        assert_eq!(sel.rows, vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn test_ddl_create_as_select_or_replace_overwrites() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE t AS SELECT 1 AS x").unwrap();
+        engine
+            .execute("CREATE OR REPLACE TABLE t AS SELECT 2 AS x")
+            .unwrap();
+        let out = engine.execute("SELECT x FROM t").unwrap();
+        assert_eq!(out.rows, vec![vec!["2".to_string()]]);
+    }
+
     // DROP TABLE
     #[test]
     fn test_ddl_drop_table() {
@@ -7038,6 +7114,28 @@ mod tests {
         engine
             .execute("DROP TABLE IF EXISTS no_such_table")
             .unwrap();
+    }
+
+    #[test]
+    fn test_ddl_drop_tables_multi_name_missing_is_atomic() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE a (x TEXT)").unwrap();
+        let err = engine.execute("DROP TABLE a, missing").unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+        // 'a' must not have been dropped by the time 'missing' failed.
+        engine.execute("SELECT * FROM a").unwrap();
+    }
+
+    #[test]
+    fn test_ddl_drop_views_multi_name_missing_is_atomic() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE VIEW a AS SELECT 1").unwrap();
+        let err = engine.execute("DROP VIEW a, missing").unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+        // 'a' must not have been dropped by the time 'missing' failed.
+        engine.execute("SELECT * FROM a").unwrap();
     }
 
     // DESC blocks (built-in)

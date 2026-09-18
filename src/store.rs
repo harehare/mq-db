@@ -1648,6 +1648,30 @@ mod vacuum_tests {
         let reloaded = DocumentStore::load(&db_path).unwrap();
         assert_eq!(reloaded.documents().len(), 1);
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn vacuum_locks_the_replacement_inode_against_a_hard_link_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let md_path = write_md(&dir, "a.md", "# A\n\nHello\n");
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&md_path).unwrap();
+        store.save(&db_path).unwrap();
+
+        let mut opened = open_for_writes(&db_path);
+        opened.vacuum(&db_path).unwrap();
+
+        // `db_path` now names the inode vacuum's rename left behind. A hard
+        // link to it must still contend for the writer lock.
+        let alias = dir.path().join("alias.mq-db");
+        std::fs::hard_link(&db_path, &alias).unwrap();
+        let err = Storage::open(&alias)
+            .err()
+            .expect("second writer through the post-vacuum hard link must fail");
+        assert!(err.to_string().contains("already open for writing"));
+    }
 }
 
 #[cfg(test)]

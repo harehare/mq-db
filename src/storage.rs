@@ -133,6 +133,18 @@ fn open_and_lock(lock_path: &Path) -> Result<File, MqdbError> {
     Ok(file)
 }
 
+/// Directory for inode-keyed lock sidecars. Deliberately independent of any
+/// alias's parent directory: two hard links to the same inode can live under
+/// different directories, but the inode lock must still resolve to one
+/// shared sidecar so they contend for it.
+fn inode_lock_dir() -> PathBuf {
+    std::env::temp_dir()
+}
+
+fn inode_lock_path(key: &str) -> PathBuf {
+    inode_lock_dir().join(format!(".{key}.mq-db.lock"))
+}
+
 impl DatabaseLock {
     fn acquire(path: &Path) -> Result<Self, MqdbError> {
         let path_identity = normalized_path_identity(path)?;
@@ -159,12 +171,21 @@ impl DatabaseLock {
         let Some(key) = inode_key(path) else {
             return Ok(());
         };
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-        let dir = match parent {
-            Some(parent) => parent.canonicalize()?,
-            None => std::env::current_dir()?,
+        self._inode_file = Some(open_and_lock(&inode_lock_path(&key))?);
+        Ok(())
+    }
+
+    /// Replace the inode-keyed lock with one for `path`'s current inode.
+    /// Used by [`Storage::reopen_after_replace`] after vacuum's rename
+    /// changes which inode the stable path lock guards: the new inode's
+    /// lock is acquired before the old one is dropped, so the replacement
+    /// inode is never briefly unlocked.
+    fn refresh_inode_lock(&mut self, path: &Path) -> Result<(), MqdbError> {
+        let Some(key) = inode_key(path) else {
+            self._inode_file = None;
+            return Ok(());
         };
-        self._inode_file = Some(open_and_lock(&dir.join(format!(".{key}.mq-db.lock")))?);
+        self._inode_file = Some(open_and_lock(&inode_lock_path(&key))?);
         Ok(())
     }
 }
@@ -316,9 +337,14 @@ impl Storage {
     }
 
     /// Reopen after an atomic replacement while retaining the sidecar lock.
-    /// Used by vacuum so there is no unlocked interval around `rename`.
+    /// Used by vacuum so there is no unlocked interval around `rename`. The
+    /// stable path lock is kept as-is; the inode lock is refreshed to match
+    /// the replacement file's (new) inode so hard-link aliases of it still
+    /// contend for a lock.
     pub fn reopen_after_replace(path: &Path, previous: Self) -> Result<Self, MqdbError> {
-        Self::open_with_lock(path, Some(previous.into_lock()))
+        let mut lock = previous.into_lock();
+        lock.refresh_inode_lock(path)?;
+        Self::open_with_lock(path, Some(lock))
     }
 
     /// Write one document's blocks to the page file. Returns the first_block_page.
@@ -1346,6 +1372,28 @@ pub(crate) mod tests {
         let err = Storage::open(&alias)
             .err()
             .expect("second writer through the hard link must fail");
+        assert!(err.to_string().contains("already open for writing"));
+
+        drop(storage);
+        std::fs::remove_file(&alias).unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writable_open_is_exclusive_through_a_hard_link_in_another_directory() {
+        let path = test_file_path("hardlink-cross-dir-target");
+        cleanup(&path);
+        let other_dir = path.parent().unwrap().join("hardlink-cross-dir-alias-dir");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let alias = other_dir.join("alias.mq-db");
+        let _ = std::fs::remove_file(&alias);
+
+        let storage = Storage::create(&path).unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        let err = Storage::open(&alias)
+            .err()
+            .expect("second writer through the cross-directory hard link must fail");
         assert!(err.to_string().contains("already open for writing"));
 
         drop(storage);
