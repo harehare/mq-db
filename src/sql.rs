@@ -2717,14 +2717,13 @@ impl<'a> SqlEngine<'a> {
                 "cannot override built-in table '{table_name}'"
             )));
         }
+        // Guard the cross-kind check too, or a concurrent CREATE VIEW can slip in.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
         if self.store.views.read().unwrap().contains_key(&table_name) {
             return Err(MqdbError::SqlExec(format!(
                 "'{table_name}' is already defined as a view"
             )));
         }
-
-        // Serialize mutate+flush+rollback against other catalog writers.
-        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
 
         if let Some(query) = &ct.query {
             // CREATE TABLE name AS SELECT ...
@@ -2833,6 +2832,14 @@ impl<'a> SqlEngine<'a> {
                 "cannot override built-in table '{view_name}'"
             )));
         }
+        if !cv.columns.is_empty() {
+            return Err(MqdbError::SqlExec(
+                "explicit view columns (CREATE VIEW v (a, b) AS ...) are not supported".into(),
+            ));
+        }
+
+        // Guard the cross-kind check too, or a concurrent CREATE TABLE can slip in.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
         if self
             .store
             .custom_tables
@@ -2844,14 +2851,6 @@ impl<'a> SqlEngine<'a> {
                 "'{view_name}' is already defined as a table"
             )));
         }
-        if !cv.columns.is_empty() {
-            return Err(MqdbError::SqlExec(
-                "explicit view columns (CREATE VIEW v (a, b) AS ...) are not supported".into(),
-            ));
-        }
-
-        // Serialize mutate+flush+rollback against other catalog writers.
-        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
 
         let already_exists = self.store.views.read().unwrap().contains_key(&view_name);
         if already_exists && !cv.or_replace {
@@ -7183,6 +7182,40 @@ mod tests {
                 "table t{i} missing after reopen — a concurrent flush lost it"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_create_table_and_view_with_same_name_do_not_both_win() {
+        let store = DocumentStore::new();
+
+        let barrier = std::sync::Barrier::new(2);
+        let (table_result, view_result) = std::thread::scope(|scope| {
+            let table_handle = scope.spawn(|| {
+                let engine = SqlEngine::new(&store).unwrap();
+                barrier.wait();
+                engine.execute("CREATE TABLE dup (x INT)")
+            });
+            let view_handle = scope.spawn(|| {
+                let engine = SqlEngine::new(&store).unwrap();
+                barrier.wait();
+                engine.execute("CREATE VIEW dup AS SELECT 1 AS x")
+            });
+            (table_handle.join().unwrap(), view_handle.join().unwrap())
+        });
+
+        assert_ne!(
+            table_result.is_ok(),
+            view_result.is_ok(),
+            "exactly one of the racing CREATE TABLE / CREATE VIEW must win"
+        );
+
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine.execute("SHOW TABLES").unwrap();
+        assert_eq!(
+            out.rows.iter().filter(|r| r[0] == "dup").count(),
+            1,
+            "the catalog must contain exactly one 'dup' entry"
+        );
     }
 
     // DESC blocks (built-in)

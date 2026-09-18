@@ -872,13 +872,15 @@ impl DocumentStore {
     }
 
     pub(crate) fn rollback_transaction_tables_only(&self) -> Result<(), MqdbError> {
+        // Guard the whole snapshot-take-and-restore, or a concurrent commit
+        // in the gap gets silently overwritten by this restore.
+        let _catalog_guard = self.catalog_commit.lock().unwrap();
         let snapshot = self
             .tx_snapshot
             .lock()
             .unwrap()
             .take()
             .ok_or_else(|| MqdbError::SqlExec("no transaction is in progress".into()))?;
-        let _catalog_guard = self.catalog_commit.lock().unwrap();
         *self.custom_tables.write().unwrap() = snapshot.custom_tables;
         *self.views.write().unwrap() = snapshot.views;
         self.flush_catalog_to_storage()?;
@@ -886,6 +888,9 @@ impl DocumentStore {
     }
 
     pub(crate) fn rollback_transaction(&mut self) -> Result<Vec<String>, MqdbError> {
+        // See `rollback_transaction_tables_only` for why the guard covers
+        // the whole snapshot-take-and-restore.
+        let _catalog_guard = self.catalog_commit.lock().unwrap();
         let snapshot = self
             .tx_snapshot
             .lock()
@@ -989,8 +994,20 @@ impl DocumentStore {
 
     /// Persist all in-memory documents to a `.mq-db` file, including secondary
     /// indexes. Writes atomically: writes to `path.tmp` then renames to `path`.
+    ///
+    /// Errors if `path` is the store's own open backing file (would keep
+    /// writing through the old, unlinked inode) — use
+    /// [`vacuum`](Self::vacuum) instead.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), MqdbError> {
-        self.save_inner(path.as_ref(), false).map(|_| ())
+        let path = path.as_ref();
+        if let Some(storage) = self.storage.lock().unwrap().as_ref()
+            && storage.same_backing_file(path)?
+        {
+            return Err(MqdbError::Storage(
+                "save cannot target the store's own open backing file — use vacuum instead".into(),
+            ));
+        }
+        self.save_inner(path, false).map(|_| ())
     }
 
     /// `write_lock_held` is used by migration, whose snapshot and replacement
@@ -1629,6 +1646,26 @@ mod vacuum_tests {
 
         let report = opened.vacuum(&db_path).unwrap();
         assert_eq!(report.pages_before, report.pages_after);
+    }
+
+    #[test]
+    fn save_rejects_targeting_its_own_open_backing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let md_path = write_md(&dir, "a.md", "# A\n\nHello\n");
+        let db_path = dir.path().join("store.mq-db");
+
+        let mut store = DocumentStore::new();
+        store.add_file(&md_path).unwrap();
+        store.save(&db_path).unwrap();
+
+        let mut opened = open_for_writes(&db_path);
+        let err = opened.save(&db_path).unwrap_err();
+        assert!(err.to_string().contains("vacuum"));
+
+        // The original handle must still be able to commit.
+        opened.execute_sql_mut("CREATE TABLE t (x TEXT)").unwrap();
+        let reloaded = DocumentStore::load(&db_path).unwrap();
+        assert!(reloaded.custom_tables.read().unwrap().contains_key("t"));
     }
 
     #[test]

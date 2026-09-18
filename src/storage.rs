@@ -1354,6 +1354,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn writable_open_after_partial_tail_does_not_corrupt_next_commit() {
+        use crate::storage::page::PAGE_SIZE;
+        use std::io::{Seek, SeekFrom, Write};
+
+        let path = test_file_path("v8-partial-tail-append");
+        cleanup(&path);
+
+        let mut storage = Storage::create(&path).unwrap();
+        storage
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .unwrap();
+        drop(storage);
+
+        // A crash mid-append leaves extra bytes past the committed length,
+        // short of a full page.
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&[0u8; PAGE_SIZE / 2]).unwrap();
+        drop(file);
+
+        let mut storage = Storage::open(&path).unwrap();
+        let entry = CatalogEntry {
+            document_id: 7,
+            path: None,
+            first_block_page: 0,
+            num_blocks: 0,
+            zone_map_bytes: vec![],
+            index_start_page: 0,
+        };
+        storage
+            .flush_catalog(
+                std::slice::from_ref(&entry),
+                &[],
+                &[],
+                &[],
+                TokenizerKind::Word,
+            )
+            .unwrap();
+        drop(storage);
+
+        let mut reopened = Storage::open_read_only(&path).unwrap();
+        let (entries, _, _, _, _) = reopened.load_catalog().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the committed catalog must survive reopen"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
     fn open_rejects_unaligned_legacy_file() {
         use crate::storage::page::PAGE_SIZE;
         use std::io::{Seek, SeekFrom, Write};

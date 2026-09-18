@@ -228,7 +228,10 @@ impl PageFile {
 
     pub fn append_page(&mut self, data: &[u8; PAGE_SIZE]) -> Result<u32, MqdbError> {
         let page_id = self.num_pages;
-        self.file.seek(SeekFrom::End(0))?;
+        // Seek to the aligned logical end, not physical EOF: a crash can
+        // leave a partial tail past `num_pages` (see `open`).
+        self.file
+            .seek(SeekFrom::Start(u64::from(page_id) * PAGE_SIZE as u64))?;
         self.file.write_all(data)?;
         self.num_pages = self
             .num_pages
