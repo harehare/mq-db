@@ -2240,21 +2240,31 @@ impl<'a> SqlEngine<'a> {
 
         match stmt {
             Statement::Query(q) => self.exec_query(&q),
-            Statement::CreateTable(ct) => self.exec_create_table(&ct),
-            Statement::Insert(ins) => self.exec_insert(&ins),
+            Statement::CreateTable(ct) => {
+                self.exec_create_table(&ct).inspect(|_| self.store.note_catalog_mutation())
+            }
+            Statement::Insert(ins) => {
+                self.exec_insert(&ins).inspect(|_| self.store.note_catalog_mutation())
+            }
             Statement::Drop {
                 object_type: ObjectType::Table,
                 names,
                 if_exists,
                 ..
-            } => self.exec_drop_tables(&names, if_exists),
+            } => self
+                .exec_drop_tables(&names, if_exists)
+                .inspect(|_| self.store.note_catalog_mutation()),
             Statement::Drop {
                 object_type: ObjectType::View,
                 names,
                 if_exists,
                 ..
-            } => self.exec_drop_views(&names, if_exists),
-            Statement::CreateView(cv) => self.exec_create_view(&cv),
+            } => self
+                .exec_drop_views(&names, if_exists)
+                .inspect(|_| self.store.note_catalog_mutation()),
+            Statement::CreateView(cv) => {
+                self.exec_create_view(&cv).inspect(|_| self.store.note_catalog_mutation())
+            }
             Statement::Explain {
                 analyze, statement, ..
             } => self.exec_explain(analyze, &statement),
@@ -7966,6 +7976,45 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn rollback_does_not_delete_a_table_committed_by_another_session_mid_transaction() {
+        let store = DocumentStore::new();
+        let began = std::sync::Barrier::new(2);
+        let committed = std::sync::Barrier::new(2);
+
+        std::thread::scope(|scope| {
+            let engine_a_handle = scope.spawn(|| {
+                let engine_a = SqlEngine::new(&store).unwrap();
+                engine_a.execute("BEGIN").unwrap();
+                began.wait();
+                // Wait for the other session's CREATE TABLE to land before
+                // rolling back.
+                committed.wait();
+                engine_a.execute("ROLLBACK").unwrap_err()
+            });
+            let engine_b_handle = scope.spawn(|| {
+                began.wait();
+                let engine_b = SqlEngine::new(&store).unwrap();
+                engine_b.execute("CREATE TABLE audit (id TEXT)").unwrap();
+                committed.wait();
+            });
+            let err = engine_a_handle.join().unwrap();
+            engine_b_handle.join().unwrap();
+            assert!(
+                err.to_string().contains("another session"),
+                "unexpected error: {err}"
+            );
+        });
+
+        // The concurrently committed table must survive the rollback.
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine.execute("SHOW TABLES").unwrap();
+        assert!(
+            out.rows.iter().any(|r| r[0] == "audit"),
+            "table 'audit' was deleted by an unrelated transaction's rollback"
+        );
     }
 
     #[test]

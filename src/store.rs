@@ -3,6 +3,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Mutex, RwLock},
+    thread::ThreadId,
 };
 
 use rustc_hash::FxHashMap;
@@ -28,6 +29,14 @@ pub(crate) struct TxSnapshot {
     pub custom_tables: FxHashMap<String, CustomTableState>,
     pub views: FxHashMap<String, String>,
     pub content_hashes: FxHashMap<DocumentId, u64>,
+    /// Thread that ran `BEGIN`. Catalog mutations from any other thread
+    /// while this transaction is open are treated as external commits.
+    pub owner: ThreadId,
+    /// Set by [`DocumentStore::note_catalog_mutation`] when a thread other
+    /// than `owner` mutates the catalog while this transaction is open.
+    /// Rollback refuses to run over such a mutation rather than silently
+    /// discarding it.
+    pub external_write: bool,
 }
 
 use mq_markdown::Markdown;
@@ -860,6 +869,8 @@ impl DocumentStore {
             custom_tables: self.custom_tables.read().unwrap().clone(),
             views: self.views.read().unwrap().clone(),
             content_hashes: self.content_hashes.clone(),
+            owner: std::thread::current().id(),
+            external_write: false,
         });
         Ok(())
     }
@@ -869,6 +880,21 @@ impl DocumentStore {
             return Err(MqdbError::SqlExec("no transaction is in progress".into()));
         }
         Ok(())
+    }
+
+    /// Called by every catalog-mutating statement (`CREATE`/`DROP TABLE`,
+    /// `CREATE`/`DROP VIEW`, `INSERT` into a custom table) right after it
+    /// commits its change, while a transaction may be open on another
+    /// thread. Marks that transaction's snapshot as stale so rollback
+    /// refuses to overwrite this commit instead of silently discarding it.
+    /// A no-op for mutations made by the transaction's own owner thread —
+    /// those are expected to be undone by its own rollback.
+    pub(crate) fn note_catalog_mutation(&self) {
+        if let Some(tx) = self.tx_snapshot.lock().unwrap().as_mut()
+            && tx.owner != std::thread::current().id()
+        {
+            tx.external_write = true;
+        }
     }
 
     pub(crate) fn rollback_transaction_tables_only(&self) -> Result<(), MqdbError> {
@@ -881,6 +907,13 @@ impl DocumentStore {
             .unwrap()
             .take()
             .ok_or_else(|| MqdbError::SqlExec("no transaction is in progress".into()))?;
+        if snapshot.external_write {
+            return Err(MqdbError::SqlExec(
+                "rollback aborted: another session committed catalog changes during this transaction; \
+                 the transaction has been closed without reverting the catalog to avoid discarding them"
+                    .into(),
+            ));
+        }
         *self.custom_tables.write().unwrap() = snapshot.custom_tables;
         *self.views.write().unwrap() = snapshot.views;
         self.flush_catalog_to_storage()?;
@@ -897,6 +930,13 @@ impl DocumentStore {
             .unwrap()
             .take()
             .ok_or_else(|| MqdbError::SqlExec("no transaction is in progress".into()))?;
+        if snapshot.external_write {
+            return Err(MqdbError::SqlExec(
+                "rollback aborted: another session committed catalog changes during this transaction; \
+                 the transaction has been closed without reverting to avoid discarding them"
+                    .into(),
+            ));
+        }
         let unrevertable_paths = diff_written_paths(&snapshot.documents, &self.documents);
         self.documents = snapshot.documents;
         self.doc_indexes = vec![None; self.documents.len()];
