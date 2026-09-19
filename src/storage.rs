@@ -2,7 +2,13 @@ pub mod catalog;
 pub mod codec;
 pub mod page;
 
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    fs::{File, OpenOptions},
+    path::{Path, PathBuf},
+};
+
+use fs2::FileExt;
 
 use crate::{
     block::Block,
@@ -11,13 +17,13 @@ use crate::{
     indexes::TokenizerKind,
     storage::{
         catalog::{
-            CatalogData, CatalogEntry, CustomTableEntry, ViewEntry, read_catalog, write_catalog,
+            CatalogData, CatalogEntry, CustomTableEntry, ViewEntry, append_catalog, read_catalog,
+            read_catalog_at, write_catalog,
         },
         codec::{decode_block, decode_table_rows, encode_block, encode_table_rows},
         page::{
-            PAGE_BODY_SIZE, PAGE_HEADER_SIZE, PAGE_TYPE_BLOCK_DATA, PAGE_TYPE_CATALOG,
-            PAGE_TYPE_INDEX, PAGE_TYPE_OVERFLOW, PAGE_TYPE_TABLE_DATA, PageFile, make_page,
-            parse_page_header,
+            FILE_VERSION, PAGE_BODY_SIZE, PAGE_HEADER_SIZE, PAGE_TYPE_BLOCK_DATA, PAGE_TYPE_INDEX,
+            PAGE_TYPE_OVERFLOW, PAGE_TYPE_TABLE_DATA, PageFile, make_page, parse_page_header,
         },
     },
 };
@@ -28,6 +34,197 @@ const TABLE_ROW_PAGE_CAPACITY: usize = PAGE_BODY_SIZE - 2;
 
 pub struct Storage {
     page_file: PageFile,
+    /// Held for the complete lifetime of a writable storage handle.  The
+    /// sidecar is stable across `save()`'s rename, unlike an inode lock on
+    /// the database file itself.
+    _lock: Option<DatabaseLock>,
+    path: PathBuf,
+    catalog_root: u32,
+    generation: u64,
+}
+
+const PAGE_TYPE_SUPERBLOCK: u32 = 7;
+const SUPERBLOCK_MAGIC: u32 = 0x4D51_5342; // "MQSB"
+const SUPERBLOCK_A: u32 = 1;
+const SUPERBLOCK_B: u32 = 2;
+
+pub(crate) struct DatabaseLock {
+    _file: File,
+    /// Second lock keyed by inode, held in addition to `_file` whenever the
+    /// database file exists yet, so hard-link aliases (different paths,
+    /// same inode) still contend for one lock. `create` runs its acquire
+    /// before the file exists, so it can only take the path-keyed lock —
+    /// this field stays `None` in that case.
+    _inode_file: Option<File>,
+}
+
+/// Filesystem identity of a database path; hard-link aliases share `Inode`.
+#[derive(Clone, PartialEq, Eq)]
+enum FileIdentity {
+    /// Device + inode (Unix) / volume + file index (Windows) of an existing file.
+    Inode(String),
+    /// Normalized path, used only when the file doesn't exist yet.
+    Path(PathBuf),
+}
+
+#[cfg(unix)]
+fn inode_key(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(format!("u{:x}.{:x}", meta.dev(), meta.ino()))
+}
+
+#[cfg(windows)]
+fn inode_key(path: &Path) -> Option<String> {
+    use std::os::windows::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(format!(
+        "w{:x}.{:x}",
+        meta.volume_serial_number()?,
+        meta.file_index()?
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inode_key(_path: &Path) -> Option<String> {
+    None
+}
+
+fn normalized_path_identity(path: &Path) -> Result<PathBuf, MqdbError> {
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(canonical);
+    }
+    let file_name = path.file_name().ok_or_else(|| {
+        invalid_data(format!(
+            "database path has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let canonical_parent = match parent {
+        Some(parent) => parent.canonicalize()?,
+        None => std::env::current_dir()?,
+    };
+    Ok(canonical_parent.join(file_name))
+}
+
+fn resolve_identity(path: &Path) -> Result<FileIdentity, MqdbError> {
+    if let Some(key) = inode_key(path) {
+        return Ok(FileIdentity::Inode(key));
+    }
+    Ok(FileIdentity::Path(normalized_path_identity(path)?))
+}
+
+fn open_and_lock(lock_path: &Path) -> Result<File, MqdbError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        // The lock file is a stable coordination inode; never erase it
+        // when another process is merely attempting to acquire its lock.
+        .truncate(false)
+        .open(lock_path)?;
+    file.try_lock_exclusive().map_err(|err| {
+        MqdbError::Storage(format!(
+            "database is already open for writing (lock: {}): {err}",
+            lock_path.display()
+        ))
+    })?;
+    Ok(file)
+}
+
+/// Directory for inode-keyed lock sidecars. Deliberately independent of any
+/// alias's parent directory: two hard links to the same inode can live under
+/// different directories, but the inode lock must still resolve to one
+/// shared sidecar so they contend for it.
+fn inode_lock_dir() -> PathBuf {
+    std::env::temp_dir()
+}
+
+fn inode_lock_path(key: &str) -> PathBuf {
+    inode_lock_dir().join(format!(".{key}.mq-db.lock"))
+}
+
+impl DatabaseLock {
+    fn acquire(path: &Path) -> Result<Self, MqdbError> {
+        let path_identity = normalized_path_identity(path)?;
+        let file = open_and_lock(&PathBuf::from(format!(
+            "{}.lock",
+            path_identity.to_string_lossy()
+        )))?;
+        let mut lock = Self {
+            _file: file,
+            _inode_file: None,
+        };
+        lock.acquire_inode_lock(path)?;
+        Ok(lock)
+    }
+
+    /// Take the inode-keyed lock too, once the database file exists. A
+    /// no-op if already held, or if `path` still doesn't exist (e.g. called
+    /// from `acquire` by `Storage::create`, before the file is made) — the
+    /// caller retries this after creating the file.
+    fn acquire_inode_lock(&mut self, path: &Path) -> Result<(), MqdbError> {
+        if self._inode_file.is_some() {
+            return Ok(());
+        }
+        let Some(key) = inode_key(path) else {
+            return Ok(());
+        };
+        self._inode_file = Some(open_and_lock(&inode_lock_path(&key))?);
+        Ok(())
+    }
+
+    /// Take the inode-keyed lock file, leaving `self` without one.
+    fn take_inode_lock(&mut self) -> Option<File> {
+        self._inode_file.take()
+    }
+
+    /// Adopt an already-held inode lock in place of whatever `self` has.
+    /// Avoids a re-acquire gap: see [`Storage::reopen_after_replace`].
+    fn adopt_inode_lock(&mut self, inode_file: Option<File>) {
+        self._inode_file = inode_file;
+    }
+}
+
+fn superblock_page(
+    page_id: u32,
+    generation: u64,
+    catalog_root: u32,
+    committed_pages: u32,
+) -> [u8; crate::storage::page::PAGE_SIZE] {
+    let mut body = [0u8; PAGE_BODY_SIZE];
+    body[0..4].copy_from_slice(&SUPERBLOCK_MAGIC.to_le_bytes());
+    body[4..12].copy_from_slice(&generation.to_le_bytes());
+    body[12..16].copy_from_slice(&catalog_root.to_le_bytes());
+    body[16..20].copy_from_slice(&committed_pages.to_le_bytes());
+    make_page(PAGE_TYPE_SUPERBLOCK, page_id, 0, &body)
+}
+
+fn decode_superblock(
+    page_id: u32,
+    page: &[u8; crate::storage::page::PAGE_SIZE],
+    physical_pages: u32,
+) -> Option<(u64, u32)> {
+    let (page_type, _, stored_page_id, next_page) = parse_page_header(page);
+    if page_type != PAGE_TYPE_SUPERBLOCK || stored_page_id != page_id || next_page != 0 {
+        return None;
+    }
+    let body = &page[PAGE_HEADER_SIZE..];
+    if u32::from_le_bytes(body[0..4].try_into().ok()?) != SUPERBLOCK_MAGIC {
+        return None;
+    }
+    let generation = u64::from_le_bytes(body[4..12].try_into().ok()?);
+    let catalog_root = u32::from_le_bytes(body[12..16].try_into().ok()?);
+    let committed_pages = u32::from_le_bytes(body[16..20].try_into().ok()?);
+    if generation == 0
+        || catalog_root < 3
+        || catalog_root >= committed_pages
+        || committed_pages > physical_pages
+    {
+        return None;
+    }
+    Some((generation, catalog_root))
 }
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {
@@ -35,18 +232,67 @@ fn invalid_data(message: impl Into<String>) -> MqdbError {
 }
 
 impl Storage {
+    pub(crate) fn acquire_write_lock(path: &Path) -> Result<DatabaseLock, MqdbError> {
+        DatabaseLock::acquire(path)
+    }
+
+    fn open_with_lock(path: &Path, lock: Option<DatabaseLock>) -> Result<Self, MqdbError> {
+        let mut page_file = PageFile::open(path)?;
+        let (catalog_root, generation) = {
+            let mut candidates = Vec::new();
+            for page_id in [SUPERBLOCK_A, SUPERBLOCK_B] {
+                if let Ok(page) = page_file.read_page(page_id)
+                    && let Some(candidate) = decode_superblock(page_id, &page, page_file.num_pages)
+                {
+                    candidates.push(candidate);
+                }
+            }
+            if let Some((generation, root)) = candidates
+                .into_iter()
+                .max_by_key(|(generation, _)| *generation)
+            {
+                (root, generation)
+            } else if page_file.version == FILE_VERSION {
+                return Err(invalid_data("no valid v8 superblock found"));
+            } else {
+                (1, 0)
+            }
+        };
+        Ok(Self {
+            page_file,
+            _lock: lock,
+            path: path.to_path_buf(),
+            catalog_root,
+            generation,
+        })
+    }
     /// Create a new empty database file. Writes file header + empty catalog.
     pub fn create(path: &Path) -> Result<Self, MqdbError> {
+        let mut lock = DatabaseLock::acquire(path)?;
         let mut page_file = PageFile::create(path)?;
-        let empty_catalog = 0u32.to_le_bytes();
-        let page = make_page(PAGE_TYPE_CATALOG, 1, 0, &empty_catalog);
-        let page_id = page_file.append_page(&page)?;
-        if page_id != 1 {
-            return Err(invalid_data(format!(
-                "expected catalog page id 1, found {page_id}"
-            )));
+        lock.acquire_inode_lock(path)?;
+        // Reserve two fixed commit records before appending the first root.
+        // A zero-magic page is invalid and therefore never selected during
+        // recovery.
+        for page_id in [SUPERBLOCK_A, SUPERBLOCK_B] {
+            let page = make_page(PAGE_TYPE_SUPERBLOCK, page_id, 0, &[]);
+            if page_file.append_page(&page)? != page_id {
+                return Err(invalid_data("superblock page allocation failed"));
+            }
         }
-        Ok(Self { page_file })
+        let catalog_root = append_catalog(&mut page_file, &[], &[], &[], &[], TokenizerKind::Word)?;
+        page_file.sync_all()?;
+        let committed_pages = page_file.num_pages;
+        let commit = superblock_page(SUPERBLOCK_A, 1, catalog_root, committed_pages);
+        page_file.write_page(SUPERBLOCK_A, &commit)?;
+        page_file.sync_all()?;
+        Ok(Self {
+            page_file,
+            _lock: Some(lock),
+            path: path.to_path_buf(),
+            catalog_root,
+            generation: 1,
+        })
     }
 
     /// Open an existing database file. Validates magic + version.
@@ -55,9 +301,15 @@ impl Storage {
     /// versions (see `page::LEGACY_VERSIONS`) — check [`Storage::file_version`]
     /// to tell which one was actually read.
     pub fn open(path: &Path) -> Result<Self, MqdbError> {
-        Ok(Self {
-            page_file: PageFile::open(path)?,
-        })
+        let lock = DatabaseLock::acquire(path)?;
+        Self::open_with_lock(path, Some(lock))
+    }
+
+    /// Open a snapshot reader.  It holds no writer lock: v8's immutable
+    /// roots let it safely observe either the old or new committed catalog
+    /// while another process owns the writer lock.
+    pub fn open_read_only(path: &Path) -> Result<Self, MqdbError> {
+        Self::open_with_lock(path, None)
     }
 
     /// The file-format version this store was read from. `page::FILE_VERSION`
@@ -70,6 +322,31 @@ impl Storage {
     /// Total pages in the file, including the header and catalog pages.
     pub fn num_pages(&self) -> u32 {
         self.page_file.num_pages
+    }
+
+    pub(crate) fn same_backing_file(&self, path: &Path) -> Result<bool, MqdbError> {
+        Ok(resolve_identity(&self.path)? == resolve_identity(path)?)
+    }
+
+    fn into_lock(self) -> DatabaseLock {
+        self._lock
+            .expect("reopen_after_replace requires a writable storage handle")
+    }
+
+    /// Reopen after an atomic replacement while retaining the sidecar lock.
+    /// Used by vacuum so there is no unlocked interval around `rename`: the
+    /// stable path lock comes from `previous`, and the inode lock is
+    /// transplanted from `replacement` (held since before the rename), so
+    /// the replacement inode is never briefly unlocked.
+    pub fn reopen_after_replace(
+        path: &Path,
+        previous: Self,
+        replacement: Self,
+    ) -> Result<Self, MqdbError> {
+        let mut lock = previous.into_lock();
+        let mut replacement_lock = replacement.into_lock();
+        lock.adopt_inode_lock(replacement_lock.take_inode_lock());
+        Self::open_with_lock(path, Some(lock))
     }
 
     /// Write one document's blocks to the page file. Returns the first_block_page.
@@ -174,7 +451,19 @@ impl Storage {
         views: &[ViewEntry],
         tokenizer: TokenizerKind,
     ) -> Result<(), MqdbError> {
-        write_catalog(
+        if self.page_file.version != FILE_VERSION {
+            write_catalog(
+                &mut self.page_file,
+                entries,
+                custom_tables,
+                content_hashes,
+                views,
+                tokenizer,
+            )?;
+            return self.page_file.sync_header();
+        }
+
+        let catalog_root = append_catalog(
             &mut self.page_file,
             entries,
             custom_tables,
@@ -182,12 +471,33 @@ impl Storage {
             views,
             tokenizer,
         )?;
-        self.page_file.sync_header()
+        // Ordering is the transaction protocol: an on-disk commit record
+        // never points at catalog pages which have not reached stable media.
+        self.page_file.sync_all()?;
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("catalog generation overflow"))?;
+        let slot = if generation % 2 == 0 {
+            SUPERBLOCK_B
+        } else {
+            SUPERBLOCK_A
+        };
+        let commit = superblock_page(slot, generation, catalog_root, self.page_file.num_pages);
+        self.page_file.write_page(slot, &commit)?;
+        self.page_file.sync_all()?;
+        self.catalog_root = catalog_root;
+        self.generation = generation;
+        Ok(())
     }
 
     /// Read the catalog.
     pub fn load_catalog(&mut self) -> Result<CatalogData, MqdbError> {
-        read_catalog(&mut self.page_file)
+        if self.generation != 0 {
+            read_catalog_at(&mut self.page_file, self.catalog_root)
+        } else {
+            read_catalog(&mut self.page_file)
+        }
     }
 
     /// Write raw index bytes as a chained page sequence. Returns the first page id.
@@ -951,6 +1261,247 @@ pub(crate) mod tests {
         let expected: Vec<Vec<String>> = expected.into_iter().chain(big_batch).collect();
         assert_eq!(all_rows, expected);
 
+        cleanup(&path);
+    }
+
+    #[test]
+    fn recovery_uses_previous_superblock_when_latest_commit_is_torn() {
+        let path = test_file_path("superblock-recovery");
+        cleanup(&path);
+
+        let mut storage = Storage::create(&path).unwrap();
+        // Generation 2 lives in superblock B and is our known-good state.
+        storage
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .unwrap();
+        let entry = CatalogEntry {
+            document_id: 42,
+            path: None,
+            first_block_page: 0,
+            num_blocks: 0,
+            zone_map_bytes: vec![],
+            index_start_page: 0,
+        };
+        // Generation 3 is published through superblock A.
+        storage
+            .flush_catalog(
+                std::slice::from_ref(&entry),
+                &[],
+                &[],
+                &[],
+                TokenizerKind::Word,
+            )
+            .unwrap();
+        drop(storage);
+
+        // Model a torn final commit-page write: the new root pages remain
+        // intact, but the selected superblock fails its page checksum.
+        use crate::storage::page::PAGE_SIZE;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(
+            u64::from(SUPERBLOCK_A) * PAGE_SIZE as u64 + 4,
+        ))
+        .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(
+            u64::from(SUPERBLOCK_A) * PAGE_SIZE as u64 + 4,
+        ))
+        .unwrap();
+        file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut recovered = Storage::open(&path).unwrap();
+        let (entries, _, _, _, _) = recovered.load_catalog().unwrap();
+        assert!(
+            entries.is_empty(),
+            "must retain the previous committed root"
+        );
+        drop(recovered);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_read_only_tolerates_a_partial_trailing_page_on_v8() {
+        use crate::storage::page::PAGE_SIZE;
+        use std::io::{Seek, SeekFrom, Write};
+
+        let path = test_file_path("v8-partial-tail");
+        cleanup(&path);
+
+        let mut storage = Storage::create(&path).unwrap();
+        storage
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .unwrap();
+        drop(storage);
+
+        // Simulate a concurrent writer mid-append: extra bytes past the
+        // committed length, short of a full page and unreferenced by any
+        // superblock.
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&[0u8; PAGE_SIZE / 2]).unwrap();
+        drop(file);
+
+        Storage::open_read_only(&path).expect("v8 open must tolerate a torn tail");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn writable_open_after_partial_tail_does_not_corrupt_next_commit() {
+        use crate::storage::page::PAGE_SIZE;
+        use std::io::{Seek, SeekFrom, Write};
+
+        let path = test_file_path("v8-partial-tail-append");
+        cleanup(&path);
+
+        let mut storage = Storage::create(&path).unwrap();
+        storage
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .unwrap();
+        drop(storage);
+
+        // A crash mid-append leaves extra bytes past the committed length,
+        // short of a full page.
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&[0u8; PAGE_SIZE / 2]).unwrap();
+        drop(file);
+
+        let mut storage = Storage::open(&path).unwrap();
+        let entry = CatalogEntry {
+            document_id: 7,
+            path: None,
+            first_block_page: 0,
+            num_blocks: 0,
+            zone_map_bytes: vec![],
+            index_start_page: 0,
+        };
+        storage
+            .flush_catalog(
+                std::slice::from_ref(&entry),
+                &[],
+                &[],
+                &[],
+                TokenizerKind::Word,
+            )
+            .unwrap();
+        drop(storage);
+
+        let mut reopened = Storage::open_read_only(&path).unwrap();
+        let (entries, _, _, _, _) = reopened.load_catalog().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the committed catalog must survive reopen"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_rejects_unaligned_legacy_file() {
+        use crate::storage::page::PAGE_SIZE;
+        use std::io::{Seek, SeekFrom, Write};
+
+        let path = test_file_path("legacy-unaligned-tail");
+        cleanup(&path);
+
+        let mut store = DocumentStore::new();
+        store.add_str("# Hello\n\nBody\n").unwrap();
+        store.save(&path).unwrap();
+        patch_version(&path, 4);
+
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(&[0u8; PAGE_SIZE / 2]).unwrap();
+        drop(file);
+
+        let err = Storage::open_read_only(&path)
+            .err()
+            .expect("legacy formats still require page-aligned files");
+        assert!(err.to_string().contains("not aligned"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn writable_open_is_exclusive_across_storage_handles() {
+        let path = test_file_path("exclusive-lock");
+        cleanup(&path);
+
+        let storage = Storage::create(&path).unwrap();
+        let err = Storage::open(&path).err().expect("second writer must fail");
+        assert!(err.to_string().contains("already open for writing"));
+        drop(storage);
+
+        Storage::open(&path).unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writable_open_is_exclusive_through_a_symlink_alias() {
+        let path = test_file_path("symlink-lock-target");
+        cleanup(&path);
+        let alias = test_file_path("symlink-lock-alias");
+        let _ = std::fs::remove_file(&alias);
+
+        let storage = Storage::create(&path).unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let err = Storage::open(&alias)
+            .err()
+            .expect("second writer through the symlink must fail");
+        assert!(err.to_string().contains("already open for writing"));
+
+        drop(storage);
+        std::fs::remove_file(&alias).unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writable_open_is_exclusive_through_a_hard_link_alias() {
+        let path = test_file_path("hardlink-lock-target");
+        cleanup(&path);
+        let alias = test_file_path("hardlink-lock-alias");
+        let _ = std::fs::remove_file(&alias);
+
+        let storage = Storage::create(&path).unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        let err = Storage::open(&alias)
+            .err()
+            .expect("second writer through the hard link must fail");
+        assert!(err.to_string().contains("already open for writing"));
+
+        drop(storage);
+        std::fs::remove_file(&alias).unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn writable_open_is_exclusive_through_a_hard_link_in_another_directory() {
+        let path = test_file_path("hardlink-cross-dir-target");
+        cleanup(&path);
+        let other_dir = path.parent().unwrap().join("hardlink-cross-dir-alias-dir");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let alias = other_dir.join("alias.mq-db");
+        let _ = std::fs::remove_file(&alias);
+
+        let storage = Storage::create(&path).unwrap();
+        std::fs::hard_link(&path, &alias).unwrap();
+        let err = Storage::open(&alias)
+            .err()
+            .expect("second writer through the cross-directory hard link must fail");
+        assert!(err.to_string().contains("already open for writing"));
+
+        drop(storage);
+        std::fs::remove_file(&alias).unwrap();
         cleanup(&path);
     }
 

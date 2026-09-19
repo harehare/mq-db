@@ -2136,6 +2136,9 @@ pub struct SqlEngine<'a> {
     /// own `WITH` shadows an outer CTE of the same name.
     cte_scopes: std::cell::RefCell<Vec<FxHashMap<String, std::rc::Rc<QueryOutput>>>>,
     view_stack: std::cell::RefCell<Vec<String>>,
+    /// Identifies this engine as a transaction owner; `ThreadId` can't, since
+    /// engines may share a thread or a session may move between threads.
+    session_id: u64,
 }
 
 impl<'a> SqlEngine<'a> {
@@ -2144,6 +2147,13 @@ impl<'a> SqlEngine<'a> {
     /// Uses cached indexes from [`DocumentStore::load_all_indexes`] when
     /// available (O(1) per document); otherwise rebuilds from blocks (O(n)).
     pub fn new(store: &'a DocumentStore) -> Result<Self, MqdbError> {
+        Self::with_session(store, DocumentStore::new_session_id())
+    }
+
+    /// Like [`new`](Self::new), but runs as an existing session (see
+    /// [`DocumentStore::new_session_id`]), so a transaction opened by one
+    /// engine can be continued or rolled back by a later one.
+    pub fn with_session(store: &'a DocumentStore, session_id: u64) -> Result<Self, MqdbError> {
         let indexes = store
             .documents()
             .iter()
@@ -2161,6 +2171,7 @@ impl<'a> SqlEngine<'a> {
             indexes,
             cte_scopes: std::cell::RefCell::new(Vec::new()),
             view_stack: std::cell::RefCell::new(Vec::new()),
+            session_id,
         })
     }
 
@@ -2262,7 +2273,7 @@ impl<'a> SqlEngine<'a> {
                 "VACUUM is a CLI command, not a SQL statement here — run `mq-db vacuum --db <path>`".into(),
             )),
             Statement::StartTransaction { .. } => {
-                self.store.begin_transaction()?;
+                self.store.begin_transaction(self.session_id)?;
                 Ok(ok_result())
             }
             Statement::Commit { .. } => {
@@ -2717,6 +2728,8 @@ impl<'a> SqlEngine<'a> {
                 "cannot override built-in table '{table_name}'"
             )));
         }
+        // Guard the cross-kind check too, or a concurrent CREATE VIEW can slip in.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
         if self.store.views.read().unwrap().contains_key(&table_name) {
             return Err(MqdbError::SqlExec(format!(
                 "'{table_name}' is already defined as a view"
@@ -2725,10 +2738,27 @@ impl<'a> SqlEngine<'a> {
 
         if let Some(query) = &ct.query {
             // CREATE TABLE name AS SELECT ...
+            let already_exists = self
+                .store
+                .custom_tables
+                .read()
+                .unwrap()
+                .contains_key(&table_name);
+            if already_exists && !ct.or_replace {
+                if ct.if_not_exists {
+                    return Ok(QueryOutput {
+                        columns: vec!["result".to_string()],
+                        rows: vec![vec!["already exists".to_string()]],
+                    });
+                }
+                return Err(MqdbError::SqlExec(format!(
+                    "table '{table_name}' already exists"
+                )));
+            }
             let result = self.exec_query(query)?;
             let n = result.rows.len();
-            self.store.custom_tables.write().unwrap().insert(
-                table_name,
+            let previous = self.store.custom_tables.write().unwrap().insert(
+                table_name.clone(),
                 CustomTableState {
                     columns: result.columns,
                     rows: result.rows,
@@ -2738,7 +2768,19 @@ impl<'a> SqlEngine<'a> {
                     unique: vec![],
                 },
             );
-            self.store.try_flush_catalog_to_storage();
+            if let Err(err) = self.store.flush_catalog_to_storage() {
+                let mut tables = self.store.custom_tables.write().unwrap();
+                match previous {
+                    Some(previous_state) => {
+                        tables.insert(table_name, previous_state);
+                    }
+                    None => {
+                        tables.remove(&table_name);
+                    }
+                }
+                return Err(err);
+            }
+            self.store.note_catalog_mutation(self.session_id);
             return Ok(QueryOutput {
                 columns: vec!["rows".to_string()],
                 rows: vec![vec![n.to_string()]],
@@ -2771,7 +2813,7 @@ impl<'a> SqlEngine<'a> {
         }
         let (not_null, unique) = table_constraints(&columns, &ct.columns, &ct.constraints);
         self.store.custom_tables.write().unwrap().insert(
-            table_name,
+            table_name.clone(),
             CustomTableState {
                 columns,
                 rows: vec![],
@@ -2781,7 +2823,15 @@ impl<'a> SqlEngine<'a> {
                 unique,
             },
         );
-        self.store.try_flush_catalog_to_storage();
+        if let Err(err) = self.store.flush_catalog_to_storage() {
+            self.store
+                .custom_tables
+                .write()
+                .unwrap()
+                .remove(&table_name);
+            return Err(err);
+        }
+        self.store.note_catalog_mutation(self.session_id);
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec!["ok".to_string()]],
@@ -2795,6 +2845,14 @@ impl<'a> SqlEngine<'a> {
                 "cannot override built-in table '{view_name}'"
             )));
         }
+        if !cv.columns.is_empty() {
+            return Err(MqdbError::SqlExec(
+                "explicit view columns (CREATE VIEW v (a, b) AS ...) are not supported".into(),
+            ));
+        }
+
+        // Guard the cross-kind check too, or a concurrent CREATE TABLE can slip in.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
         if self
             .store
             .custom_tables
@@ -2805,11 +2863,6 @@ impl<'a> SqlEngine<'a> {
             return Err(MqdbError::SqlExec(format!(
                 "'{view_name}' is already defined as a table"
             )));
-        }
-        if !cv.columns.is_empty() {
-            return Err(MqdbError::SqlExec(
-                "explicit view columns (CREATE VIEW v (a, b) AS ...) are not supported".into(),
-            ));
         }
 
         let already_exists = self.store.views.read().unwrap().contains_key(&view_name);
@@ -2835,12 +2888,25 @@ impl<'a> SqlEngine<'a> {
             ));
         }
 
-        self.store
+        let previous = self
+            .store
             .views
             .write()
             .unwrap()
-            .insert(view_name, sql_text);
-        self.store.try_flush_catalog_to_storage();
+            .insert(view_name.clone(), sql_text);
+        if let Err(err) = self.store.flush_catalog_to_storage() {
+            let mut views = self.store.views.write().unwrap();
+            match previous {
+                Some(previous_sql) => {
+                    views.insert(view_name, previous_sql);
+                }
+                None => {
+                    views.remove(&view_name);
+                }
+            }
+            return Err(err);
+        }
+        self.store.note_catalog_mutation(self.session_id);
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec!["ok".to_string()]],
@@ -2852,27 +2918,53 @@ impl<'a> SqlEngine<'a> {
         names: &[ObjectName],
         if_exists: bool,
     ) -> Result<QueryOutput, MqdbError> {
+        let mut view_names = Vec::with_capacity(names.len());
+        for name in names {
+            let view_name = require_unqualified(name)?;
+            if matches!(view_name.as_str(), "blocks" | "documents") {
+                return Err(MqdbError::SqlExec(format!(
+                    "cannot drop built-in table '{view_name}'"
+                )));
+            }
+            view_names.push(view_name);
+        }
+
+        // Serialize mutate+flush+rollback against other catalog writers.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
+
+        let mut removed = Vec::new();
         let dropped = {
             let mut guard = self.store.views.write().unwrap();
-            let mut dropped = 0usize;
-            for name in names {
-                let view_name = require_unqualified(name)?;
-                if matches!(view_name.as_str(), "blocks" | "documents") {
-                    return Err(MqdbError::SqlExec(format!(
-                        "cannot drop built-in table '{view_name}'"
-                    )));
+            // Validate every target before mutating so a missing name later
+            // in the list can't leave earlier names partially dropped.
+            if !if_exists {
+                for view_name in &view_names {
+                    if !guard.contains_key(view_name) {
+                        return Err(MqdbError::SqlExec(format!(
+                            "view '{view_name}' does not exist"
+                        )));
+                    }
                 }
-                if guard.remove(&view_name).is_some() {
+            }
+            let mut dropped = 0usize;
+            for view_name in view_names {
+                if let Some(sql) = guard.remove(&view_name) {
+                    removed.push((view_name, sql));
                     dropped += 1;
-                } else if !if_exists {
-                    return Err(MqdbError::SqlExec(format!(
-                        "view '{view_name}' does not exist"
-                    )));
                 }
             }
             dropped
         };
-        self.store.try_flush_catalog_to_storage();
+        if let Err(err) = self.store.flush_catalog_to_storage() {
+            let mut guard = self.store.views.write().unwrap();
+            for (name, sql) in removed {
+                guard.insert(name, sql);
+            }
+            return Err(err);
+        }
+        if dropped > 0 {
+            self.store.note_catalog_mutation(self.session_id);
+        }
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec![format!("{dropped} view(s) dropped")]],
@@ -2890,6 +2982,9 @@ impl<'a> SqlEngine<'a> {
             .as_ref()
             .ok_or_else(|| MqdbError::SqlExec("INSERT requires VALUES or SELECT".into()))?;
         let values_out = self.exec_query(source)?;
+
+        // Serialize mutate+flush+rollback against other catalog writers.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
 
         // Determine column mapping
         let col_indices: Option<Vec<usize>> = if ins.columns.is_empty() {
@@ -2983,8 +3078,16 @@ impl<'a> SqlEngine<'a> {
         // Append only the new rows to the on-disk chain instead of rewriting
         // the whole table, so INSERT cost stays proportional to the rows
         // being added rather than the table's total size.
-        self.store
-            .try_append_table_rows_to_storage(&table_name, &new_rows);
+        if let Err(err) = self
+            .store
+            .append_table_rows_to_storage(&table_name, &new_rows)
+        {
+            self.store.rollback_appended_rows(&table_name, inserted);
+            return Err(err);
+        }
+        if inserted > 0 {
+            self.store.note_catalog_mutation(self.session_id);
+        }
         Ok(QueryOutput {
             columns: vec!["rows_affected".to_string()],
             rows: vec![vec![inserted.to_string()]],
@@ -2996,27 +3099,53 @@ impl<'a> SqlEngine<'a> {
         names: &[ObjectName],
         if_exists: bool,
     ) -> Result<QueryOutput, MqdbError> {
+        let mut table_names = Vec::with_capacity(names.len());
+        for name in names {
+            let table_name = require_unqualified(name)?;
+            if matches!(table_name.as_str(), "blocks" | "documents") {
+                return Err(MqdbError::SqlExec(format!(
+                    "cannot drop built-in table '{table_name}'"
+                )));
+            }
+            table_names.push(table_name);
+        }
+
+        // Serialize mutate+flush+rollback against other catalog writers.
+        let _catalog_guard = self.store.catalog_commit.lock().unwrap();
+
+        let mut removed = Vec::new();
         let dropped = {
             let mut guard = self.store.custom_tables.write().unwrap();
-            let mut dropped = 0usize;
-            for name in names {
-                let table_name = require_unqualified(name)?;
-                if matches!(table_name.as_str(), "blocks" | "documents") {
-                    return Err(MqdbError::SqlExec(format!(
-                        "cannot drop built-in table '{table_name}'"
-                    )));
+            // Validate every target before mutating so a missing name later
+            // in the list can't leave earlier names partially dropped.
+            if !if_exists {
+                for table_name in &table_names {
+                    if !guard.contains_key(table_name) {
+                        return Err(MqdbError::SqlExec(format!(
+                            "table '{table_name}' does not exist"
+                        )));
+                    }
                 }
-                if guard.remove(&table_name).is_some() {
+            }
+            let mut dropped = 0usize;
+            for table_name in table_names {
+                if let Some(state) = guard.remove(&table_name) {
+                    removed.push((table_name, state));
                     dropped += 1;
-                } else if !if_exists {
-                    return Err(MqdbError::SqlExec(format!(
-                        "table '{table_name}' does not exist"
-                    )));
                 }
             }
             dropped
         }; // write lock released before flush
-        self.store.try_flush_catalog_to_storage();
+        if let Err(err) = self.store.flush_catalog_to_storage() {
+            let mut guard = self.store.custom_tables.write().unwrap();
+            for (name, state) in removed {
+                guard.insert(name, state);
+            }
+            return Err(err);
+        }
+        if dropped > 0 {
+            self.store.note_catalog_mutation(self.session_id);
+        }
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec![format!("{dropped} table(s) dropped")]],
@@ -4602,7 +4731,7 @@ impl DocumentStore {
         let trimmed = sql.trim().trim_end_matches(';');
         let upper = trimmed.to_ascii_uppercase();
         if upper.starts_with("DESC ") || upper.starts_with("DESCRIBE ") || upper == "SHOW TABLES" {
-            return SqlEngine::new(self)?.execute(sql);
+            return SqlEngine::with_session(self, self.write_session)?.execute(sql);
         }
 
         let stmts = Parser::parse_sql(&GenericDialect {}, sql)
@@ -4686,7 +4815,7 @@ impl DocumentStore {
                         rows: vec![vec![n.to_string()]],
                     })
                 } else {
-                    SqlEngine::new(self)?.execute(sql)
+                    SqlEngine::with_session(self, self.write_session)?.execute(sql)
                 }
             }
             Statement::Rollback { .. } => {
@@ -4704,7 +4833,7 @@ impl DocumentStore {
                     })
                 }
             }
-            _ => SqlEngine::new(self)?.execute(sql),
+            _ => SqlEngine::with_session(self, self.write_session)?.execute(sql),
         }
     }
 }
@@ -6964,6 +7093,45 @@ mod tests {
         assert_eq!(out.rows.len(), 2);
     }
 
+    #[test]
+    fn test_ddl_create_as_select_rejects_existing_table() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE t AS SELECT 1 AS x").unwrap();
+        let err = engine
+            .execute("CREATE TABLE t AS SELECT 2 AS x")
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        // The original table must survive the rejected statement.
+        let out = engine.execute("SELECT x FROM t").unwrap();
+        assert_eq!(out.rows, vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn test_ddl_create_as_select_if_not_exists_keeps_existing() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE t AS SELECT 1 AS x").unwrap();
+        let out = engine
+            .execute("CREATE TABLE IF NOT EXISTS t AS SELECT 2 AS x")
+            .unwrap();
+        assert_eq!(out.rows[0][0], "already exists");
+        let sel = engine.execute("SELECT x FROM t").unwrap();
+        assert_eq!(sel.rows, vec![vec!["1".to_string()]]);
+    }
+
+    #[test]
+    fn test_ddl_create_as_select_or_replace_overwrites() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE t AS SELECT 1 AS x").unwrap();
+        engine
+            .execute("CREATE OR REPLACE TABLE t AS SELECT 2 AS x")
+            .unwrap();
+        let out = engine.execute("SELECT x FROM t").unwrap();
+        assert_eq!(out.rows, vec![vec!["2".to_string()]]);
+    }
+
     // DROP TABLE
     #[test]
     fn test_ddl_drop_table() {
@@ -6983,6 +7151,94 @@ mod tests {
         engine
             .execute("DROP TABLE IF EXISTS no_such_table")
             .unwrap();
+    }
+
+    #[test]
+    fn test_ddl_drop_tables_multi_name_missing_is_atomic() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE TABLE a (x TEXT)").unwrap();
+        let err = engine.execute("DROP TABLE a, missing").unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+        // 'a' must not have been dropped by the time 'missing' failed.
+        engine.execute("SELECT * FROM a").unwrap();
+    }
+
+    #[test]
+    fn test_ddl_drop_views_multi_name_missing_is_atomic() {
+        let store = DocumentStore::new();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine.execute("CREATE VIEW a AS SELECT 1").unwrap();
+        let err = engine.execute("DROP VIEW a, missing").unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+        // 'a' must not have been dropped by the time 'missing' failed.
+        engine.execute("SELECT * FROM a").unwrap();
+    }
+
+    #[test]
+    fn concurrent_create_table_statements_all_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("store.mq-db");
+        DocumentStore::new().save(&db_path).unwrap();
+        let store = DocumentStore::open(&db_path).unwrap();
+
+        const N: usize = 16;
+        std::thread::scope(|scope| {
+            for i in 0..N {
+                let store = &store;
+                scope.spawn(move || {
+                    let engine = SqlEngine::new(store).unwrap();
+                    engine
+                        .execute(&format!("CREATE TABLE t{i} (x INT)"))
+                        .unwrap();
+                });
+            }
+        });
+        drop(store);
+
+        let reopened = DocumentStore::open(&db_path).unwrap();
+        let engine = SqlEngine::new(&reopened).unwrap();
+        let out = engine.execute("SHOW TABLES").unwrap();
+        for i in 0..N {
+            assert!(
+                out.rows.iter().any(|r| r[0] == format!("t{i}")),
+                "table t{i} missing after reopen — a concurrent flush lost it"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_create_table_and_view_with_same_name_do_not_both_win() {
+        let store = DocumentStore::new();
+
+        let barrier = std::sync::Barrier::new(2);
+        let (table_result, view_result) = std::thread::scope(|scope| {
+            let table_handle = scope.spawn(|| {
+                let engine = SqlEngine::new(&store).unwrap();
+                barrier.wait();
+                engine.execute("CREATE TABLE dup (x INT)")
+            });
+            let view_handle = scope.spawn(|| {
+                let engine = SqlEngine::new(&store).unwrap();
+                barrier.wait();
+                engine.execute("CREATE VIEW dup AS SELECT 1 AS x")
+            });
+            (table_handle.join().unwrap(), view_handle.join().unwrap())
+        });
+
+        assert_ne!(
+            table_result.is_ok(),
+            view_result.is_ok(),
+            "exactly one of the racing CREATE TABLE / CREATE VIEW must win"
+        );
+
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine.execute("SHOW TABLES").unwrap();
+        assert_eq!(
+            out.rows.iter().filter(|r| r[0] == "dup").count(),
+            1,
+            "the catalog must contain exactly one 'dup' entry"
+        );
     }
 
     // DESC blocks (built-in)
@@ -7733,6 +7989,128 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn rollback_does_not_delete_a_table_committed_by_another_session_mid_transaction() {
+        let store = DocumentStore::new();
+        let began = std::sync::Barrier::new(2);
+        let committed = std::sync::Barrier::new(2);
+
+        std::thread::scope(|scope| {
+            let engine_a_handle = scope.spawn(|| {
+                let engine_a = SqlEngine::new(&store).unwrap();
+                engine_a.execute("BEGIN").unwrap();
+                began.wait();
+                // Wait for the other session's CREATE TABLE to land before
+                // rolling back.
+                committed.wait();
+                engine_a.execute("ROLLBACK").unwrap_err()
+            });
+            let engine_b_handle = scope.spawn(|| {
+                began.wait();
+                let engine_b = SqlEngine::new(&store).unwrap();
+                engine_b.execute("CREATE TABLE audit (id TEXT)").unwrap();
+                committed.wait();
+            });
+            let err = engine_a_handle.join().unwrap();
+            engine_b_handle.join().unwrap();
+            assert!(
+                err.to_string().contains("another session"),
+                "unexpected error: {err}"
+            );
+        });
+
+        // The concurrently committed table must survive the rollback.
+        let engine = SqlEngine::new(&store).unwrap();
+        let out = engine.execute("SHOW TABLES").unwrap();
+        assert!(
+            out.rows.iter().any(|r| r[0] == "audit"),
+            "table 'audit' was deleted by an unrelated transaction's rollback"
+        );
+    }
+
+    #[test]
+    fn rollback_ignores_noop_ddl_from_another_session() {
+        let store = DocumentStore::new();
+        let engine_a = SqlEngine::new(&store).unwrap();
+        let engine_b = SqlEngine::new(&store).unwrap();
+        engine_a.execute("CREATE TABLE notes (id TEXT)").unwrap();
+
+        engine_a.execute("BEGIN").unwrap();
+        engine_a.execute("INSERT INTO notes VALUES ('1')").unwrap();
+        engine_b.execute("DROP TABLE IF EXISTS missing").unwrap();
+        engine_b.execute("DROP VIEW IF EXISTS missing").unwrap();
+        engine_b
+            .execute("CREATE TABLE IF NOT EXISTS notes (id TEXT)")
+            .unwrap();
+        engine_b
+            .execute("INSERT INTO notes SELECT * FROM notes WHERE 1 = 0")
+            .unwrap();
+        engine_a.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            engine_a.execute("SELECT * FROM notes").unwrap().rows.len(),
+            0
+        );
+    }
+
+    #[test]
+    fn rollback_does_not_delete_a_commit_from_another_engine_on_the_same_thread() {
+        let store = DocumentStore::new();
+        let engine_a = SqlEngine::new(&store).unwrap();
+        let engine_b = SqlEngine::new(&store).unwrap();
+
+        engine_a.execute("BEGIN").unwrap();
+        engine_b.execute("CREATE TABLE audit (id TEXT)").unwrap();
+        let err = engine_a.execute("ROLLBACK").unwrap_err();
+        assert!(
+            err.to_string().contains("another session"),
+            "unexpected error: {err}"
+        );
+
+        let out = engine_a.execute("SHOW TABLES").unwrap();
+        assert!(out.rows.iter().any(|r| r[0] == "audit"));
+    }
+
+    #[test]
+    fn rollback_works_across_execute_sql_mut_calls() {
+        let mut store = DocumentStore::new();
+        store.execute_sql_mut("BEGIN").unwrap();
+        store.execute_sql_mut("CREATE TABLE t (x TEXT)").unwrap();
+        store.execute_sql_mut("ROLLBACK").unwrap();
+
+        let out = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SHOW TABLES")
+            .unwrap();
+        assert!(
+            out.rows.iter().all(|r| r[0] != "t"),
+            "table 't' survived rollback"
+        );
+    }
+
+    #[test]
+    fn rollback_works_across_engines_sharing_a_session() {
+        let store = DocumentStore::new();
+        let session = DocumentStore::new_session_id();
+        let run = |sql: &str| {
+            SqlEngine::with_session(&store, session)
+                .unwrap()
+                .execute(sql)
+        };
+        run("BEGIN").unwrap();
+        run("CREATE TABLE t (x TEXT)").unwrap();
+        run("ROLLBACK").unwrap();
+
+        let out = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SHOW TABLES")
+            .unwrap();
+        assert!(
+            out.rows.iter().all(|r| r[0] != "t"),
+            "table 't' survived rollback"
+        );
     }
 
     #[test]
@@ -9047,6 +9425,26 @@ mod tests {
 
         let err = engine.execute(&attach_sql).unwrap_err();
         assert!(err.to_string().contains("already attached"));
+    }
+
+    #[test]
+    fn attach_does_not_block_a_concurrent_writer_on_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_path = saved_store(&dir, "other.mq-db", "# Other Doc\n\nOther body\n");
+
+        let _writer = DocumentStore::open(&other_path).unwrap();
+
+        let store = make_store();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "ATTACH DATABASE '{}' AS other",
+                other_path.display()
+            ))
+            .unwrap();
+
+        let result = engine.execute("SELECT content FROM other.blocks").unwrap();
+        assert!(!result.rows.is_empty());
     }
 
     #[test]
