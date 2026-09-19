@@ -3,7 +3,6 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Mutex, RwLock},
-    thread::ThreadId,
 };
 
 use rustc_hash::FxHashMap;
@@ -29,10 +28,10 @@ pub(crate) struct TxSnapshot {
     pub custom_tables: FxHashMap<String, CustomTableState>,
     pub views: FxHashMap<String, String>,
     pub content_hashes: FxHashMap<DocumentId, u64>,
-    /// Thread that ran `BEGIN`. Catalog mutations from any other thread
-    /// while this transaction is open are treated as external commits.
-    pub owner: ThreadId,
-    /// Set by [`DocumentStore::note_catalog_mutation`] when a thread other
+    /// Session (`SqlEngine`) that ran `BEGIN`. Catalog mutations from any
+    /// other session while this transaction is open are external commits.
+    pub owner: u64,
+    /// Set by [`DocumentStore::note_catalog_mutation`] when a session other
     /// than `owner` mutates the catalog while this transaction is open.
     /// Rollback refuses to run over such a mutation rather than silently
     /// discarding it.
@@ -857,7 +856,9 @@ impl DocumentStore {
     /// their existing pages untouched — see
     /// [`append_table_rows_to_storage`](DocumentStore::append_table_rows_to_storage)
     /// for the incremental `INSERT` path.
-    pub(crate) fn begin_transaction(&self) -> Result<(), MqdbError> {
+    pub(crate) fn begin_transaction(&self, session: u64) -> Result<(), MqdbError> {
+        // Snapshot must not observe a writer's half-applied mutation.
+        let _catalog_guard = self.catalog_commit.lock().unwrap();
         let mut guard = self.tx_snapshot.lock().unwrap();
         if guard.is_some() {
             return Err(MqdbError::SqlExec(
@@ -869,7 +870,7 @@ impl DocumentStore {
             custom_tables: self.custom_tables.read().unwrap().clone(),
             views: self.views.read().unwrap().clone(),
             content_hashes: self.content_hashes.clone(),
-            owner: std::thread::current().id(),
+            owner: session,
             external_write: false,
         });
         Ok(())
@@ -882,16 +883,15 @@ impl DocumentStore {
         Ok(())
     }
 
-    /// Called by every catalog-mutating statement (`CREATE`/`DROP TABLE`,
-    /// `CREATE`/`DROP VIEW`, `INSERT` into a custom table) right after it
-    /// commits its change, while a transaction may be open on another
-    /// thread. Marks that transaction's snapshot as stale so rollback
-    /// refuses to overwrite this commit instead of silently discarding it.
-    /// A no-op for mutations made by the transaction's own owner thread —
-    /// those are expected to be undone by its own rollback.
-    pub(crate) fn note_catalog_mutation(&self) {
+    /// Called by a catalog-mutating executor after it has actually changed
+    /// and durably flushed the catalog. Callers must still hold
+    /// `catalog_commit`, so rollback can't slip in between the commit and
+    /// this mark. Flags an open transaction owned by another session so its
+    /// rollback refuses to overwrite this commit. A no-op for the owner's own
+    /// mutations — its rollback is expected to undo those.
+    pub(crate) fn note_catalog_mutation(&self, session: u64) {
         if let Some(tx) = self.tx_snapshot.lock().unwrap().as_mut()
-            && tx.owner != std::thread::current().id()
+            && tx.owner != session
         {
             tx.external_write = true;
         }

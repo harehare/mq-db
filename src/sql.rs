@@ -2136,7 +2136,12 @@ pub struct SqlEngine<'a> {
     /// own `WITH` shadows an outer CTE of the same name.
     cte_scopes: std::cell::RefCell<Vec<FxHashMap<String, std::rc::Rc<QueryOutput>>>>,
     view_stack: std::cell::RefCell<Vec<String>>,
+    /// Identifies this engine as a transaction owner; `ThreadId` can't, since
+    /// engines may share a thread or a session may move between threads.
+    session_id: u64,
 }
+
+static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl<'a> SqlEngine<'a> {
     /// Build the engine and its secondary indexes.
@@ -2161,6 +2166,7 @@ impl<'a> SqlEngine<'a> {
             indexes,
             cte_scopes: std::cell::RefCell::new(Vec::new()),
             view_stack: std::cell::RefCell::new(Vec::new()),
+            session_id: NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -2240,31 +2246,21 @@ impl<'a> SqlEngine<'a> {
 
         match stmt {
             Statement::Query(q) => self.exec_query(&q),
-            Statement::CreateTable(ct) => {
-                self.exec_create_table(&ct).inspect(|_| self.store.note_catalog_mutation())
-            }
-            Statement::Insert(ins) => {
-                self.exec_insert(&ins).inspect(|_| self.store.note_catalog_mutation())
-            }
+            Statement::CreateTable(ct) => self.exec_create_table(&ct),
+            Statement::Insert(ins) => self.exec_insert(&ins),
             Statement::Drop {
                 object_type: ObjectType::Table,
                 names,
                 if_exists,
                 ..
-            } => self
-                .exec_drop_tables(&names, if_exists)
-                .inspect(|_| self.store.note_catalog_mutation()),
+            } => self.exec_drop_tables(&names, if_exists),
             Statement::Drop {
                 object_type: ObjectType::View,
                 names,
                 if_exists,
                 ..
-            } => self
-                .exec_drop_views(&names, if_exists)
-                .inspect(|_| self.store.note_catalog_mutation()),
-            Statement::CreateView(cv) => {
-                self.exec_create_view(&cv).inspect(|_| self.store.note_catalog_mutation())
-            }
+            } => self.exec_drop_views(&names, if_exists),
+            Statement::CreateView(cv) => self.exec_create_view(&cv),
             Statement::Explain {
                 analyze, statement, ..
             } => self.exec_explain(analyze, &statement),
@@ -2272,7 +2268,7 @@ impl<'a> SqlEngine<'a> {
                 "VACUUM is a CLI command, not a SQL statement here — run `mq-db vacuum --db <path>`".into(),
             )),
             Statement::StartTransaction { .. } => {
-                self.store.begin_transaction()?;
+                self.store.begin_transaction(self.session_id)?;
                 Ok(ok_result())
             }
             Statement::Commit { .. } => {
@@ -2779,6 +2775,7 @@ impl<'a> SqlEngine<'a> {
                 }
                 return Err(err);
             }
+            self.store.note_catalog_mutation(self.session_id);
             return Ok(QueryOutput {
                 columns: vec!["rows".to_string()],
                 rows: vec![vec![n.to_string()]],
@@ -2829,6 +2826,7 @@ impl<'a> SqlEngine<'a> {
                 .remove(&table_name);
             return Err(err);
         }
+        self.store.note_catalog_mutation(self.session_id);
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec!["ok".to_string()]],
@@ -2903,6 +2901,7 @@ impl<'a> SqlEngine<'a> {
             }
             return Err(err);
         }
+        self.store.note_catalog_mutation(self.session_id);
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
             rows: vec![vec!["ok".to_string()]],
@@ -2957,6 +2956,9 @@ impl<'a> SqlEngine<'a> {
                 guard.insert(name, sql);
             }
             return Err(err);
+        }
+        if dropped > 0 {
+            self.store.note_catalog_mutation(self.session_id);
         }
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
@@ -3078,6 +3080,9 @@ impl<'a> SqlEngine<'a> {
             self.store.rollback_appended_rows(&table_name, inserted);
             return Err(err);
         }
+        if inserted > 0 {
+            self.store.note_catalog_mutation(self.session_id);
+        }
         Ok(QueryOutput {
             columns: vec!["rows_affected".to_string()],
             rows: vec![vec![inserted.to_string()]],
@@ -3132,6 +3137,9 @@ impl<'a> SqlEngine<'a> {
                 guard.insert(name, state);
             }
             return Err(err);
+        }
+        if dropped > 0 {
+            self.store.note_catalog_mutation(self.session_id);
         }
         Ok(QueryOutput {
             columns: vec!["result".to_string()],
@@ -8015,6 +8023,49 @@ mod tests {
             out.rows.iter().any(|r| r[0] == "audit"),
             "table 'audit' was deleted by an unrelated transaction's rollback"
         );
+    }
+
+    #[test]
+    fn rollback_ignores_noop_ddl_from_another_session() {
+        let store = DocumentStore::new();
+        let engine_a = SqlEngine::new(&store).unwrap();
+        let engine_b = SqlEngine::new(&store).unwrap();
+        engine_a.execute("CREATE TABLE notes (id TEXT)").unwrap();
+
+        engine_a.execute("BEGIN").unwrap();
+        engine_a.execute("INSERT INTO notes VALUES ('1')").unwrap();
+        engine_b.execute("DROP TABLE IF EXISTS missing").unwrap();
+        engine_b.execute("DROP VIEW IF EXISTS missing").unwrap();
+        engine_b
+            .execute("CREATE TABLE IF NOT EXISTS notes (id TEXT)")
+            .unwrap();
+        engine_b
+            .execute("INSERT INTO notes SELECT * FROM notes WHERE 1 = 0")
+            .unwrap();
+        engine_a.execute("ROLLBACK").unwrap();
+
+        assert_eq!(
+            engine_a.execute("SELECT * FROM notes").unwrap().rows.len(),
+            0
+        );
+    }
+
+    #[test]
+    fn rollback_does_not_delete_a_commit_from_another_engine_on_the_same_thread() {
+        let store = DocumentStore::new();
+        let engine_a = SqlEngine::new(&store).unwrap();
+        let engine_b = SqlEngine::new(&store).unwrap();
+
+        engine_a.execute("BEGIN").unwrap();
+        engine_b.execute("CREATE TABLE audit (id TEXT)").unwrap();
+        let err = engine_a.execute("ROLLBACK").unwrap_err();
+        assert!(
+            err.to_string().contains("another session"),
+            "unexpected error: {err}"
+        );
+
+        let out = engine_a.execute("SHOW TABLES").unwrap();
+        assert!(out.rows.iter().any(|r| r[0] == "audit"));
     }
 
     #[test]
