@@ -240,7 +240,12 @@ pub struct DocumentStore {
     /// a failing flush can't roll back into a catalog another thread already
     /// committed durably.
     pub(crate) catalog_commit: Mutex<()>,
+    /// Session identity for [`execute_sql_mut`](DocumentStore::execute_sql_mut);
+    /// stable across calls so `BEGIN`/`ROLLBACK` see one owner.
+    pub(crate) write_session: u64,
 }
+
+static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Default for DocumentStore {
     fn default() -> Self {
@@ -257,6 +262,7 @@ impl Default for DocumentStore {
             content_hashes: FxHashMap::default(),
             tx_snapshot: Mutex::new(None),
             catalog_commit: Mutex::new(()),
+            write_session: DocumentStore::new_session_id(),
         }
     }
 }
@@ -319,6 +325,13 @@ fn read_files_parallel(files: &[PathBuf]) -> Vec<Result<String, MqdbError>> {
 
 impl DocumentStore {
     /// Creates an empty document store.
+    /// Allocate a fresh transaction-owner ID. Pass it to
+    /// [`SqlEngine::with_session`](crate::sql::SqlEngine::with_session) so
+    /// every statement of one client's transaction shares an owner.
+    pub fn new_session_id() -> u64 {
+        NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -1268,6 +1281,7 @@ impl DocumentStore {
             content_hashes: content_hashes.into_iter().collect(),
             tx_snapshot: Mutex::new(None),
             catalog_commit: Mutex::new(()),
+            write_session: DocumentStore::new_session_id(),
         })
     }
 
@@ -1326,6 +1340,7 @@ impl DocumentStore {
             content_hashes: content_hashes.into_iter().collect(),
             tx_snapshot: Mutex::new(None),
             catalog_commit: Mutex::new(()),
+            write_session: DocumentStore::new_session_id(),
         })
     }
 
@@ -1369,6 +1384,7 @@ impl DocumentStore {
             content_hashes: content_hashes.into_iter().collect(),
             tx_snapshot: Mutex::new(None),
             catalog_commit: Mutex::new(()),
+            write_session: DocumentStore::new_session_id(),
         })
     }
 

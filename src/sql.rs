@@ -2141,14 +2141,19 @@ pub struct SqlEngine<'a> {
     session_id: u64,
 }
 
-static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 impl<'a> SqlEngine<'a> {
     /// Build the engine and its secondary indexes.
     ///
     /// Uses cached indexes from [`DocumentStore::load_all_indexes`] when
     /// available (O(1) per document); otherwise rebuilds from blocks (O(n)).
     pub fn new(store: &'a DocumentStore) -> Result<Self, MqdbError> {
+        Self::with_session(store, DocumentStore::new_session_id())
+    }
+
+    /// Like [`new`](Self::new), but runs as an existing session (see
+    /// [`DocumentStore::new_session_id`]), so a transaction opened by one
+    /// engine can be continued or rolled back by a later one.
+    pub fn with_session(store: &'a DocumentStore, session_id: u64) -> Result<Self, MqdbError> {
         let indexes = store
             .documents()
             .iter()
@@ -2166,7 +2171,7 @@ impl<'a> SqlEngine<'a> {
             indexes,
             cte_scopes: std::cell::RefCell::new(Vec::new()),
             view_stack: std::cell::RefCell::new(Vec::new()),
-            session_id: NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            session_id,
         })
     }
 
@@ -4726,7 +4731,7 @@ impl DocumentStore {
         let trimmed = sql.trim().trim_end_matches(';');
         let upper = trimmed.to_ascii_uppercase();
         if upper.starts_with("DESC ") || upper.starts_with("DESCRIBE ") || upper == "SHOW TABLES" {
-            return SqlEngine::new(self)?.execute(sql);
+            return SqlEngine::with_session(self, self.write_session)?.execute(sql);
         }
 
         let stmts = Parser::parse_sql(&GenericDialect {}, sql)
@@ -4810,7 +4815,7 @@ impl DocumentStore {
                         rows: vec![vec![n.to_string()]],
                     })
                 } else {
-                    SqlEngine::new(self)?.execute(sql)
+                    SqlEngine::with_session(self, self.write_session)?.execute(sql)
                 }
             }
             Statement::Rollback { .. } => {
@@ -4828,7 +4833,7 @@ impl DocumentStore {
                     })
                 }
             }
-            _ => SqlEngine::new(self)?.execute(sql),
+            _ => SqlEngine::with_session(self, self.write_session)?.execute(sql),
         }
     }
 }
@@ -8066,6 +8071,46 @@ mod tests {
 
         let out = engine_a.execute("SHOW TABLES").unwrap();
         assert!(out.rows.iter().any(|r| r[0] == "audit"));
+    }
+
+    #[test]
+    fn rollback_works_across_execute_sql_mut_calls() {
+        let mut store = DocumentStore::new();
+        store.execute_sql_mut("BEGIN").unwrap();
+        store.execute_sql_mut("CREATE TABLE t (x TEXT)").unwrap();
+        store.execute_sql_mut("ROLLBACK").unwrap();
+
+        let out = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SHOW TABLES")
+            .unwrap();
+        assert!(
+            out.rows.iter().all(|r| r[0] != "t"),
+            "table 't' survived rollback"
+        );
+    }
+
+    #[test]
+    fn rollback_works_across_engines_sharing_a_session() {
+        let store = DocumentStore::new();
+        let session = DocumentStore::new_session_id();
+        let run = |sql: &str| {
+            SqlEngine::with_session(&store, session)
+                .unwrap()
+                .execute(sql)
+        };
+        run("BEGIN").unwrap();
+        run("CREATE TABLE t (x TEXT)").unwrap();
+        run("ROLLBACK").unwrap();
+
+        let out = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SHOW TABLES")
+            .unwrap();
+        assert!(
+            out.rows.iter().all(|r| r[0] != "t"),
+            "table 't' survived rollback"
+        );
     }
 
     #[test]

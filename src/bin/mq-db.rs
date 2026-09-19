@@ -1503,6 +1503,7 @@ fn run_repl(
 ) -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut mode = initial_mode;
+    let session = DocumentStore::new_session_id();
 
     println!("mq-db  (.help for commands  .quit to exit)");
     println!(
@@ -1548,10 +1549,12 @@ fn run_repl(
                     Ok(out) => print!("{}", out.to_table()),
                     Err(e) => eprintln!("error: {}", e),
                 },
-                ReplMode::Sql => match SqlEngine::new(&store).and_then(|e| e.execute(input)) {
-                    Ok(out) => print!("{}", out.to_table()),
-                    Err(e) => eprintln!("error: {}", e),
-                },
+                ReplMode::Sql => {
+                    match SqlEngine::with_session(&store, session).and_then(|e| e.execute(input)) {
+                        Ok(out) => print!("{}", out.to_table()),
+                        Err(e) => eprintln!("error: {}", e),
+                    }
+                }
                 ReplMode::Mq => match MqEngine::eval_store(input, &store) {
                     Ok(results) => {
                         if results.is_empty() {
