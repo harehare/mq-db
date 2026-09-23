@@ -76,13 +76,19 @@ fn inode_key(path: &Path) -> Option<String> {
 
 #[cfg(windows)]
 fn inode_key(path: &Path) -> Option<String> {
-    use std::os::windows::fs::MetadataExt;
-    let meta = std::fs::metadata(path).ok()?;
-    Some(format!(
-        "w{:x}.{:x}",
-        meta.volume_serial_number()?,
-        meta.file_index()?
-    ))
+    // MetadataExt::volume_serial_number/file_index need unstable windows_by_handle.
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return None;
+    }
+    let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    Some(format!("w{:x}.{:x}", info.dwVolumeSerialNumber, file_index))
 }
 
 #[cfg(not(any(unix, windows)))]
