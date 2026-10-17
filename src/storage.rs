@@ -53,7 +53,7 @@ pub(crate) struct DatabaseLock {
     /// Second lock keyed by inode, held in addition to `_file` whenever the
     /// database file exists yet, so hard-link aliases (different paths,
     /// same inode) still contend for one lock. `create` runs its acquire
-    /// before the file exists, so it can only take the path-keyed lock —
+    /// before the file exists, so it can only take the path-keyed lock;
     /// this field stays `None` in that case.
     _inode_file: Option<File>,
 }
@@ -168,7 +168,7 @@ impl DatabaseLock {
 
     /// Take the inode-keyed lock too, once the database file exists. A
     /// no-op if already held, or if `path` still doesn't exist (e.g. called
-    /// from `acquire` by `Storage::create`, before the file is made) — the
+    /// from `acquire` by `Storage::create`, before the file is made); the
     /// caller retries this after creating the file.
     fn acquire_inode_lock(&mut self, path: &Path) -> Result<(), MqdbError> {
         if self._inode_file.is_some() {
@@ -304,7 +304,7 @@ impl Storage {
     /// Open an existing database file. Validates magic + version.
     ///
     /// Accepts both the current file format and older, still-recognised
-    /// versions (see `page::LEGACY_VERSIONS`) — check [`Storage::file_version`]
+    /// versions (see `page::LEGACY_VERSIONS`); check [`Storage::file_version`]
     /// to tell which one was actually read.
     pub fn open(path: &Path) -> Result<Self, MqdbError> {
         let lock = DatabaseLock::acquire(path)?;
@@ -579,7 +579,7 @@ impl Storage {
 
     /// Write a fresh chain of table-row pages, starting a brand-new table.
     /// Returns `(first_page, last_page)`, or `(0, 0)` if `rows` is empty
-    /// (nothing written — 0 is never a valid page id).
+    /// (nothing written; 0 is never a valid page id).
     pub fn write_table_rows(&mut self, rows: &[Vec<String>]) -> Result<(u32, u32), MqdbError> {
         self.write_table_row_chunks(rows, PAGE_TYPE_TABLE_DATA)
     }
@@ -597,7 +597,7 @@ impl Storage {
         }
 
         // The first page of an appended batch continues the existing chain,
-        // so it must be tagged OVERFLOW like every other non-head page —
+        // so it must be tagged OVERFLOW like every other non-head page;
         // only the table's very first page is ever PAGE_TYPE_TABLE_DATA.
         let (first_new, last_new) = self.write_table_row_chunks(rows, PAGE_TYPE_OVERFLOW)?;
         self.relink_next(tail_page, first_new)?;
@@ -605,8 +605,8 @@ impl Storage {
     }
 
     /// Table-row chains are built incrementally across many separate write
-    /// calls (one per `INSERT`), so — unlike block/index chains, which are
-    /// always written whole in one pass — a short trailing chunk can end up
+    /// calls (one per `INSERT`), so, unlike block/index chains (which are
+    /// always written whole in one pass), a short trailing chunk can end up
     /// in the *middle* of the logical chain, not just at its very end.
     /// Padding it out to `PAGE_BODY_SIZE` would silently splice zero bytes
     /// between two batches' real data. So each table-data/overflow page
@@ -648,7 +648,7 @@ impl Storage {
     /// Predict the page ids a run of `count` consecutive `append_page` calls
     /// will produce, without writing anything. `append_page` always assigns
     /// `num_pages` (then increments it), so as long as nothing else appends
-    /// to the file in between, the ids are exactly this contiguous range —
+    /// to the file in between, the ids are exactly this contiguous range,
     /// letting a page chain's `next_page` links be resolved and each page
     /// written once in its final form, instead of appending zeroed
     /// placeholders first and overwriting them in a second pass.
@@ -1019,7 +1019,7 @@ pub(crate) mod tests {
     }
 
     /// Patches a saved file's header version field down to `version` and
-    /// recomputes the header checksum, so the file is otherwise well-formed —
+    /// recomputes the header checksum, so the file is otherwise well-formed,
     /// isolating the version check for the tests below.
     pub(crate) fn patch_version(path: &Path, version: u32) {
         use crate::storage::page::{PAGE_HEADER_SIZE, PAGE_SIZE, compute_checksum};
@@ -1044,7 +1044,7 @@ pub(crate) mod tests {
         let mut store = DocumentStore::new();
         store.add_str("# Hello\n\nBody\n").unwrap();
         store.save(&path).unwrap();
-        // Not in `page::LEGACY_VERSIONS` — neither the strict `open` path nor
+        // Not in `page::LEGACY_VERSIONS`: neither the strict `open` path nor
         // the tolerant `load` path should accept it.
         patch_version(&path, 2);
 
@@ -1091,7 +1091,7 @@ pub(crate) mod tests {
         assert_eq!(DocumentStore::file_version(&path).unwrap(), 4);
 
         // `load` never trusts persisted index bytes (see `build_or_load_index_at`),
-        // so it can read a legacy file straight away — including full-text
+        // so it can read a legacy file straight away, including full-text
         // search, which requires the TermIndex that v4 files don't have on disk.
         let mut opened = DocumentStore::load(&path).unwrap();
         opened.load_all_indexes().unwrap();
@@ -1225,7 +1225,7 @@ pub(crate) mod tests {
         // Regression test for the incremental INSERT path: each batch is
         // written with `append_table_rows` (mirroring multiple separate SQL
         // INSERTs), and only the very first page of the whole chain should
-        // be tagged PAGE_TYPE_TABLE_DATA — every later page, including the
+        // be tagged PAGE_TYPE_TABLE_DATA; every later page, including the
         // head of each appended batch, must be PAGE_TYPE_OVERFLOW or the
         // chain reader rejects it.
         let path = test_file_path("table-row-chain-append");

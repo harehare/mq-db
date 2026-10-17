@@ -33,7 +33,7 @@ pub struct Document {
     pub path: Option<PathBuf>,
     /// Flattened, interval-indexed block list.
     pub blocks: Vec<Block>,
-    /// Authoritative block count — valid even when `blocks` is empty (lazy mode).
+    /// Authoritative block count, valid even when `blocks` is empty (lazy mode).
     pub block_count: u32,
     /// Per-document statistics for query pruning.
     pub zone_maps: ZoneMaps,

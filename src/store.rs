@@ -105,7 +105,7 @@ use crate::{
 /// Persists any table whose rows have never been written to `storage` (i.e.
 /// `first_row_page == 0`), then builds catalog entries for every table.
 ///
-/// Tables that already have a row-page chain are left untouched here — their
+/// Tables that already have a row-page chain are left untouched here; their
 /// pages were already written by an earlier flush or incremental `INSERT`
 /// append (see [`DocumentStore::append_table_rows_to_storage`]).
 fn persist_unsaved_table_rows(
@@ -157,7 +157,7 @@ pub struct StoreStats {
     pub blocks: usize,
     /// `(block_type, count)`, most frequent first.
     pub block_type_counts: Vec<(BlockType, usize)>,
-    /// `(language, count)`, most frequent first — code blocks only.
+    /// `(language, count)`, most frequent first, code blocks only.
     pub code_lang_counts: Vec<(String, usize)>,
 }
 
@@ -182,9 +182,9 @@ impl VacuumReport {
 ///
 /// ## Load modes
 ///
-/// - [`DocumentStore::new`] / [`DocumentStore::add_str`] — in-memory, blocks immediately available
-/// - [`DocumentStore::load`] — reads all blocks from a `.mq-db` file into memory
-/// - [`DocumentStore::open`] — reads catalog only; blocks loaded on demand via
+/// - [`DocumentStore::new`] / [`DocumentStore::add_str`]: in-memory, blocks immediately available
+/// - [`DocumentStore::load`]: reads all blocks from a `.mq-db` file into memory
+/// - [`DocumentStore::open`]: reads catalog only; blocks loaded on demand via
 ///   [`load_all_blocks`](DocumentStore::load_all_blocks)
 ///
 /// Secondary indexes ([`DocumentIndex`]) are built once via
@@ -226,7 +226,7 @@ pub struct DocumentStore {
     /// on every reference rather than materialized.
     pub(crate) views: RwLock<FxHashMap<String, String>>,
     /// Stores attached via `ATTACH DATABASE`, keyed by alias. Session-scoped
-    /// only — never persisted.
+    /// only: never persisted.
     pub(crate) attached: RwLock<FxHashMap<DatabaseAlias, DocumentStore>>,
     /// Content hash of each document's source, keyed by `DocumentId`. Used by
     /// [`reindex_paths`](DocumentStore::reindex_paths) to skip re-parsing
@@ -268,7 +268,7 @@ impl Default for DocumentStore {
 }
 
 /// Hash of file/document content used for change detection (not
-/// cryptographic — this only needs to detect "did this file change since
+/// cryptographic: this only needs to detect "did this file change since
 /// last index", not resist adversarial collisions).
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -290,7 +290,7 @@ fn diff_written_paths(before: &[Document], after: &[Document]) -> Vec<String> {
         .collect()
 }
 
-/// Reads every file in `files`, in order, using a small worker-thread pool —
+/// Reads every file in `files`, in order, using a small worker-thread pool:
 /// indexing many small files is I/O-latency bound, not CPU bound.
 fn read_files_parallel(files: &[PathBuf]) -> Vec<Result<String, MqdbError>> {
     let worker_count = std::thread::available_parallelism()
@@ -530,16 +530,16 @@ impl DocumentStore {
     }
 
     /// Replace the content of an existing document in place, keeping its
-    /// `DocumentId` stable (so any external references to it — e.g. `mq()`
-    /// join columns, application code holding the id — stay valid).
+    /// `DocumentId` stable (so any external references to it, e.g. `mq()`
+    /// join columns, application code holding the id, stay valid).
     ///
     /// Re-parses `content`, writes fresh block/index page chains to the
     /// backing storage file (if one is open) and overwrites that document's
     /// catalog entry; the old page chains become orphaned dead space (no
-    /// compaction yet — a future `vacuum` command could reclaim them).
+    /// compaction yet; a future `vacuum` command could reclaim them).
     ///
     /// For in-memory-only stores (no backing file open), this only updates
-    /// in-memory state — call [`save`](DocumentStore::save) afterward to
+    /// in-memory state; call [`save`](DocumentStore::save) afterward to
     /// persist.
     ///
     /// Returns an error if no document with `doc_id` exists.
@@ -866,7 +866,7 @@ impl DocumentStore {
     ///
     /// Any table whose rows have never been persisted is written out in full
     /// here (a one-time cost). Tables already backed by a row-page chain keep
-    /// their existing pages untouched — see
+    /// their existing pages untouched; see
     /// [`append_table_rows_to_storage`](DocumentStore::append_table_rows_to_storage)
     /// for the incremental `INSERT` path.
     pub(crate) fn begin_transaction(&self, session: u64) -> Result<(), MqdbError> {
@@ -901,7 +901,7 @@ impl DocumentStore {
     /// `catalog_commit`, so rollback can't slip in between the commit and
     /// this mark. Flags an open transaction owned by another session so its
     /// rollback refuses to overwrite this commit. A no-op for the owner's own
-    /// mutations — its rollback is expected to undo those.
+    /// mutations: its rollback is expected to undo those.
     pub(crate) fn note_catalog_mutation(&self, session: u64) {
         if let Some(tx) = self.tx_snapshot.lock().unwrap().as_mut()
             && tx.owner != session
@@ -980,7 +980,7 @@ impl DocumentStore {
     }
 
     /// Append `new_rows` to `table_name`'s on-disk row chain and flush a
-    /// lightweight catalog update — no full row rewrite. No-op for in-memory
+    /// lightweight catalog update, no full row rewrite. No-op for in-memory
     /// stores or unknown tables.
     ///
     /// This is what makes `INSERT INTO <table>` incremental: the cost is
@@ -1049,7 +1049,7 @@ impl DocumentStore {
     /// indexes. Writes atomically: writes to `path.tmp` then renames to `path`.
     ///
     /// Errors if `path` is the store's own open backing file (would keep
-    /// writing through the old, unlinked inode) — use
+    /// writing through the old, unlinked inode); use
     /// [`vacuum`](Self::vacuum) instead.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), MqdbError> {
         let path = path.as_ref();
@@ -1219,7 +1219,7 @@ impl DocumentStore {
         let mut storage = Storage::open(path.as_ref())?;
         // Unlike `load`/`load_catalog_only` (read-only, always rebuild
         // indexes from blocks), this mode keeps `storage` open for later
-        // in-place writes, which only emit current-format index bytes —
+        // in-place writes, which only emit current-format index bytes;
         // mixed with a legacy file's untouched ones, that would corrupt it.
         if storage.file_version() != FILE_VERSION {
             return Err(MqdbError::Storage(format!(
@@ -1288,7 +1288,7 @@ impl DocumentStore {
     /// Load a `.mq-db` file and reconstruct the in-memory `DocumentStore`.
     ///
     /// All block data is read from disk. Secondary indexes are **not** built
-    /// here — [`crate::SqlEngine`] builds them lazily on construction.
+    /// here: [`crate::SqlEngine`] builds them lazily on construction.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open_read_only(path.as_ref())?;
         let (entries, custom_table_entries, content_hashes, view_entries, tokenizer) =
@@ -1344,7 +1344,7 @@ impl DocumentStore {
         })
     }
 
-    /// Load only the catalog metadata from a `.mq-db` file — no block data.
+    /// Load only the catalog metadata from a `.mq-db` file, no block data.
     ///
     /// Documents have `block_count` populated from the catalog but `blocks`
     /// is empty. Useful for commands that only need zone-map metadata (e.g.
@@ -1401,7 +1401,7 @@ impl DocumentStore {
     /// that version) from its stored blocks. Returns the version the file
     /// was in before migrating; a no-op if it was already current.
     ///
-    /// This does not touch the original bytes in place — like [`Self::save`],
+    /// This does not touch the original bytes in place, like [`Self::save`],
     /// it writes a new file to `<path>.tmp` and renames it over `path`, so a
     /// failure or interruption midway leaves the original file untouched.
     /// Callers that want a backup of the pre-migration file should copy it

@@ -156,7 +156,7 @@ impl PageFile {
 
         let file_len = file.metadata()?.len();
         // v8's mutable catalog head doesn't depend on the file ending on a
-        // page boundary — a concurrent append can leave a partial tail page
+        // page boundary; a concurrent append can leave a partial tail page
         // that a lock-free `open_read_only` would otherwise wrongly reject,
         // even though the committed superblock never references it. Legacy
         // formats' catalog protocol does depend on that boundary.
