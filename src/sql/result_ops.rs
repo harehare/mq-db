@@ -5,7 +5,9 @@ use super::output::QueryOutput;
 use super::value::{Row, Value};
 use crate::MqdbError;
 use rustc_hash::FxHashMap;
-use sqlparser::ast::{Expr, LimitClause, OrderByExpr, Query, SetOperator, SetQuantifier};
+use sqlparser::ast::{
+    Expr, LimitClause, OrderByExpr, OrderBySort, Query, SetOperator, SetQuantifier,
+};
 
 pub(super) fn expr_structurally_eq(a: &Expr, b: &Expr) -> bool {
     a == b
@@ -17,8 +19,8 @@ pub(super) fn apply_order_by_exprs(rows: &mut [(Row, Vec<String>)], exprs: &[Ord
             let va = eval_expr(&ob.expr, ra);
             let vb = eval_expr(&ob.expr, rb);
             let ord = va.cmp_val(&vb).unwrap_or(std::cmp::Ordering::Equal);
-            // asc=None or asc=Some(true) → ascending; asc=Some(false) → descending
-            let ord = if ob.options.asc == Some(false) {
+            // sort=None or Asc → ascending; Desc → descending
+            let ord = if ob.options.sort == Some(OrderBySort::Desc) {
                 ord.reverse()
             } else {
                 ord

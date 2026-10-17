@@ -12,8 +12,8 @@ use crate::MqdbError;
 use crate::block::BlockType;
 use crate::indexes::IndexHint;
 use sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, JoinConstraint, JoinOperator, OrderByKind, Query, Select,
-    SetExpr, Statement,
+    BinaryOperator, Expr, GroupByExpr, JoinConstraint, JoinOperator, OrderByKind, OrderBySort,
+    Query, Select, SetExpr, Statement,
 };
 
 fn describe_hint(hint: &IndexHint) -> String {
@@ -342,7 +342,7 @@ impl<'a> SqlEngine<'a> {
                     format!(
                         "{} {}",
                         e.expr,
-                        if e.options.asc == Some(false) {
+                        if e.options.sort == Some(OrderBySort::Desc) {
                             "DESC"
                         } else {
                             "ASC"

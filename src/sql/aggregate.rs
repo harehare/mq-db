@@ -11,7 +11,7 @@ use crate::MqdbError;
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
     DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, OrderByExpr, OrderByKind, Select, SelectItem,
+    GroupByExpr, OrderByExpr, OrderByKind, OrderBySort, Select, SelectItem,
 };
 
 fn projection_columns(projection: &[SelectItem], first_row: Option<&Row>) -> Vec<String> {
@@ -513,7 +513,7 @@ impl<'a> SqlEngine<'a> {
                 .map(|oe| {
                     (
                         resolve_order_expr_alias(&oe.expr, &select.projection),
-                        oe.options.asc == Some(false),
+                        oe.options.sort == Some(OrderBySort::Desc),
                     )
                 })
                 .collect();
