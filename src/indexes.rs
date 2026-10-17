@@ -29,7 +29,7 @@
 //! Zone Maps have decided it is worth scanning.
 //!
 //! `SqlEngine` applies this automatically (see `zone_map_skip` in
-//! `src/sql.rs`) for `lang =` / `depth =` / heading `content =` conjuncts,
+//! `src/sql/plan.rs`) for `lang =` / `depth =` / heading `content =` conjuncts,
 //! but only for a single, non-`JOIN`ed `FROM blocks`.
 
 use std::collections::BTreeMap;
@@ -41,7 +41,7 @@ use crate::{
     error::MqdbError,
 };
 
-// BitmapIndex — block_type → sorted Vec of block positions
+// BitmapIndex: block_type → sorted Vec of block positions
 
 /// Bitmap-style inverted index on `block_type`.
 ///
@@ -89,12 +89,12 @@ impl BitmapIndex {
     }
 }
 
-// BTreeIndex — pre/post → block position
+// BTreeIndex: pre/post → block position
 
 /// B-Tree index on `pre` (and a secondary one on `post`).
 ///
 /// Since blocks produced by [`crate::index::build_blocks`] are already in
-/// DFS pre-order, `blocks[i].pre` is *not* necessarily equal to `i` — the
+/// DFS pre-order, `blocks[i].pre` is *not* necessarily equal to `i`: the
 /// pre counter increments for every tree slot, including heading scopes.
 /// We need an explicit map for O(log n) lookup.
 ///
@@ -141,7 +141,7 @@ impl BTreeIndex {
     }
 }
 
-// HashIndex — content / lang / depth → block positions
+// HashIndex: content / lang / depth → block positions
 
 /// Hash index for point-equality lookups on string/integer columns.
 ///
@@ -229,7 +229,7 @@ impl TokenizerKind {
         }
     }
 
-    /// Persisted tag byte — don't renumber existing variants.
+    /// Persisted tag byte; don't renumber existing variants.
     pub fn to_u8(self) -> u8 {
         match self {
             TokenizerKind::Word => 0,
@@ -250,7 +250,7 @@ impl TokenizerKind {
     }
 }
 
-/// Hiragana, Katakana, Han, and Hangul ranges — scripts needing n-gram
+/// Hiragana, Katakana, Han, and Hangul ranges, scripts needing n-gram
 /// tokenization instead of whole-run tokens.
 fn is_cjk(c: char) -> bool {
     matches!(c as u32,
@@ -274,7 +274,7 @@ fn is_cjk(c: char) -> bool {
 }
 
 /// Tokenizes `text` per `kind`. Used at both index build time and query time
-/// (`src/sql.rs`) — the two **must** pass the same `kind`, or the index
+/// (`src/sql/`); the two **must** pass the same `kind`, or the index
 /// silently drops true matches instead of just mis-ranking them.
 pub fn tokenize(text: &str, kind: TokenizerKind) -> Vec<String> {
     let lower = text.to_lowercase();
@@ -341,7 +341,7 @@ pub fn tokenize(text: &str, kind: TokenizerKind) -> Vec<String> {
 /// Complexity: build `O(n * avg_tokens)`, intersect `O(k)` for the rarest
 /// term's postings length.
 ///
-/// `block_count`/`total_token_count` feed `bm25()`'s corpus stats in `sql.rs`.
+/// `block_count`/`total_token_count` feed `bm25()`'s corpus stats in `sql/fts.rs`.
 #[derive(Debug, Default, Clone)]
 pub struct TermIndex {
     postings: FxHashMap<String, Vec<u32>>,
@@ -357,7 +357,7 @@ impl TermIndex {
             let mut terms = tokenize(&block.content, kind);
             total_token_count += terms.len() as u64;
             // Sort + dedup the token list itself rather than allocating a
-            // side `HashSet` per block — cheaper for the small token counts
+            // side `HashSet` per block, cheaper for the small token counts
             // typical of one block, and avoids an allocation per block.
             terms.sort_unstable();
             terms.dedup();
@@ -383,7 +383,7 @@ impl TermIndex {
     /// result (mirrors `match()`'s "no terms → no match" semantics).
     ///
     /// Each per-term postings list is already sorted ascending and deduped
-    /// (see `build`), so this intersects them with a plain sorted merge —
+    /// (see `build`), so this intersects them with a plain sorted merge,
     /// no hashing, no per-call `BTreeSet`/`HashSet` allocation. Terms are
     /// processed shortest-postings-first so the accumulator shrinks as fast
     /// as possible and a term with an empty postings list short-circuits
@@ -430,7 +430,7 @@ fn merge_intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
     out
 }
 
-// DocumentIndex — all four indexes bundled for one document
+// DocumentIndex: all four indexes bundled for one document
 
 /// All secondary indexes for a single [`crate::document::Document`].
 ///
@@ -491,7 +491,7 @@ impl DocumentIndex {
         for (key, indices) in &content_entries {
             let kb = key.as_bytes();
             // Block content is unbounded (e.g. a large code block or table cell can
-            // exceed 64KB), so the length prefix must be u32 — a u16 here would
+            // exceed 64KB), so the length prefix must be u32; a u16 here would
             // silently wrap and desync the rest of the index stream.
             out.extend_from_slice(&(kb.len() as u32).to_le_bytes());
             out.extend_from_slice(kb);
@@ -527,7 +527,7 @@ impl DocumentIndex {
             }
         }
 
-        // TermIndex postings — appended after the four pre-existing sections
+        // TermIndex postings, appended after the four pre-existing sections
         // above; each of those is self-length-prefixed, so this is purely
         // additive and doesn't disturb their encoding/decoding order.
         let mut term_entries: Vec<(&String, &Vec<u32>)> = self.term.postings.iter().collect();
@@ -740,11 +740,11 @@ fn block_type_from_ord(v: u8) -> Result<BlockType, MqdbError> {
     }
 }
 
-// IndexHint — what the SQL planner decided to use
+// IndexHint: what the SQL planner decided to use
 
 /// A candidate (or chosen) access plan for a WHERE clause. Multiple viable
-/// candidates for the same query are cost-compared — see
-/// `SqlEngine::choose_best_hint` — rather than picked by syntax alone.
+/// candidates for the same query are cost-compared, see
+/// `SqlEngine::choose_best_hint`, rather than picked by syntax alone.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IndexHint {
     /// Use the bitmap index: `WHERE block_type = 'X'` or `IN (...)`.
@@ -761,7 +761,7 @@ pub enum IndexHint {
     DepthExact(u8),
     /// Use the term index: `WHERE match(content, 'foo bar')` (AND of tokens).
     TermMatch(Vec<String>),
-    /// No applicable index — fall back to full scan.
+    /// No applicable index; fall back to full scan.
     FullScan,
 }
 

@@ -1,0 +1,117 @@
+//! Scalar values and result rows.
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Null,
+}
+
+impl Value {
+    pub(super) fn as_str(&self) -> Option<&str> {
+        if let Value::Str(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+    pub(super) fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::Int(n) => Some(*n),
+            Value::Float(f) => Some(*f as i64),
+            _ => None,
+        }
+    }
+    pub(super) fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Float(f) => Some(*f),
+            Value::Int(n) => Some(*n as f64),
+            _ => None,
+        }
+    }
+    pub(super) fn is_truthy(&self) -> bool {
+        match self {
+            Value::Bool(b) => *b,
+            Value::Int(n) => *n != 0,
+            Value::Float(f) => *f != 0.0,
+            Value::Str(s) => !s.is_empty(),
+            Value::Null => false,
+        }
+    }
+    pub(super) fn display(&self) -> String {
+        match self {
+            Value::Str(s) => s.clone(),
+            Value::Int(n) => n.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Null => "NULL".to_string(),
+        }
+    }
+    pub(super) fn cmp_val(&self, other: &Value) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
+            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+            (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+            (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::Str(a), Value::Str(b)) => Some(a.cmp(b)),
+            (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
+            _ => None,
+        }
+    }
+}
+
+/// Hashable projection of [`Value`], mirroring its derived `PartialEq` (no
+/// cross-variant coercion, `NULL` equals `NULL`, `NaN` matches nothing).
+#[derive(PartialEq, Eq, Hash)]
+pub(super) enum JoinKey {
+    Str(String),
+    Int(i64),
+    Bool(bool),
+    FloatBits(u64),
+    Null,
+}
+
+pub(super) fn value_join_key(v: &Value) -> Option<JoinKey> {
+    match v {
+        Value::Str(s) => Some(JoinKey::Str(s.clone())),
+        Value::Int(i) => Some(JoinKey::Int(*i)),
+        Value::Bool(b) => Some(JoinKey::Bool(*b)),
+        Value::Null => Some(JoinKey::Null),
+        Value::Float(f) if f.is_nan() => None, // NaN matches nothing
+        Value::Float(f) => {
+            let normalized = if *f == 0.0 { 0.0 } else { *f };
+            Some(JoinKey::FloatBits(normalized.to_bits()))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct Row {
+    pub(super) columns: Vec<String>,
+    pub(super) values: Vec<Value>,
+}
+
+impl Row {
+    pub(super) fn get(&self, col: &str) -> Option<&Value> {
+        if let Some(i) = self
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(col))
+        {
+            return self.values.get(i);
+        }
+        let short = col.rsplit('.').next().unwrap_or(col);
+        self.columns
+            .iter()
+            .position(|c| {
+                c.eq_ignore_ascii_case(col)
+                    || c.rsplit('.')
+                        .next()
+                        .unwrap_or(c)
+                        .eq_ignore_ascii_case(short)
+            })
+            .and_then(|i| self.values.get(i))
+    }
+}
