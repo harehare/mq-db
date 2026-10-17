@@ -21,7 +21,7 @@ pub struct CatalogEntry {
 
 /// A user-defined table entry stored in the catalog.
 ///
-/// Row data is *not* stored inline — it lives in its own page chain
+/// Row data is *not* stored inline; it lives in its own page chain
 /// (see [`crate::storage::Storage::write_table_rows`]) so that appending
 /// rows only requires writing the new pages plus this small fixed-size
 /// entry, instead of rewriting every previously-inserted row.
@@ -31,7 +31,7 @@ pub struct CustomTableEntry {
     pub columns: Vec<String>,
     /// First page of the row chain. 0 = no rows persisted yet.
     pub first_row_page: u32,
-    /// Last page of the row chain — new rows are appended after this page.
+    /// Last page of the row chain; new rows are appended after this page.
     pub last_row_page: u32,
     pub num_rows: u32,
 }
@@ -171,7 +171,7 @@ fn serialize_catalog(
     }
 
     // Trailing optional sections (added after custom tables so older catalog
-    // blobs without them still parse — `read_catalog` only reads a section if
+    // blobs without them still parse; `read_catalog` only reads a section if
     // bytes remain). Maps `document_id` -> content hash, used to skip
     // re-parsing unchanged files on `reindex_paths`.
     out.extend_from_slice(&as_u32(content_hashes.len(), "content hash count").to_le_bytes());
@@ -190,7 +190,7 @@ fn serialize_catalog(
         out.extend_from_slice(view.sql.as_bytes());
     }
 
-    // Store's tokenizer choice — one tag byte, absent in older blobs.
+    // Store's tokenizer choice, one tag byte, absent in older blobs.
     out.push(tokenizer.to_u8());
 
     out
@@ -408,7 +408,7 @@ fn read_catalog_from(pf: &mut PageFile, start_page: u32) -> Result<CatalogData, 
         vec![]
     };
 
-    // Older blobs have no trailing byte here — they were always `Word`.
+    // Older blobs have no trailing byte here; they were always `Word`.
     let tokenizer = if decoder.remaining() >= 1 {
         TokenizerKind::from_u8(decoder.read_u8()?)?
     } else {
@@ -440,7 +440,7 @@ mod tests {
     }
 
     /// Encodes catalog bytes in the format that predates content-hash
-    /// tracking (entries + custom tables, no trailing hash section) — this
+    /// tracking (entries + custom tables, no trailing hash section); this
     /// mirrors what `.mq-db` files written by older `mq-db` versions look
     /// like on disk, to confirm `read_catalog` still parses them.
     fn serialize_catalog_pre_hash_format(entries: &[CatalogEntry]) -> Vec<u8> {

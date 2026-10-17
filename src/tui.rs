@@ -18,7 +18,7 @@ use ratatui::{
 
 use crate::{DocumentStore, MqEngine, MqdbError, SqlEngine, block::BlockType};
 
-// Theme — mirrors the warm paper/ink/accent palette of docs/index.html
+// Theme: mirrors the warm paper/ink/accent palette of docs/index.html
 
 mod theme {
     use ratatui::style::Color;

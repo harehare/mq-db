@@ -81,7 +81,7 @@ enum Commands {
         no_spans: bool,
 
         /// Full-text tokenizer for a new store (default: word). Ignored when
-        /// --output already exists — its original choice, from the catalog,
+        /// --output already exists; its original choice, from the catalog,
         /// is used instead.
         #[arg(long, value_enum)]
         tokenizer: Option<TokenizerArg>,
@@ -312,7 +312,7 @@ impl std::fmt::Display for ReplMode {
 /// If `db` was written by an older but still-readable `mq-db` file format,
 /// offers to migrate it in place before any command opens it.
 ///
-/// Only prompts on an interactive terminal — non-interactive runs (scripts,
+/// Only prompts on an interactive terminal; non-interactive runs (scripts,
 /// `serve`) are left alone so they never block waiting on stdin; the current
 /// store file formats stay readable without migrating (see
 /// `DocumentStore::open`'s doc comment for the one mode that still requires
@@ -413,7 +413,7 @@ fn attach_all(store: &DocumentStore, specs: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load only catalog metadata (zone maps, paths, block counts) — no block data.
+/// Load only catalog metadata (zone maps, paths, block counts), no block data.
 /// Use this for commands that don't need block content.
 fn load_catalog_store(db: &Path) -> anyhow::Result<DocumentStore> {
     if !db.exists() {
