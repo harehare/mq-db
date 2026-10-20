@@ -26,8 +26,7 @@ pub(super) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             }
             let json = args[0].as_str().unwrap_or("");
             let path = args[1].as_str().unwrap_or("");
-            let key = path.trim_start_matches("$.").trim_matches('"');
-            extract_json_key(json, key)
+            extract_json_path(json, path)
         }
         "mq" => {
             if args.len() < 2 {
@@ -538,36 +537,49 @@ fn eval_mq_scalar(program: &str, content: &str) -> Value {
     }
 }
 
-fn extract_json_key(json: &str, key: &str) -> Value {
-    let s = json.trim();
-    if !s.starts_with('{') {
+/// Looks up `path` (`key`, `$.a.b`, `a[0].b`) in `json`.
+///
+/// Scalars map to the matching SQL value; objects and arrays come back as
+/// compact JSON text. Invalid JSON or a missing path gives `NULL`.
+fn extract_json_path(json: &str, path: &str) -> Value {
+    let Ok(mut cur) = serde_json::from_str::<serde_json::Value>(json) else {
         return Value::Null;
-    }
-    let target = format!("\"{}\":", key);
-    if let Some(pos) = s.find(&target) {
-        let after = s[pos + target.len()..].trim_start();
-        if let Some(inner) = after.strip_prefix('"') {
-            if let Some(end) = inner.find('"') {
-                return Value::Str(inner[..end].to_string());
-            }
-        } else if let Some(end) = after.find([',', '}']) {
-            let raw = after[..end].trim();
-            if let Ok(n) = raw.parse::<i64>() {
-                return Value::Int(n);
-            }
-            if let Ok(f) = raw.parse::<f64>() {
-                return Value::Float(f);
-            }
-            if raw == "true" {
-                return Value::Bool(true);
-            }
-            if raw == "false" {
-                return Value::Bool(false);
-            }
-            if raw == "null" {
+    };
+    let path = path.trim().trim_start_matches('$').trim_start_matches('.');
+    for part in path.split('.').filter(|p| !p.is_empty()) {
+        let (key, mut rest) = match part.find('[') {
+            Some(i) => (&part[..i], &part[i..]),
+            None => (part, ""),
+        };
+        let key = key.trim_matches('"');
+        if !key.is_empty() {
+            let Some(next) = cur.get(key) else {
                 return Value::Null;
-            }
+            };
+            cur = next.clone();
+        }
+        while let Some(inner) = rest.strip_prefix('[') {
+            let Some((idx, tail)) = inner.split_once(']') else {
+                return Value::Null;
+            };
+            let Some(next) = idx.trim().parse::<usize>().ok().and_then(|i| cur.get(i)) else {
+                return Value::Null;
+            };
+            cur = next.clone();
+            rest = tail;
+        }
+        if !rest.is_empty() {
+            return Value::Null;
         }
     }
-    Value::Null
+    match cur {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(b),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => n.as_f64().map_or(Value::Null, Value::Float),
+        },
+        serde_json::Value::String(s) => Value::Str(s),
+        other => Value::Str(other.to_string()),
+    }
 }

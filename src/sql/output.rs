@@ -10,8 +10,12 @@ fn json_value_str(s: &str) -> String {
     if s == "true" || s == "false" || s == "null" || s == "NULL" {
         return s.to_lowercase();
     }
-    // Treat as JSON string: escape quotes and backslashes
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    json_string(s)
+}
+
+/// `s` as a JSON string literal, escaping quotes, backslashes and control characters.
+pub(super) fn json_string(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 fn csv_cell(s: &str) -> String {
@@ -60,13 +64,7 @@ impl QueryOutput {
                     .columns
                     .iter()
                     .zip(row.iter())
-                    .map(|(col, val)| {
-                        format!(
-                            "\"{}\":{}",
-                            col.replace('\\', "\\\\").replace('"', "\\\""),
-                            json_value_str(val)
-                        )
-                    })
+                    .map(|(col, val)| format!("{}:{}", json_string(col), json_value_str(val)))
                     .collect();
                 format!("{{{}}}", pairs.join(","))
             })

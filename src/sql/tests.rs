@@ -97,7 +97,7 @@ fn test_sql_links_table() {
         vec![
             row("link", "https://a.com/x", "docs", "tt"),
             row("image", "p.png", "img", ""),
-            row("ref", "r", "r", ""),
+            row("ref", "r", "ref", ""),
             row("link", "other.md#sec", "l2", ""),
             row("link", "q.md", "q", ""),
         ]
@@ -3133,4 +3133,52 @@ fn qualified_writes_to_attached_store_are_rejected() {
         .execute_sql_mut("INSERT INTO other.blocks (block_type, content) VALUES ('paragraph', 'x')")
         .unwrap_err();
     assert!(err.to_string().contains("not supported"));
+}
+
+#[rstest::rstest]
+#[case(r#"{"a":"x","n":3,"f":1.5,"b":true}"#, "a", "x")]
+#[case(r#"{"a":"x","n":3,"f":1.5,"b":true}"#, "$.n", "3")]
+#[case(r#"{"a":"x","n":3,"f":1.5,"b":true}"#, "f", "1.5")]
+#[case(r#"{"a":"x","n":3,"f":1.5,"b":true}"#, "b", "true")]
+#[case(r#"{"a":{"b":{"c":"deep"}}}"#, "$.a.b.c", "deep")]
+#[case(r#"{"tags":["x","y"]}"#, "tags[1]", "y")]
+#[case(r#"{"tags":["x","y"]}"#, "$.tags", r#"["x","y"]"#)]
+#[case(r#"{"a":"say \"hi\", ok"}"#, "a", r#"say "hi", ok"#)]
+#[case(r#"{"a":"x"}"#, "b", "NULL")]
+#[case(r#"{"a":"x"}"#, "a.b", "NULL")]
+#[case(r#"{"tags":["x"]}"#, "tags[5]", "NULL")]
+#[case("not json", "a", "NULL")]
+fn test_sql_json_extract(#[case] json: &str, #[case] path: &str, #[case] expected: &str) {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    let json = json.replace('\'', "\'\'");
+    let out = engine
+        .execute(&format!("SELECT json_extract('{json}', '{path}')"))
+        .unwrap();
+    assert_eq!(out.rows[0][0], expected);
+}
+
+#[test]
+fn test_sql_properties_json_escapes_control_characters() {
+    let mut store = DocumentStore::new();
+    store
+        .add_str("---\ntitle: \"a\\nb\\tc \\\"q\\\"\"\n---\n\n# H\n")
+        .unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("SELECT json_extract(properties, 'title') FROM documents")
+        .unwrap();
+    assert_eq!(out.rows[0][0], "a\nb\tc \"q\"");
+}
+
+#[test]
+fn test_sql_json_output_escapes_control_characters() {
+    let mut store = DocumentStore::new();
+    store.add_str("# H\n\n```\na\tb\n```\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("SELECT content FROM blocks WHERE block_type = 'code'")
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&out.to_json()).unwrap();
+    assert_eq!(parsed[0]["content"], "a\tb");
 }
