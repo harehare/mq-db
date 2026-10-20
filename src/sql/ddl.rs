@@ -117,6 +117,7 @@ impl<'a> SqlEngine<'a> {
                 ("max_heading_depth", "integer"),
                 ("code_languages", "text"),
                 ("frontmatter_keys", "text"),
+                ("properties", "text"),
             ]),
             _ => None,
         };

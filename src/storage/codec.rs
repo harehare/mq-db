@@ -49,6 +49,10 @@ impl<'a> Decoder<'a> {
         Ok(bytes)
     }
 
+    fn is_empty(&self) -> bool {
+        self.pos >= self.data.len()
+    }
+
     fn read_u8(&mut self) -> Result<u8, MqdbError> {
         Ok(self.read_exact(1)?[0])
     }
@@ -357,6 +361,12 @@ pub fn encode_zone_map(zm: &ZoneMaps) -> Vec<u8> {
         encode_len_prefixed_u16(tag, &mut out);
     }
 
+    out.extend_from_slice(&as_u16(zm.frontmatter.len(), "frontmatter entry count").to_le_bytes());
+    for (key, value) in &zm.frontmatter {
+        encode_len_prefixed_u16(key, &mut out);
+        encode_property_value(value, &mut out);
+    }
+
     out
 }
 
@@ -401,6 +411,17 @@ pub fn decode_zone_map(data: &[u8]) -> Result<ZoneMaps, MqdbError> {
         tags.push(decoder.read_string_u16()?);
     }
 
+    // Absent in zone maps written before front-matter values were persisted.
+    let mut frontmatter = Vec::new();
+    if !decoder.is_empty() {
+        let count = usize::from(decoder.read_u16()?);
+        frontmatter.reserve(count);
+        for _ in 0..count {
+            let key = decoder.read_string_u16()?;
+            frontmatter.push((key, decode_property_value(&mut decoder)?));
+        }
+    }
+
     Ok(ZoneMaps {
         max_heading_depth,
         heading_slugs,
@@ -409,5 +430,6 @@ pub fn decode_zone_map(data: &[u8]) -> Result<ZoneMaps, MqdbError> {
         frontmatter_keys,
         title,
         tags,
+        frontmatter,
     })
 }

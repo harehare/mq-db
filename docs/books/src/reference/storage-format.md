@@ -182,8 +182,10 @@ Zone maps are encoded independently and embedded as opaque bytes inside catalog 
 | 11    | `title`                  | `u16 LE len` + UTF-8 bytes when present  |
 | 12    | `num_tags`               | `u16 LE`                                 |
 | 13    | `tag` items              | `u16 LE len` + UTF-8 bytes               |
+| 14    | `num_frontmatter`        | `u16 LE`, optional (absent in older files) |
+| 15    | `frontmatter` entries    | `u16 LE len` + key bytes, then a property value (same encoding as block properties) |
 
-Sets are serialized as sorted UTF-8 strings for deterministic output.
+Sets are serialized as sorted UTF-8 strings, and front-matter entries sorted by key, for deterministic output.
 
 ## Checksum Algorithm
 
