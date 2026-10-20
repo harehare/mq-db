@@ -54,7 +54,7 @@ pub struct DatabaseAlias(String);
 impl DatabaseAlias {
     /// Names reserved for the local store's own namespace; an attached
     /// database may not use one of these as its alias.
-    const RESERVED: [&'static str; 3] = ["main", "blocks", "documents"];
+    const RESERVED: [&'static str; 4] = ["main", "blocks", "documents", "links"];
 
     /// Validates and normalizes a raw alias string.
     pub fn parse(raw: &str) -> Result<Self, MqdbError> {

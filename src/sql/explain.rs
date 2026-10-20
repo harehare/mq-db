@@ -201,6 +201,7 @@ impl<'a> SqlEngine<'a> {
                         match table_name.as_str() {
                             "blocks" => "blocks",
                             "documents" => "documents",
+                            "links" => "links",
                             other
                                 if self.store.custom_tables.read().unwrap().contains_key(other) =>
                             {

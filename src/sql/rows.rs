@@ -69,6 +69,43 @@ pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32) -> Row {
     }
 }
 
+/// One row per link or image recorded on `block` at index time.
+pub(super) fn link_rows(doc_id: u32, block: &Block, block_idx: u32) -> Vec<Row> {
+    let Some(PropertyValue::Array(links)) = block.properties.get("links") else {
+        return Vec::new();
+    };
+    links
+        .iter()
+        .filter_map(|link| {
+            let PropertyValue::Array(fields) = link else {
+                return None;
+            };
+            let field = |i: usize| match fields.get(i) {
+                Some(PropertyValue::String(s)) => Value::Str(s.clone()),
+                _ => Value::Str(String::new()),
+            };
+            Some(Row {
+                columns: vec![
+                    "document_id".into(),
+                    "block_id".into(),
+                    "kind".into(),
+                    "url".into(),
+                    "text".into(),
+                    "title".into(),
+                ],
+                values: vec![
+                    Value::Int(doc_id as i64),
+                    Value::Int(block_idx as i64),
+                    field(0),
+                    field(1),
+                    field(2),
+                    field(3),
+                ],
+            })
+        })
+        .collect()
+}
+
 fn json_string_array<'a>(items: impl Iterator<Item = &'a String>) -> String {
     let items: Vec<String> = items
         .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
