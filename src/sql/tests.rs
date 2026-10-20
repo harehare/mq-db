@@ -3246,3 +3246,43 @@ fn test_sql_nearest_by_embedding() {
         vec![vec!["y".to_string()], vec!["xy".to_string()]]
     );
 }
+
+#[rstest::rstest]
+#[case("1 = '1'", "true")]
+#[case("'1' = 1", "true")]
+#[case("1 <> '1'", "false")]
+#[case("1 = '01'", "false")]
+#[case("1 = ' 1'", "false")]
+#[case("1 = 'x'", "false")]
+#[case("2 > '1'", "true")]
+#[case("1 < '10'", "true")]
+fn test_sql_integer_string_comparison(#[case] expr: &str, #[case] expected: &str) {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine.execute(&format!("SELECT {expr}")).unwrap();
+    assert_eq!(out.rows[0][0], expected, "{expr}");
+}
+
+#[test]
+fn test_sql_join_custom_table_text_key_to_block_id() {
+    let mut store = DocumentStore::new();
+    store.add_str("# One\n\nalpha\n\n# Two\n\nbeta\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE TABLE emb (block_id INTEGER, embedding TEXT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO emb VALUES (1, '[1,0]'), (3, '[0,1]'), (0, '[0.7,0.7]')")
+        .unwrap();
+    // blocks: 0=One 1=alpha 2=Two 3=beta
+    let out = engine
+        .execute(
+            "SELECT b.content FROM emb e JOIN blocks b ON b.id = e.block_id \
+             ORDER BY cosine_similarity(e.embedding, '[0.1,1]') DESC LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(
+        out.rows,
+        vec![vec!["beta".to_string()], vec!["One".to_string()]]
+    );
+}

@@ -49,8 +49,22 @@ impl Value {
             Value::Null => "NULL".to_string(),
         }
     }
+    /// SQL `=`: like `==`, but an integer also equals a string holding that
+    /// integer's canonical form (`1` and `'1'`, not `'01'`). Custom table
+    /// cells are stored as text, so this lets them join against integers.
+    pub(super) fn sql_eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Int(i), Value::Str(s)) | (Value::Str(s), Value::Int(i)) => {
+                canonical_int(s) == Some(*i)
+            }
+            _ => self == other,
+        }
+    }
+
     pub(super) fn cmp_val(&self, other: &Value) -> Option<std::cmp::Ordering> {
         match (self, other) {
+            (Value::Int(a), Value::Str(s)) => canonical_int(s).map(|b| a.cmp(&b)),
+            (Value::Str(s), Value::Int(b)) => canonical_int(s).map(|a| a.cmp(b)),
             (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
             (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
             (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
@@ -62,8 +76,14 @@ impl Value {
     }
 }
 
-/// Hashable projection of [`Value`], mirroring its derived `PartialEq` (no
-/// cross-variant coercion, `NULL` equals `NULL`, `NaN` matches nothing).
+/// The integer `s` spells in canonical form (no sign prefix, padding or spaces).
+fn canonical_int(s: &str) -> Option<i64> {
+    s.parse::<i64>().ok().filter(|n| n.to_string() == s)
+}
+
+/// Hashable projection of [`Value`], mirroring [`Value::sql_eq`] (a canonical
+/// integer string keys like the integer, `NULL` equals `NULL`, `NaN` matches
+/// nothing).
 #[derive(PartialEq, Eq, Hash)]
 pub(super) enum JoinKey {
     Str(String),
@@ -75,7 +95,10 @@ pub(super) enum JoinKey {
 
 pub(super) fn value_join_key(v: &Value) -> Option<JoinKey> {
     match v {
-        Value::Str(s) => Some(JoinKey::Str(s.clone())),
+        Value::Str(s) => Some(match canonical_int(s) {
+            Some(i) => JoinKey::Int(i),
+            None => JoinKey::Str(s.clone()),
+        }),
         Value::Int(i) => Some(JoinKey::Int(*i)),
         Value::Bool(b) => Some(JoinKey::Bool(*b)),
         Value::Null => Some(JoinKey::Null),
