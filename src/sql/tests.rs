@@ -3545,3 +3545,158 @@ fn test_sql_order_by_mixed_null_and_numbers_is_total() {
         .collect();
     assert!(nums.windows(2).all(|w| w[0] >= w[1]));
 }
+
+fn people_engine_store() -> DocumentStore {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO p VALUES (1, 'ann', 30), (2, 'bob', 25), (3, 'cy', 41)")
+        .unwrap();
+    store
+}
+
+fn names(store: &DocumentStore) -> Vec<String> {
+    SqlEngine::new(store)
+        .unwrap()
+        .execute("SELECT name FROM p ORDER BY id")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r[0].clone())
+        .collect()
+}
+
+#[test]
+fn test_sql_update_custom_table() {
+    let store = people_engine_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("UPDATE p SET name = 'ANN', age = age + 1 WHERE id = 1")
+        .unwrap();
+    assert_eq!(out.rows, vec![vec!["1".to_string()]]);
+    let out = engine
+        .execute("SELECT name, age FROM p WHERE id = 1")
+        .unwrap();
+    assert_eq!(out.rows, vec![vec!["ANN".to_string(), "31".to_string()]]);
+    assert_eq!(names(&store), vec!["ANN", "bob", "cy"]);
+}
+
+#[test]
+fn test_sql_update_all_rows_and_swap_uses_old_values() {
+    let store = people_engine_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine.execute("CREATE TABLE s (a TEXT, b TEXT)").unwrap();
+    engine.execute("INSERT INTO s VALUES ('x', 'y')").unwrap();
+    engine.execute("UPDATE s SET a = b, b = a").unwrap();
+    let out = engine.execute("SELECT a, b FROM s").unwrap();
+    assert_eq!(out.rows, vec![vec!["y".to_string(), "x".to_string()]]);
+}
+
+#[test]
+fn test_sql_delete_custom_table() {
+    let store = people_engine_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine.execute("DELETE FROM p WHERE age > 28").unwrap();
+    assert_eq!(out.rows, vec![vec!["2".to_string()]]);
+    assert_eq!(names(&store), vec!["bob"]);
+    let out = engine.execute("DELETE FROM p").unwrap();
+    assert_eq!(out.rows, vec![vec!["1".to_string()]]);
+    assert!(names(&store).is_empty());
+}
+
+#[test]
+fn test_sql_delete_with_subquery_and_alias() {
+    let mut store = people_engine_store();
+    store.add_str("# ann\n\nx\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute(
+            "DELETE FROM p AS q WHERE q.name IN (SELECT content FROM blocks WHERE block_type = 'heading')",
+        )
+        .unwrap();
+    assert_eq!(out.rows, vec![vec!["1".to_string()]]);
+    assert_eq!(names(&store), vec!["bob", "cy"]);
+}
+
+#[test]
+fn test_sql_update_enforces_constraints_and_leaves_table_unchanged() {
+    let store = people_engine_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let err = engine
+        .execute("UPDATE p SET name = '' WHERE id = 2")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("NOT NULL"), "{err}");
+    let err = engine
+        .execute("UPDATE p SET id = 1 WHERE id = 3")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("UNIQUE"), "{err}");
+    assert_eq!(names(&store), vec!["ann", "bob", "cy"]);
+}
+
+#[test]
+fn test_sql_update_unknown_column_and_table() {
+    let store = people_engine_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    assert!(engine.execute("UPDATE p SET nope = 1").is_err());
+    assert!(engine.execute("UPDATE nope SET a = 1").is_err());
+    assert!(engine.execute("DELETE FROM nope").is_err());
+}
+
+#[test]
+fn test_sql_update_delete_reject_built_in_tables_without_write_back() {
+    let mut store = DocumentStore::new();
+    store.add_str("# A\n\nx\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    for sql in [
+        "UPDATE blocks SET content = 'y'",
+        "DELETE FROM blocks",
+        "DELETE FROM documents",
+    ] {
+        let err = engine.execute(sql).unwrap_err().to_string();
+        assert!(err.contains("built-in"), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn test_sql_update_delete_roll_back_with_transaction() {
+    let store = people_engine_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine.execute("BEGIN").unwrap();
+    engine.execute("DELETE FROM p WHERE id = 1").unwrap();
+    engine
+        .execute("UPDATE p SET name = 'zz' WHERE id = 2")
+        .unwrap();
+    assert_eq!(names(&store), vec!["zz", "cy"]);
+    engine.execute("ROLLBACK").unwrap();
+    assert_eq!(names(&store), vec!["ann", "bob", "cy"]);
+}
+
+#[rstest::rstest]
+#[case("UPDATE blocks SET content = 'x'", true)]
+#[case("DELETE FROM blocks WHERE id = 1", true)]
+#[case("INSERT INTO blocks VALUES (1)", true)]
+#[case("UPDATE p SET name = 'x'", false)]
+#[case("DELETE FROM p", false)]
+#[case("INSERT INTO p VALUES (1)", false)]
+#[case("SELECT * FROM blocks", false)]
+#[case("UPDATE", false)]
+fn test_statement_needs_write_back(#[case] sql: &str, #[case] expected: bool) {
+    assert_eq!(super::statement_needs_write_back(sql), expected, "{sql}");
+}
+
+#[rstest::rstest]
+#[case("SELECT '30' + 1", "31")]
+#[case("SELECT '1.5' * 2", "3")]
+#[case("SELECT 7 / '2'", "3")]
+#[case("SELECT 'abc' + 1", "NULL")]
+#[case("SELECT '' + 1", "NULL")]
+fn test_sql_arithmetic_on_numeric_text(#[case] sql: &str, #[case] expected: &str) {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    assert_eq!(engine.execute(sql).unwrap().rows[0][0], expected, "{sql}");
+}

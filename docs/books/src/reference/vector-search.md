@@ -34,8 +34,7 @@ INSERT INTO emb SELECT * FROM read_json('new-embeddings.jsonl');
 Drop embeddings of blocks that no longer exist:
 
 ```sql
-CREATE OR REPLACE TABLE emb AS
-SELECT * FROM emb WHERE content_hash IN (SELECT content_hash FROM blocks);
+DELETE FROM emb WHERE content_hash NOT IN (SELECT content_hash FROM blocks);
 ```
 
 ## Searching

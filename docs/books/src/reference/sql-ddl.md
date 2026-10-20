@@ -1,12 +1,14 @@
 # DDL Statements
 
-`mq-db` supports a small set of DDL statements for defining **custom in-memory tables** alongside the built-in `documents`/`blocks` virtual tables. Custom tables live only for the process lifetime; they are not persisted to the `.mq-db` store file.
+`mq-db` supports a small set of DDL statements for defining **custom in-memory tables** alongside the built-in `documents`/`blocks` virtual tables. Custom tables are saved in the `.mq-db` store file, so they are there the next time it is opened.
 
 | Statement | Description |
 | --- | --- |
 | `CREATE TABLE name AS SELECT …` | Create a custom table from a query result |
 | `CREATE TABLE name (col TYPE, …)` | Create an empty custom table with explicit schema |
 | `INSERT INTO name VALUES (…)` | Insert a row into a custom table |
+| `UPDATE name SET col = expr, … [WHERE …]` | Change rows of a custom table. Every expression sees the row as it was before the statement, so `SET a = b, b = a` swaps |
+| `DELETE FROM name [WHERE …]` | Delete rows of a custom table |
 | `DROP TABLE name` | Drop a custom table |
 | `SHOW TABLES` | List all custom tables and views |
 | `DESC name` | Show the schema of a custom table or view |
@@ -15,6 +17,10 @@
 | `DROP VIEW name` | Drop a view |
 | `ATTACH DATABASE 'path' AS alias` | Mount another `.mq-db` store as `alias.<table>` |
 | `DETACH alias` | Unmount a previously attached store |
+
+`UPDATE` and `DELETE` accept an alias and subqueries in `WHERE`, enforce `NOT NULL` and `UNIQUE`, and take effect atomically: a failing statement leaves the table unchanged. They roll back with `ROLLBACK`. `UPDATE ... FROM`, `JOIN`, `RETURNING`, `ORDER BY` and `LIMIT` are not supported. The same statements on `blocks` are [write-back](write-back.md) and need `--write-back`.
+
+Cells are stored as text. In arithmetic a cell holding a number counts as that number (`SET age = age + 1`), and the result is stored back as text.
 
 ## Examples
 

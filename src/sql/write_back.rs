@@ -42,6 +42,35 @@ fn single_table_name(twj: &TableWithJoins) -> Result<String, MqdbError> {
     }
 }
 
+/// Whether `sql` would modify Markdown files, i.e. `UPDATE`/`DELETE`/`INSERT`
+/// targeting `blocks`. Statements on custom tables do not. A target that is
+/// not a plain table name counts as needing write-back, the safe default; SQL
+/// that does not parse needs nothing, since executing it only reports the
+/// parse error.
+pub fn statement_needs_write_back(sql: &str) -> bool {
+    let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, sql) else {
+        return false;
+    };
+    let is_blocks = |twj: &TableWithJoins| single_table_name(twj).is_ok_and(|n| n == "blocks");
+    match stmts.first() {
+        Some(Statement::Update(update)) => {
+            single_table_name(&update.table).map_or(true, |n| n == "blocks")
+        }
+        Some(Statement::Delete(delete)) => {
+            let (FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables)) =
+                &delete.from;
+            tables.len() != 1 || tables.iter().any(is_blocks) || !delete.tables.is_empty()
+        }
+        Some(Statement::Insert(ins)) => match &ins.table {
+            TableObject::TableName(name) => {
+                require_unqualified(name).map_or(true, |n| n == "blocks")
+            }
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
 /// Materialises the rows matched by `target`/`selection`, optionally
 /// evaluating `set_value` (the `UPDATE ... SET content = <expr>` value,
 /// per matched row) into `MatchedBlockEdit`s. `set_value` is `None` for
@@ -522,6 +551,12 @@ impl DocumentStore {
             .ok_or_else(|| MqdbError::SqlParse("empty query".into()))?;
 
         match stmt {
+            Statement::Update(_) if !statement_needs_write_back(sql) => {
+                SqlEngine::with_session(self, self.write_session)?.execute(sql)
+            }
+            Statement::Delete(_) if !statement_needs_write_back(sql) => {
+                SqlEngine::with_session(self, self.write_session)?.execute(sql)
+            }
             Statement::Update(update) => {
                 if update.from.is_some() {
                     return Err(MqdbError::SqlExec(

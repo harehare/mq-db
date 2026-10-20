@@ -132,6 +132,8 @@ impl<'a> SqlEngine<'a> {
             Statement::Query(q) => self.exec_query(&q),
             Statement::CreateTable(ct) => self.exec_create_table(&ct),
             Statement::Insert(ins) => self.exec_insert(&ins),
+            Statement::Update(update) => self.exec_update(&update),
+            Statement::Delete(delete) => self.exec_delete(&delete),
             Statement::Drop {
                 object_type: ObjectType::Table,
                 names,
@@ -178,7 +180,7 @@ impl<'a> SqlEngine<'a> {
                 Ok(ok_result())
             }
             _ => Err(MqdbError::SqlExec(
-                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, DROP TABLE, CREATE VIEW, DROP VIEW, ATTACH DATABASE, DETACH, DESC, SHOW TABLES, EXPLAIN, BEGIN, COMMIT, ROLLBACK".into(),
+                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, UPDATE, DELETE, DROP TABLE, CREATE VIEW, DROP VIEW, ATTACH DATABASE, DETACH, DESC, SHOW TABLES, EXPLAIN, BEGIN, COMMIT, ROLLBACK".into(),
             )),
         }
     }

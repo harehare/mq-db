@@ -1,5 +1,7 @@
 # INSERT / UPDATE / DELETE with Write-Back
 
+Statements on [custom tables](sql-ddl.md) change only the `.mq-db` file and never need the flag. The rest of this page is about `blocks`.
+
 `INSERT`/`UPDATE`/`DELETE` on `blocks` write the change back to the document's *source Markdown file* (re-parsed in place, same `DocumentId`), pass `--write-back` to allow it; without the flag the statement is rejected:
 
 ```bash
