@@ -97,7 +97,7 @@ fn test_sql_links_table() {
         vec![
             row("link", "https://a.com/x", "docs", "tt"),
             row("image", "p.png", "img", ""),
-            row("ref", "r", "r", ""),
+            row("ref", "r", "ref", ""),
             row("link", "other.md#sec", "l2", ""),
             row("link", "q.md", "q", ""),
         ]

@@ -59,21 +59,16 @@ fn collect_links(node: &Node, out: &mut Vec<PropertyValue>) {
             PropertyValue::String(title.unwrap_or_default()),
         ])
     };
-    let text = |n: &Node| n.children().iter().map(|c| c.value()).collect::<String>();
+    let text = |values: &[Node]| values.iter().map(|c| c.value()).collect::<String>();
 
     match node {
         Node::Link(l) => out.push(entry(
             "link",
             l.url.as_str(),
-            text(node),
+            text(&l.values),
             l.title.as_ref().map(|t| t.to_value()),
         )),
-        Node::LinkRef(l) => {
-            // The parser may leave `values` empty; fall back to the identifier.
-            let t = text(node);
-            let t = if t.is_empty() { l.ident.clone() } else { t };
-            out.push(entry("ref", &l.ident, t, None));
-        }
+        Node::LinkRef(l) => out.push(entry("ref", &l.ident, text(&l.values), None)),
         Node::Image(i) => out.push(entry("image", &i.url, i.alt.clone(), i.title.clone())),
         Node::ImageRef(i) => out.push(entry("image_ref", &i.ident, i.alt.clone(), None)),
         _ => {}
