@@ -6,7 +6,7 @@
 | --- | --- |
 | `under(pre, post, anc_pre, anc_post)` | `O(1)` interval ancestor check, see [Index Layers](index-layers.md) |
 | `mq(program, content)` | Run an mq program against Markdown content |
-| `json_extract(json, path)` | Extract a value from a JSON string |
+| `json_extract(json, path)` | Extract a value from a JSON string. `path` is a key, a dotted path or an index: `owner`, `$.a.b`, `tags[0]`. Scalars keep their type, objects and arrays come back as JSON text, and a missing path or invalid JSON gives `NULL` |
 | `match(content, query)` | Full-text search: true iff every tokenized term in `query` appears in `content`; index-accelerated when `content` is a bare column reference and `query` is a string literal. See [Full-Text Search](full-text-search.md) |
 | `score(content, query)` | Simple term-frequency relevance score for `query` against `content` (no IDF, see [Storage Format](storage-format.md)) |
 | `bm25(content, query)` | Okapi BM25 relevance score, IDF-weighted across the whole store (`k1=1.2`, `b=0.75`) |

@@ -1,6 +1,6 @@
 //! Conversion of documents and blocks to rows, plus shared row/AST helpers.
 
-use super::output::QueryOutput;
+use super::output::{QueryOutput, json_string};
 use super::value::{Row, Value};
 use crate::MqdbError;
 use crate::block::{Block, Properties, PropertyValue};
@@ -9,9 +9,7 @@ use sqlparser::ast::{ObjectName, ObjectNamePart, Value as SqlValue};
 
 fn pv_to_json(pv: &PropertyValue) -> String {
     match pv {
-        PropertyValue::String(s) => {
-            format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-        }
+        PropertyValue::String(s) => json_string(s),
         PropertyValue::Int(n) => n.to_string(),
         PropertyValue::Float(f) => f.to_string(),
         PropertyValue::Bool(b) => b.to_string(),
@@ -31,13 +29,7 @@ fn properties_to_json(props: &Properties) -> String {
 
 fn pairs_to_json<'a>(pairs: impl Iterator<Item = (&'a String, &'a PropertyValue)>) -> String {
     let pairs: Vec<String> = pairs
-        .map(|(k, v)| {
-            format!(
-                "\"{}\":{}",
-                k.replace('\\', "\\\\").replace('"', "\\\""),
-                pv_to_json(v)
-            )
-        })
+        .map(|(k, v)| format!("{}:{}", json_string(k), pv_to_json(v)))
         .collect();
     format!("{{{}}}", pairs.join(","))
 }
@@ -107,9 +99,7 @@ pub(super) fn link_rows(doc_id: u32, block: &Block, block_idx: u32) -> Vec<Row> 
 }
 
 fn json_string_array<'a>(items: impl Iterator<Item = &'a String>) -> String {
-    let items: Vec<String> = items
-        .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
-        .collect();
+    let items: Vec<String> = items.map(|s| json_string(s)).collect();
     format!("[{}]", items.join(","))
 }
 
