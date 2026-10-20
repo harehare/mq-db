@@ -23,6 +23,8 @@ pub struct ZoneMaps {
     pub title: Option<String>,
     /// Tags list from front-matter `tags` array.
     pub tags: Vec<String>,
+    /// Top-level front-matter entries, sorted by key.
+    pub frontmatter: Vec<(String, PropertyValue)>,
 }
 
 /// A parsed Markdown document stored in the database.
@@ -160,6 +162,7 @@ impl ZoneMaps {
                 BlockType::Yaml | BlockType::Toml => {
                     for (k, v) in block.properties.iter() {
                         maps.frontmatter_keys.insert(k.clone());
+                        maps.frontmatter.push((k.clone(), v.clone()));
                         if k == "title"
                             && let PropertyValue::String(s) = v
                         {
@@ -179,6 +182,7 @@ impl ZoneMaps {
             }
         }
 
+        maps.frontmatter.sort_by(|a, b| a.0.cmp(&b.0));
         maps
     }
 }

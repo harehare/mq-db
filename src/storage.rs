@@ -858,6 +858,13 @@ pub(crate) mod tests {
                 .collect(),
             title: Some("Storage Spec".to_string()),
             tags: vec!["db".to_string(), "markdown".to_string()],
+            frontmatter: vec![
+                ("tags".to_string(), PropertyValue::Array(vec!["db".into()])),
+                (
+                    "title".to_string(),
+                    PropertyValue::String("Storage Spec".into()),
+                ),
+            ],
         };
         let encoded = encode_zone_map(&zone_maps);
         let decoded = decode_zone_map(&encoded).unwrap();
@@ -1566,9 +1573,21 @@ pub(crate) mod tests {
             frontmatter_keys: ["title", "tags"].iter().map(|s| s.to_string()).collect(),
             title: title.map(|s| s.to_string()),
             tags: vec!["db".to_string(), "markdown".to_string()],
+            frontmatter: Vec::new(),
         };
         let encoded = encode_zone_map(&zone_maps);
         let decoded = decode_zone_map(&encoded).unwrap();
         assert_eq!(decoded, zone_maps);
+    }
+
+    #[test]
+    fn zone_map_without_frontmatter_section_decodes_as_empty() {
+        let zone_maps = ZoneMaps {
+            title: Some("Old".to_string()),
+            ..ZoneMaps::default()
+        };
+        let mut encoded = encode_zone_map(&zone_maps);
+        encoded.truncate(encoded.len() - 2);
+        assert_eq!(decode_zone_map(&encoded).unwrap(), zone_maps);
     }
 }

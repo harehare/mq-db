@@ -50,6 +50,33 @@ fn test_sql_documents_zone_map_columns() {
 }
 
 #[test]
+fn test_sql_documents_properties_column() {
+    let mut store = DocumentStore::new();
+    store
+        .add_str("---\ntitle: T\nowner: alice\nrank: 3\ntags: [a, b]\n---\n\n# H\n")
+        .unwrap();
+    store.add_str("# No frontmatter\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("SELECT properties FROM documents ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        out.rows,
+        vec![
+            vec![
+                "{\"owner\":\"alice\",\"rank\":3,\"tags\":[\"a\",\"b\"],\"title\":\"T\"}"
+                    .to_string()
+            ],
+            vec!["{}".to_string()],
+        ]
+    );
+    let out = engine
+        .execute("SELECT title FROM documents WHERE json_extract(properties, 'owner') = 'alice'")
+        .unwrap();
+    assert_eq!(out.rows, vec![vec!["T".to_string()]]);
+}
+
+#[test]
 fn test_sql_select_all_blocks() {
     let store = make_store();
     let engine = SqlEngine::new(&store).unwrap();

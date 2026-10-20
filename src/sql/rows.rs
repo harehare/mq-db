@@ -26,8 +26,11 @@ fn pv_to_json(pv: &PropertyValue) -> String {
 }
 
 fn properties_to_json(props: &Properties) -> String {
-    let pairs: Vec<String> = props
-        .iter()
+    pairs_to_json(props.iter())
+}
+
+fn pairs_to_json<'a>(pairs: impl Iterator<Item = (&'a String, &'a PropertyValue)>) -> String {
+    let pairs: Vec<String> = pairs
         .map(|(k, v)| {
             format!(
                 "\"{}\":{}",
@@ -90,6 +93,7 @@ pub(super) fn doc_to_row(doc: &Document) -> Row {
             "max_heading_depth".into(),
             "code_languages".into(),
             "frontmatter_keys".into(),
+            "properties".into(),
         ],
         values: vec![
             Value::Int(doc.id as i64),
@@ -109,6 +113,9 @@ pub(super) fn doc_to_row(doc: &Document) -> Row {
             )),
             Value::Str(json_string_array_sorted(
                 doc.zone_maps.frontmatter_keys.iter(),
+            )),
+            Value::Str(pairs_to_json(
+                doc.zone_maps.frontmatter.iter().map(|(k, v)| (k, v)),
             )),
         ],
     }
