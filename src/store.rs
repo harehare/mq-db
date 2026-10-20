@@ -270,6 +270,14 @@ impl Default for DocumentStore {
 /// Hash of file/document content used for change detection (not
 /// cryptographic: this only needs to detect "did this file change since
 /// last index", not resist adversarial collisions).
+/// The directory holding `path`; `.` for a bare file name, whose `parent()`
+/// is the empty path rather than `None`.
+fn containing_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
@@ -1159,8 +1167,7 @@ impl DocumentStore {
         std::fs::rename(&tmp_path, path)?;
         // A rename is only power-loss durable after the containing directory
         // is synced as well.
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::File::open(parent)?.sync_all()?;
+        std::fs::File::open(containing_dir(path))?.sync_all()?;
         drop(save_lock);
         Ok(temp_storage)
     }
@@ -1874,5 +1881,24 @@ mod tokenizer_tests {
 
         let loaded = DocumentStore::load(&db_path).unwrap();
         assert_eq!(loaded.tokenizer(), TokenizerKind::Word);
+    }
+}
+
+#[cfg(test)]
+mod containing_dir_tests {
+    use super::containing_dir;
+    use rstest::rstest;
+    use std::path::Path;
+
+    #[rstest]
+    #[case("store.mq-db", ".")]
+    #[case("./store.mq-db", ".")]
+    #[case("dir/store.mq-db", "dir")]
+    #[case("/abs/store.mq-db", "/abs")]
+    fn bare_file_names_resolve_to_the_current_directory(
+        #[case] path: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(containing_dir(Path::new(path)), Path::new(expected));
     }
 }
