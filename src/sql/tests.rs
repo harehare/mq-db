@@ -3456,3 +3456,39 @@ fn test_sql_distinct_content_hash() {
         .unwrap();
     assert_eq!(out.rows.len(), 1);
 }
+
+#[test]
+fn test_sql_order_by_mixed_null_and_numbers_is_total() {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE TABLE v (name TEXT, embedding TEXT)")
+        .unwrap();
+    let values: Vec<String> = (0..200)
+        .map(|i| {
+            if i % 3 == 0 {
+                format!("('n{i}', 'bad')")
+            } else {
+                format!("('n{i}', '[1,{i}]')")
+            }
+        })
+        .collect();
+    engine
+        .execute(&format!("INSERT INTO v VALUES {}", values.join(",")))
+        .unwrap();
+    let out = engine
+        .execute("SELECT name, cosine_similarity(embedding, '[1,0]') AS s FROM v ORDER BY s DESC")
+        .unwrap();
+    assert_eq!(out.rows.len(), 200);
+    let nulls = out.rows.iter().filter(|r| r[1] == "NULL").count();
+    assert_eq!(nulls, 67);
+    // Every number must come before every NULL.
+    let first_null = out.rows.iter().position(|r| r[1] == "NULL").unwrap();
+    assert!(out.rows[first_null..].iter().all(|r| r[1] == "NULL"));
+    // And the numbers must be in descending order.
+    let nums: Vec<f64> = out.rows[..first_null]
+        .iter()
+        .map(|r| r[1].parse().unwrap())
+        .collect();
+    assert!(nums.windows(2).all(|w| w[0] >= w[1]));
+}

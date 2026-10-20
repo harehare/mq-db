@@ -61,6 +61,28 @@ impl Value {
         }
     }
 
+    /// A total order for `ORDER BY`: `NULL`, then booleans, then numbers,
+    /// then strings. `NULL` sorts lowest, so it comes last under `DESC`.
+    pub(super) fn sort_cmp(&self, other: &Value) -> std::cmp::Ordering {
+        fn rank(v: &Value) -> u8 {
+            match v {
+                Value::Null => 0,
+                Value::Bool(_) => 1,
+                Value::Int(_) | Value::Float(_) => 2,
+                Value::Str(_) => 3,
+            }
+        }
+        match (self, other) {
+            (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+            (Value::Int(a), Value::Int(b)) => a.cmp(b),
+            (Value::Int(a), Value::Float(b)) => (*a as f64).total_cmp(b),
+            (Value::Float(a), Value::Int(b)) => a.total_cmp(&(*b as f64)),
+            (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
+            (Value::Str(a), Value::Str(b)) => a.cmp(b),
+            _ => rank(self).cmp(&rank(other)),
+        }
+    }
+
     pub(super) fn cmp_val(&self, other: &Value) -> Option<std::cmp::Ordering> {
         match (self, other) {
             (Value::Int(a), Value::Str(s)) => canonical_int(s).map(|b| a.cmp(&b)),

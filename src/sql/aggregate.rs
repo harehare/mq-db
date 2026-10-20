@@ -521,7 +521,7 @@ impl<'a> SqlEngine<'a> {
                 for (expr, desc) in &sort_keys {
                     let va = eval_agg_expr_value(expr, group_by_exprs, &a.0, &a.1);
                     let vb = eval_agg_expr_value(expr, group_by_exprs, &b.0, &b.1);
-                    let mut ord = va.cmp_val(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    let mut ord = va.sort_cmp(&vb);
                     if *desc {
                         ord = ord.reverse();
                     }

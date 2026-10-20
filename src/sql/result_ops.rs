@@ -24,9 +24,7 @@ pub(super) fn apply_order_by_exprs(rows: &mut [(Row, Vec<String>)], exprs: &[Ord
     let mut order: Vec<usize> = (0..rows.len()).collect();
     order.sort_by(|&a, &b| {
         for (i, ob) in exprs.iter().enumerate() {
-            let ord = keys[a][i]
-                .cmp_val(&keys[b][i])
-                .unwrap_or(std::cmp::Ordering::Equal);
+            let ord = keys[a][i].sort_cmp(&keys[b][i]);
             // sort=None or Asc → ascending; Desc → descending
             let ord = if ob.options.sort == Some(OrderBySort::Desc) {
                 ord.reverse()
