@@ -108,6 +108,14 @@ impl<'a> SqlEngine<'a> {
                 ("lang", "text"),
                 ("properties", "text"),
             ]),
+            "links" => Some(vec![
+                ("document_id", "integer"),
+                ("block_id", "integer"),
+                ("kind", "text"),
+                ("url", "text"),
+                ("text", "text"),
+                ("title", "text"),
+            ]),
             "documents" => Some(vec![
                 ("id", "integer"),
                 ("path", "text"),
@@ -162,6 +170,7 @@ impl<'a> SqlEngine<'a> {
         let mut rows = vec![
             vec!["blocks".to_string(), "built-in".to_string()],
             vec!["documents".to_string(), "built-in".to_string()],
+            vec!["links".to_string(), "built-in".to_string()],
         ];
         let guard = self.store.custom_tables.read().unwrap();
         let mut custom: Vec<String> = guard.keys().cloned().collect();
@@ -183,7 +192,7 @@ impl<'a> SqlEngine<'a> {
 
     pub(super) fn exec_create_table(&self, ct: &CreateTable) -> Result<QueryOutput, MqdbError> {
         let table_name = require_unqualified(&ct.name)?;
-        if matches!(table_name.as_str(), "blocks" | "documents") {
+        if matches!(table_name.as_str(), "blocks" | "documents" | "links") {
             return Err(MqdbError::SqlExec(format!(
                 "cannot override built-in table '{table_name}'"
             )));
@@ -300,7 +309,7 @@ impl<'a> SqlEngine<'a> {
 
     pub(super) fn exec_create_view(&self, cv: &CreateView) -> Result<QueryOutput, MqdbError> {
         let view_name = require_unqualified(&cv.name)?;
-        if matches!(view_name.as_str(), "blocks" | "documents") {
+        if matches!(view_name.as_str(), "blocks" | "documents" | "links") {
             return Err(MqdbError::SqlExec(format!(
                 "cannot override built-in table '{view_name}'"
             )));
@@ -381,7 +390,7 @@ impl<'a> SqlEngine<'a> {
         let mut view_names = Vec::with_capacity(names.len());
         for name in names {
             let view_name = require_unqualified(name)?;
-            if matches!(view_name.as_str(), "blocks" | "documents") {
+            if matches!(view_name.as_str(), "blocks" | "documents" | "links") {
                 return Err(MqdbError::SqlExec(format!(
                     "cannot drop built-in table '{view_name}'"
                 )));
@@ -562,7 +571,7 @@ impl<'a> SqlEngine<'a> {
         let mut table_names = Vec::with_capacity(names.len());
         for name in names {
             let table_name = require_unqualified(name)?;
-            if matches!(table_name.as_str(), "blocks" | "documents") {
+            if matches!(table_name.as_str(), "blocks" | "documents" | "links") {
                 return Err(MqdbError::SqlExec(format!(
                     "cannot drop built-in table '{table_name}'"
                 )));

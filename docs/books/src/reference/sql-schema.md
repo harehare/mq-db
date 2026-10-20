@@ -1,6 +1,6 @@
 # Virtual Schema
 
-The SQL engine exposes two virtual tables backed directly by the in-memory store; there is no separate schema to migrate.
+The SQL engine exposes three virtual tables backed directly by the in-memory store; there is no separate schema to migrate.
 
 ```sql
 SELECT id, path, title, tags FROM documents;
@@ -26,6 +26,24 @@ SELECT id, document_id, block_type, content, pre, post,
 ```sql
 SELECT path FROM documents
 WHERE json_extract(properties, 'owner') = 'alice';
+```
+
+## `links`
+
+One row per link or image, including those inside lists, tables and block quotes.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `document_id` | integer | Owning document ID |
+| `block_id` | integer | `blocks.id` of the block containing the link |
+| `kind` | text | `'link'`, `'image'`, `'ref'` (reference link) or `'image_ref'` |
+| `url` | text | Destination URL, or the reference label for `ref`/`image_ref` |
+| `text` | text | Link text, or image alt text |
+| `title` | text | Link title, or empty |
+
+```sql
+-- Most linked-to URLs
+SELECT url, COUNT(*) AS n FROM links WHERE kind = 'link' GROUP BY url ORDER BY n DESC;
 ```
 
 ## `blocks`

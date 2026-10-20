@@ -47,6 +47,42 @@ fn yaml_value_to_property(v: serde_yaml::Value) -> PropertyValue {
     }
 }
 
+/// Appends every link and image under `node` as `[kind, target, text, title]`.
+///
+/// `target` is the URL, or the reference identifier for `ref`/`image_ref`.
+fn collect_links(node: &Node, out: &mut Vec<PropertyValue>) {
+    let entry = |kind: &str, target: &str, text: String, title: Option<String>| {
+        PropertyValue::Array(vec![
+            PropertyValue::String(kind.to_string()),
+            PropertyValue::String(target.to_string()),
+            PropertyValue::String(text),
+            PropertyValue::String(title.unwrap_or_default()),
+        ])
+    };
+    let text = |n: &Node| n.children().iter().map(|c| c.value()).collect::<String>();
+
+    match node {
+        Node::Link(l) => out.push(entry(
+            "link",
+            l.url.as_str(),
+            text(node),
+            l.title.as_ref().map(|t| t.to_value()),
+        )),
+        Node::LinkRef(l) => {
+            // The parser may leave `values` empty; fall back to the identifier.
+            let t = text(node);
+            let t = if t.is_empty() { l.ident.clone() } else { t };
+            out.push(entry("ref", &l.ident, t, None));
+        }
+        Node::Image(i) => out.push(entry("image", &i.url, i.alt.clone(), i.title.clone())),
+        Node::ImageRef(i) => out.push(entry("image_ref", &i.ident, i.alt.clone(), None)),
+        _ => {}
+    }
+    for child in node.children() {
+        collect_links(&child, out);
+    }
+}
+
 // Core conversion: Node → (BlockType, content, Properties)
 // Returns None for nodes that should be skipped (Fragment, Empty).
 
@@ -284,7 +320,12 @@ pub fn build_blocks(doc_id: DocumentId, nodes: &[Node]) -> Vec<Block> {
 
     for (idx, node) in nodes.iter().enumerate() {
         let slot = node_slot[idx];
-        if let Some((block_type, content, properties)) = node_to_parts(node) {
+        if let Some((block_type, content, mut properties)) = node_to_parts(node) {
+            let mut links = Vec::new();
+            collect_links(node, &mut links);
+            if !links.is_empty() {
+                properties.set("links", PropertyValue::Array(links));
+            }
             blocks.push(Block {
                 id: next_id,
                 document_id: doc_id,

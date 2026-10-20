@@ -7,7 +7,7 @@ use super::join::{combine_rows, cross_join, hash_equi_join, null_extend_row, out
 use super::output::QueryOutput;
 use super::plan::{find_equi_join_exprs, zone_map_skip};
 use super::rewrite::fold_constants;
-use super::rows::{block_to_row, doc_to_row, ident_value, qualify_row};
+use super::rows::{block_to_row, doc_to_row, ident_value, link_rows, qualify_row};
 use super::value::{Row, Value};
 use crate::MqdbError;
 use crate::indexes::IndexHint;
@@ -189,6 +189,20 @@ impl<'a> SqlEngine<'a> {
                                 block_to_row(doc.id, block, global_idx + i as u32),
                                 prefix,
                             ));
+                        }
+                    }
+                    global_idx += doc.blocks.len() as u32;
+                }
+                Ok(rows)
+            }
+            "links" => {
+                let prefix = alias.unwrap_or("links");
+                let mut rows = Vec::new();
+                let mut global_idx: u32 = 0;
+                for doc in self.store.documents() {
+                    for (i, block) in doc.blocks.iter().enumerate() {
+                        for row in link_rows(doc.id, block, global_idx + i as u32) {
+                            rows.push(qualify_row(row, prefix));
                         }
                     }
                     global_idx += doc.blocks.len() as u32;

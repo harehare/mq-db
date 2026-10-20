@@ -77,6 +77,49 @@ fn test_sql_documents_properties_column() {
 }
 
 #[test]
+fn test_sql_links_table() {
+    let mut store = DocumentStore::new();
+    store
+        .add_str(
+            "# T\n\nSee [docs](https://a.com/x \"tt\") and ![img](p.png) and [ref][r].\n\n\
+             - item [l2](other.md#sec)\n\n> quote [q](q.md)\n\n[r]: https://r.com\n",
+        )
+        .unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("SELECT kind, url, text, title FROM links ORDER BY block_id, kind")
+        .unwrap();
+    let row = |k: &str, u: &str, t: &str, ti: &str| {
+        vec![k.to_string(), u.to_string(), t.to_string(), ti.to_string()]
+    };
+    assert_eq!(
+        out.rows,
+        vec![
+            row("link", "https://a.com/x", "docs", "tt"),
+            row("image", "p.png", "img", ""),
+            row("ref", "r", "r", ""),
+            row("link", "other.md#sec", "l2", ""),
+            row("link", "q.md", "q", ""),
+        ]
+    );
+}
+
+#[test]
+fn test_sql_links_join_blocks() {
+    let mut store = DocumentStore::new();
+    store.add_str("# A\n\n[x](x.md)\n").unwrap();
+    store.add_str("# B\n\nplain\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute(
+            "SELECT b.content FROM links l JOIN blocks b \
+             ON b.document_id = l.document_id AND b.id = l.block_id",
+        )
+        .unwrap();
+    assert_eq!(out.rows.len(), 1);
+}
+
+#[test]
 fn test_sql_select_all_blocks() {
     let store = make_store();
     let engine = SqlEngine::new(&store).unwrap();
