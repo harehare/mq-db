@@ -3204,3 +3204,45 @@ fn test_sql_correlated_subquery_expression_forms(#[case] cond: &str, #[case] exp
         .unwrap();
     assert_eq!(out.rows.len(), expected, "{cond}");
 }
+
+#[rstest::rstest]
+#[case("cosine_similarity('[1,0]', '[1,0]')", "1")]
+#[case("cosine_similarity('[1,0]', '[0,1]')", "0")]
+#[case("cosine_similarity('[3,4]', '[3,4]')", "1")]
+#[case("dot_product('[1,2,3]', '[4,5,6]')", "32")]
+#[case("l2_distance('[0,0]', '[3,4]')", "5")]
+#[case("COSINE_SIMILARITY('[1,0]', '[1,0]')", "1")]
+#[case("cosine_similarity('[1,0]', '[1,0,0]')", "NULL")]
+#[case("cosine_similarity('[0,0]', '[1,0]')", "NULL")]
+#[case("cosine_similarity('[]', '[]')", "NULL")]
+#[case("cosine_similarity('[1,\"a\"]', '[1,0]')", "NULL")]
+#[case("cosine_similarity('not json', '[1,0]')", "NULL")]
+#[case("cosine_similarity(NULL, '[1,0]')", "NULL")]
+fn test_sql_vector_functions(#[case] expr: &str, #[case] expected: &str) {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine.execute(&format!("SELECT {expr}")).unwrap();
+    assert_eq!(out.rows[0][0], expected, "{expr}");
+}
+
+#[test]
+fn test_sql_nearest_by_embedding() {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE TABLE emb (name TEXT, embedding TEXT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO emb VALUES ('x', '[1,0]'), ('y', '[0,1]'), ('xy', '[0.7,0.7]')")
+        .unwrap();
+    let out = engine
+        .execute(
+            "SELECT name FROM emb \
+             ORDER BY cosine_similarity(embedding, '[0.1,1]') DESC LIMIT 2",
+        )
+        .unwrap();
+    assert_eq!(
+        out.rows,
+        vec![vec!["y".to_string()], vec!["xy".to_string()]]
+    );
+}
