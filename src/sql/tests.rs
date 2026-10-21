@@ -3182,3 +3182,25 @@ fn test_sql_json_output_escapes_control_characters() {
     let parsed: serde_json::Value = serde_json::from_str(&out.to_json()).unwrap();
     assert_eq!(parsed[0]["content"], "a\tb");
 }
+
+#[rstest::rstest]
+#[case("l.url LIKE d.title || '%'", 1)]
+#[case("l.url NOT LIKE d.title || 'z%'", 1)]
+#[case("l.url NOT LIKE d.title", 1)]
+#[case("l.url LIKE '%' || d.title", 0)]
+#[case("l.url REGEXP d.title", 1)]
+#[case("CASE WHEN d.title = 'a' THEN l.url = 'a.md' ELSE false END", 1)]
+#[case("l.url = CAST(d.title AS TEXT) || '.md'", 1)]
+fn test_sql_correlated_subquery_expression_forms(#[case] cond: &str, #[case] expected: usize) {
+    let mut store = DocumentStore::new();
+    store.add_str("# a\n\n[x](a.md)\n").unwrap();
+    store.add_str("# b\n\nplain\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute(&format!(
+            "SELECT d.title FROM documents d \
+             WHERE EXISTS (SELECT 1 FROM links l WHERE l.document_id = d.id AND {cond})"
+        ))
+        .unwrap();
+    assert_eq!(out.rows.len(), expected, "{cond}");
+}

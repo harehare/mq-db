@@ -4,7 +4,8 @@ use super::analysis::{select_own_aliases, value_to_expr};
 use super::expr::eval_expr;
 use super::value::Row;
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SelectItem, SetExpr,
+    CaseWhen, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SelectItem,
+    SetExpr,
 };
 
 /// Replaces any `<alias>.<column>` reference in `expr` with its literal
@@ -80,6 +81,64 @@ fn substitute_outer_refs(expr: &Expr, outer_row: &Row, own_aliases: &[String]) -
             negated: *negated,
             low: Box::new(substitute_outer_refs(low, outer_row, own_aliases)),
             high: Box::new(substitute_outer_refs(high, outer_row, own_aliases)),
+        },
+        Expr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            escape_char,
+        } => Expr::Like {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(substitute_outer_refs(expr, outer_row, own_aliases)),
+            pattern: Box::new(substitute_outer_refs(pattern, outer_row, own_aliases)),
+            escape_char: escape_char.clone(),
+        },
+        Expr::RLike {
+            negated,
+            expr,
+            pattern,
+            regexp,
+        } => Expr::RLike {
+            negated: *negated,
+            expr: Box::new(substitute_outer_refs(expr, outer_row, own_aliases)),
+            pattern: Box::new(substitute_outer_refs(pattern, outer_row, own_aliases)),
+            regexp: *regexp,
+        },
+        Expr::Cast {
+            kind,
+            expr,
+            data_type,
+            format,
+        } => Expr::Cast {
+            kind: kind.clone(),
+            expr: Box::new(substitute_outer_refs(expr, outer_row, own_aliases)),
+            data_type: data_type.clone(),
+            format: format.clone(),
+        },
+        Expr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => Expr::Case {
+            case_token: case_token.clone(),
+            end_token: end_token.clone(),
+            operand: operand
+                .as_ref()
+                .map(|e| Box::new(substitute_outer_refs(e, outer_row, own_aliases))),
+            conditions: conditions
+                .iter()
+                .map(|w| CaseWhen {
+                    condition: substitute_outer_refs(&w.condition, outer_row, own_aliases),
+                    result: substitute_outer_refs(&w.result, outer_row, own_aliases),
+                })
+                .collect(),
+            else_result: else_result
+                .as_ref()
+                .map(|e| Box::new(substitute_outer_refs(e, outer_row, own_aliases))),
         },
         Expr::Function(f) => {
             let new_args = match &f.args {
