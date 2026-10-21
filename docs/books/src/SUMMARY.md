@@ -16,6 +16,7 @@
   - [Full-Text Search](reference/full-text-search.md)
   - [EXPLAIN / EXPLAIN ANALYZE](reference/explain.md)
   - [External Files](reference/external-files.md)
+  - [Vector Search](reference/vector-search.md)
   - [Write-Back](reference/write-back.md)
   - [Example Queries](reference/sql-examples.md)
   - [Block Model](reference/block-model.md)

@@ -28,6 +28,37 @@ pub(super) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             let path = args[1].as_str().unwrap_or("");
             extract_json_path(json, path)
         }
+        "cosine_similarity" | "dot_product" | "l2_distance" => {
+            if args.len() < 2 {
+                return Value::Null;
+            }
+            let (Some(a), Some(b)) = (parse_vector(&args[0]), parse_vector(&args[1])) else {
+                return Value::Null;
+            };
+            if a.len() != b.len() {
+                return Value::Null;
+            }
+            let dot: f64 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+            match name.to_lowercase().as_str() {
+                "dot_product" => Value::Float(dot),
+                "l2_distance" => Value::Float(
+                    a.iter()
+                        .zip(&b)
+                        .map(|(x, y)| (x - y).powi(2))
+                        .sum::<f64>()
+                        .sqrt(),
+                ),
+                _ => {
+                    let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                    let denom = norm(&a) * norm(&b);
+                    if denom == 0.0 {
+                        Value::Null
+                    } else {
+                        Value::Float(dot / denom)
+                    }
+                }
+            }
+        }
         "mq" => {
             if args.len() < 2 {
                 return Value::Null;
@@ -535,6 +566,17 @@ fn eval_mq_scalar(program: &str, content: &str) -> Value {
         }
         Err(_) => Value::Null,
     }
+}
+
+/// Parses a non-empty JSON array of numbers; `None` for anything else.
+fn parse_vector(value: &Value) -> Option<Vec<f64>> {
+    let serde_json::Value::Array(items) = serde_json::from_str(value.as_str()?).ok()? else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    items.iter().map(serde_json::Value::as_f64).collect()
 }
 
 /// Looks up `path` (`key`, `$.a.b`, `a[0].b`) in `json`.

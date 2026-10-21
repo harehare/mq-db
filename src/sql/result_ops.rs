@@ -13,12 +13,20 @@ pub(super) fn expr_structurally_eq(a: &Expr, b: &Expr) -> bool {
     a == b
 }
 
+/// Sorts `rows` by `exprs`, evaluating each sort expression once per row
+/// rather than once per comparison (it can be expensive, e.g. a vector
+/// similarity).
 pub(super) fn apply_order_by_exprs(rows: &mut [(Row, Vec<String>)], exprs: &[OrderByExpr]) {
-    rows.sort_by(|(ra, _), (rb, _)| {
-        for ob in exprs {
-            let va = eval_expr(&ob.expr, ra);
-            let vb = eval_expr(&ob.expr, rb);
-            let ord = va.cmp_val(&vb).unwrap_or(std::cmp::Ordering::Equal);
+    let keys: Vec<Vec<Value>> = rows
+        .iter()
+        .map(|(row, _)| exprs.iter().map(|ob| eval_expr(&ob.expr, row)).collect())
+        .collect();
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&a, &b| {
+        for (i, ob) in exprs.iter().enumerate() {
+            let ord = keys[a][i]
+                .cmp_val(&keys[b][i])
+                .unwrap_or(std::cmp::Ordering::Equal);
             // sort=None or Asc → ascending; Desc → descending
             let ord = if ob.options.sort == Some(OrderBySort::Desc) {
                 ord.reverse()
@@ -31,6 +39,23 @@ pub(super) fn apply_order_by_exprs(rows: &mut [(Row, Vec<String>)], exprs: &[Ord
         }
         std::cmp::Ordering::Equal
     });
+    apply_permutation(rows, order);
+}
+
+/// Reorders `items` so that position `i` holds the old item at `order[i]`.
+fn apply_permutation<T>(items: &mut [T], order: Vec<usize>) {
+    // Invert into "old position -> new position", then follow cycles.
+    let mut dest = vec![0; order.len()];
+    for (new, &old) in order.iter().enumerate() {
+        dest[old] = new;
+    }
+    for i in 0..dest.len() {
+        while dest[i] != i {
+            let j = dest[i];
+            items.swap(i, j);
+            dest.swap(i, j);
+        }
+    }
 }
 
 fn multiset_counts(rows: &[Vec<String>]) -> FxHashMap<Vec<String>, usize> {
@@ -170,4 +195,16 @@ pub(super) fn offset_expr_of(query: &Query) -> Option<Expr> {
         LimitClause::LimitOffset { offset, .. } => offset.as_ref().map(|o| o.value.clone()),
         LimitClause::OffsetCommaLimit { offset, .. } => Some(offset.clone()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_permutation;
+
+    #[test]
+    fn permutation_gathers_old_positions() {
+        let mut items = vec!['a', 'b', 'c', 'd', 'e'];
+        apply_permutation(&mut items, vec![3, 0, 4, 1, 2]);
+        assert_eq!(items, vec!['d', 'a', 'e', 'b', 'c']);
+    }
 }
