@@ -590,12 +590,11 @@ fn parse_vector(value: &Value) -> Option<std::rc::Rc<[f64]>> {
     if hit.is_some() {
         return hit;
     }
-    let inner = text.trim().strip_prefix('[')?.strip_suffix(']')?;
-    let parsed: Option<Vec<f64>> = inner
-        .split(',')
-        .map(|n| n.trim().parse::<f64>().ok().filter(|f| f.is_finite()))
-        .collect();
-    let vector: std::rc::Rc<[f64]> = parsed?.into();
+    let parsed: Vec<f64> = serde_json::from_str(text).ok()?;
+    if parsed.is_empty() || !parsed.iter().all(|f| f.is_finite()) {
+        return None;
+    }
+    let vector: std::rc::Rc<[f64]> = parsed.into();
     RECENT_VECTORS.with(|c| {
         let mut recent = c.borrow_mut();
         recent.insert(0, (text.to_string(), vector.clone()));
