@@ -278,8 +278,8 @@ fn eval_binary(left: &Expr, op: &BinaryOperator, right: &Expr, row: &Row) -> Val
             }
             Value::Bool(eval_expr(right, row).is_truthy())
         }
-        BinaryOperator::Eq => Value::Bool(eval_expr(left, row) == eval_expr(right, row)),
-        BinaryOperator::NotEq => Value::Bool(eval_expr(left, row) != eval_expr(right, row)),
+        BinaryOperator::Eq => Value::Bool(eval_expr(left, row).sql_eq(&eval_expr(right, row))),
+        BinaryOperator::NotEq => Value::Bool(!eval_expr(left, row).sql_eq(&eval_expr(right, row))),
         BinaryOperator::Lt => cmp_op(left, right, row, |o| o.is_lt()),
         BinaryOperator::LtEq => cmp_op(left, right, row, |o| o.is_le()),
         BinaryOperator::Gt => cmp_op(left, right, row, |o| o.is_gt()),
