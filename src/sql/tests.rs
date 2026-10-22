@@ -3286,3 +3286,68 @@ fn test_sql_join_custom_table_text_key_to_block_id() {
         vec![vec!["beta".to_string()], vec!["One".to_string()]]
     );
 }
+
+fn anchors_of(md: &str) -> Vec<(String, String)> {
+    let mut store = DocumentStore::new();
+    store.add_str(md).unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("SELECT content, anchor FROM blocks ORDER BY pre")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| (r[0].clone(), r[1].clone()))
+        .collect()
+}
+
+#[test]
+fn test_sql_block_anchor_paths() {
+    let got = anchors_of(
+        "intro\n\n# Guide\n\ntext\n\n## Install\n\na\n\n```sh\nx\n```\n\n## Install\n\nb\n\n# Guide\n\nc\n",
+    );
+    let anchors: Vec<&str> = got.iter().map(|(_, a)| a.as_str()).collect();
+    assert_eq!(
+        anchors,
+        vec![
+            "::paragraph:1",
+            "guide",
+            "guide::paragraph:1",
+            "guide/install",
+            "guide/install::paragraph:1",
+            "guide/install::code:1",
+            "guide/install-2",
+            "guide/install-2::paragraph:1",
+            "guide-2",
+            "guide-2::paragraph:1",
+        ]
+    );
+}
+
+#[test]
+fn test_sql_block_anchor_survives_unrelated_edits() {
+    let before = anchors_of("# A\n\none\n\n# B\n\ntwo\n");
+    let after = anchors_of("# New\n\nx\n\n# A\n\none\n\nmore\n\n# B\n\ntwo\n");
+    let find = |v: &[(String, String)], c: &str| v.iter().find(|(x, _)| x == c).unwrap().1.clone();
+    assert_eq!(find(&before, "two"), find(&after, "two"));
+    assert_eq!(find(&before, "one"), find(&after, "one"));
+}
+
+#[test]
+fn test_sql_content_hash_depends_on_type_and_content_only() {
+    let mut store = DocumentStore::new();
+    store
+        .add_str("# A\n\nsame\n\n# B\n\nsame\n\nother\n")
+        .unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let rows = engine
+        .execute(
+            "SELECT content, content_hash FROM blocks WHERE block_type = 'paragraph' ORDER BY pre",
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(rows[0][1], rows[1][1]);
+    assert_ne!(rows[0][1], rows[2][1]);
+    assert_eq!(rows[0][1].len(), 16);
+    // FNV-1a 64 of "paragraph\0same"; a change here invalidates stored keys.
+    assert_eq!(rows[0][1], "1c8d281685b6b265");
+}

@@ -7,7 +7,7 @@ use super::join::{combine_rows, cross_join, hash_equi_join, null_extend_row, out
 use super::output::QueryOutput;
 use super::plan::{find_equi_join_exprs, zone_map_skip};
 use super::rewrite::fold_constants;
-use super::rows::{block_to_row, doc_to_row, ident_value, link_rows, qualify_row};
+use super::rows::{block_anchors, block_to_row, doc_to_row, ident_value, link_rows, qualify_row};
 use super::value::{Row, Value};
 use crate::MqdbError;
 use crate::indexes::IndexHint;
@@ -170,6 +170,7 @@ impl<'a> SqlEngine<'a> {
                         global_idx += doc.blocks.len() as u32;
                         continue;
                     }
+                    let anchors = block_anchors(doc);
                     // Try index-based access first
                     if let Some(local_indices) = hint.resolve(doc_idx) {
                         // Only materialise the pre-filtered blocks
@@ -177,7 +178,12 @@ impl<'a> SqlEngine<'a> {
                             if let Some(block) = doc.blocks.get(local_i as usize) {
                                 let block_global_idx = global_idx + local_i;
                                 rows.push(qualify_row(
-                                    block_to_row(doc.id, block, block_global_idx),
+                                    block_to_row(
+                                        doc.id,
+                                        block,
+                                        block_global_idx,
+                                        &anchors[local_i as usize],
+                                    ),
                                     prefix,
                                 ));
                             }
@@ -186,7 +192,7 @@ impl<'a> SqlEngine<'a> {
                         // FullScan
                         for (i, block) in doc.blocks.iter().enumerate() {
                             rows.push(qualify_row(
-                                block_to_row(doc.id, block, global_idx + i as u32),
+                                block_to_row(doc.id, block, global_idx + i as u32, &anchors[i]),
                                 prefix,
                             ));
                         }

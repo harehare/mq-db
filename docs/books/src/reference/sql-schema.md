@@ -59,5 +59,9 @@ SELECT url, COUNT(*) AS n FROM links WHERE kind = 'link' GROUP BY url ORDER BY n
 | `depth` | integer | Heading depth (`1`–`6`); `NULL`/`0` for non-headings |
 | `lang` | text | Code fence language, when `block_type = 'code'` |
 | `properties` | text | Remaining block-type-specific properties as JSON |
+| `content_hash` | text | 16 hex digits of FNV-1a 64 over the block type, a NUL byte and the content. Equal for equal content wherever it appears, so it is a stable key for derived data such as embeddings |
+| `anchor` | text | Location that survives edits elsewhere in the document: a heading is its slug path (`guide/install`, a repeated sibling gets `-2`), any other block is `<section path>::<type>:<n>` (`guide/install::code:1`). Unique within a document |
+
+`id` is the block's position across the whole store, so it shifts when an earlier document gains or loses blocks. Key long-lived data on `(documents.path, anchor)` or on `content_hash` instead.
 
 `pre`/`post` are the Nested-Set interval-index boundaries described in [Index Layers](index-layers.md); they encode heading hierarchy as a pure integer range, which is what the [`under()`](sql-functions.md) function operates on.

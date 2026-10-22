@@ -5,6 +5,7 @@ use super::value::{Row, Value};
 use crate::MqdbError;
 use crate::block::{Block, Properties, PropertyValue};
 use crate::document::Document;
+use rustc_hash::FxHashMap;
 use sqlparser::ast::{ObjectName, ObjectNamePart, Value as SqlValue};
 
 fn pv_to_json(pv: &PropertyValue) -> String {
@@ -34,7 +35,76 @@ fn pairs_to_json<'a>(pairs: impl Iterator<Item = (&'a String, &'a PropertyValue)
     format!("{{{}}}", pairs.join(","))
 }
 
-pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32) -> Row {
+/// FNV-1a over `block_type`, a NUL and `content`, as 16 hex digits.
+///
+/// Hand-rolled because the value is user-visible and must not change with
+/// the standard library or a dependency.
+fn content_hash(block: &Block) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in block
+        .block_type
+        .as_str()
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(block.content.bytes())
+    {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// A location key for every block of `doc` that survives edits elsewhere.
+///
+/// A heading is its slug path (`guide/install`, repeated siblings get `-2`,
+/// `-3`). Any other block is `<section path>::<type>:<n>`, the `n`th block of
+/// that type directly under the section.
+pub(super) fn block_anchors(doc: &Document) -> Vec<String> {
+    #[derive(Default)]
+    struct Scope {
+        depth: u8,
+        path: String,
+        children: FxHashMap<String, usize>,
+        types: FxHashMap<&'static str, usize>,
+    }
+    let mut stack = vec![Scope::default()];
+    let mut anchors = Vec::with_capacity(doc.blocks.len());
+    for block in &doc.blocks {
+        if let Some(depth) = block.heading_depth() {
+            while stack.len() > 1 && stack.last().is_some_and(|s| s.depth >= depth) {
+                stack.pop();
+            }
+            let slug = match block.properties.get("slug") {
+                Some(PropertyValue::String(s)) if !s.is_empty() => s.clone(),
+                _ => block.content.to_lowercase(),
+            };
+            let parent = stack.last_mut().expect("root scope is never popped");
+            let n = parent.children.entry(slug.clone()).or_insert(0);
+            *n += 1;
+            let segment = if *n == 1 { slug } else { format!("{slug}-{n}") };
+            let path = if parent.path.is_empty() {
+                segment
+            } else {
+                format!("{}/{segment}", parent.path)
+            };
+            anchors.push(path.clone());
+            stack.push(Scope {
+                depth,
+                path,
+                ..Scope::default()
+            });
+        } else {
+            let scope = stack.last_mut().expect("root scope is never popped");
+            let ty = block.block_type.as_str();
+            let n = scope.types.entry(ty).or_insert(0);
+            *n += 1;
+            anchors.push(format!("{}::{ty}:{n}", scope.path));
+        }
+    }
+    anchors
+}
+
+pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32, anchor: &str) -> Row {
     Row {
         columns: vec![
             "id".into(),
@@ -46,6 +116,8 @@ pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32) -> Row {
             "depth".into(),
             "lang".into(),
             "properties".into(),
+            "content_hash".into(),
+            "anchor".into(),
         ],
         values: vec![
             Value::Int(block_idx as i64),
@@ -57,6 +129,8 @@ pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32) -> Row {
             Value::Int(block.heading_depth().unwrap_or(0) as i64),
             Value::Str(block.code_lang().unwrap_or("").to_string()),
             Value::Str(properties_to_json(&block.properties)),
+            Value::Str(content_hash(block)),
+            Value::Str(anchor.to_string()),
         ],
     }
 }
