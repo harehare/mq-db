@@ -3287,6 +3287,56 @@ fn test_sql_join_custom_table_text_key_to_block_id() {
     );
 }
 
+#[test]
+fn test_sql_embeddings_keyed_by_content_hash() {
+    let hash_of = |md: &str, content: &str| {
+        let mut store = DocumentStore::new();
+        store.add_str(md).unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "SELECT content_hash FROM blocks WHERE content = '{content}'"
+            ))
+            .unwrap()
+            .rows[0][0]
+            .clone()
+    };
+    let alpha = hash_of("# One\n\nalpha\n", "alpha");
+
+    // `alpha` moved behind new content; `beta` has no embedding yet.
+    let mut store = DocumentStore::new();
+    store
+        .add_str("# New\n\nintro\n\n# One\n\nalpha\n\n# Two\n\nbeta\n")
+        .unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE TABLE emb (content_hash TEXT, embedding TEXT)")
+        .unwrap();
+    engine
+        .execute(&format!("INSERT INTO emb VALUES ('{alpha}', '[1,0]')"))
+        .unwrap();
+
+    let found = engine
+        .execute(
+            "SELECT b.content FROM emb e JOIN blocks b ON b.content_hash = e.content_hash \
+             ORDER BY cosine_similarity(e.embedding, '[1,0]') DESC",
+        )
+        .unwrap();
+    assert_eq!(found.rows, vec![vec!["alpha".to_string()]]);
+
+    let missing = engine
+        .execute(
+            "SELECT b.content FROM blocks b \
+             LEFT JOIN emb e ON b.content_hash = e.content_hash \
+             WHERE b.block_type = 'paragraph' AND e.content_hash IS NULL ORDER BY b.pre",
+        )
+        .unwrap();
+    assert_eq!(
+        missing.rows,
+        vec![vec!["intro".to_string()], vec!["beta".to_string()]]
+    );
+}
+
 fn anchors_of(md: &str) -> Vec<(String, String)> {
     let mut store = DocumentStore::new();
     store.add_str(md).unwrap();
@@ -3391,4 +3441,15 @@ fn test_sql_content_hash_through_view_and_wildcard() {
         .position(|c| c == "content_hash")
         .unwrap();
     assert_eq!(out.rows[0][i].len(), 64);
+}
+
+#[test]
+fn test_sql_distinct_content_hash() {
+    let mut store = DocumentStore::new();
+    store.add_str("# A\n\nsame\n\n# B\n\nsame\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("SELECT DISTINCT content_hash, content FROM blocks WHERE block_type = 'paragraph'")
+        .unwrap();
+    assert_eq!(out.rows.len(), 1);
 }
