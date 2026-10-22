@@ -5,6 +5,8 @@ use super::value::{Row, Value};
 use crate::MqdbError;
 use crate::block::{Block, Properties, PropertyValue};
 use crate::document::Document;
+use rustc_hash::FxHashMap;
+use sha2::{Digest, Sha256};
 use sqlparser::ast::{ObjectName, ObjectNamePart, Value as SqlValue};
 
 fn pv_to_json(pv: &PropertyValue) -> String {
@@ -34,7 +36,96 @@ fn pairs_to_json<'a>(pairs: impl Iterator<Item = (&'a String, &'a PropertyValue)
     format!("{{{}}}", pairs.join(","))
 }
 
-pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32) -> Row {
+thread_local! {
+    /// Whether the running query may read `blocks.content_hash`. Defaults to
+    /// true so a query run outside `SqlEngine::execute` is never given a
+    /// placeholder.
+    pub(super) static QUERY_NEEDS_CONTENT_HASH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(true) };
+}
+
+/// Cheap text scan, conservative: any `*` other than in `count(*)` may expand
+/// to `content_hash`.
+pub(super) fn sql_needs_content_hash(sql: &str) -> bool {
+    let sql: String = sql
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    sql.contains("content_hash") || sql.replace("count(*)", "").contains('*')
+}
+
+/// SHA-256 over `block_type`, a NUL and `content`, as 64 hex digits.
+fn content_hash(block: &Block) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(block.block_type.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(block.content.as_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in hasher.finalize() {
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 0xf)] as char);
+    }
+    out
+}
+
+/// A location key for every block of `doc` that survives edits elsewhere.
+///
+/// A heading is its slug path (`guide/install`, repeated siblings get `-2`,
+/// `-3`). Any other block is `<section path>::<type>:<n>`, the `n`th block of
+/// that type directly under the section.
+pub(super) fn block_anchors(doc: &Document) -> Vec<String> {
+    #[derive(Default)]
+    struct Scope {
+        depth: u8,
+        path: String,
+        children: FxHashMap<String, usize>,
+        types: FxHashMap<&'static str, usize>,
+    }
+    let mut stack = vec![Scope::default()];
+    let mut anchors = Vec::with_capacity(doc.blocks.len());
+    for block in &doc.blocks {
+        if let Some(depth) = block.heading_depth() {
+            while stack.len() > 1 && stack.last().is_some_and(|s| s.depth >= depth) {
+                stack.pop();
+            }
+            let slug = match block.properties.get("slug") {
+                Some(PropertyValue::String(s)) if !s.is_empty() => s.clone(),
+                _ => block.content.to_lowercase(),
+            };
+            let parent = stack.last_mut().expect("root scope is never popped");
+            let n = parent.children.entry(slug.clone()).or_insert(0);
+            *n += 1;
+            let segment = if *n == 1 { slug } else { format!("{slug}-{n}") };
+            let path = if parent.path.is_empty() {
+                segment
+            } else {
+                format!("{}/{segment}", parent.path)
+            };
+            anchors.push(path.clone());
+            stack.push(Scope {
+                depth,
+                path,
+                ..Scope::default()
+            });
+        } else {
+            let scope = stack.last_mut().expect("root scope is never popped");
+            let ty = block.block_type.as_str();
+            let n = scope.types.entry(ty).or_insert(0);
+            *n += 1;
+            anchors.push(format!("{}::{ty}:{n}", scope.path));
+        }
+    }
+    anchors
+}
+
+pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32, anchor: &str) -> Row {
+    let hash = if QUERY_NEEDS_CONTENT_HASH.with(std::cell::Cell::get) {
+        Value::Str(content_hash(block))
+    } else {
+        Value::Null
+    };
     Row {
         columns: vec![
             "id".into(),
@@ -46,6 +137,8 @@ pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32) -> Row {
             "depth".into(),
             "lang".into(),
             "properties".into(),
+            "content_hash".into(),
+            "anchor".into(),
         ],
         values: vec![
             Value::Int(block_idx as i64),
@@ -57,6 +150,8 @@ pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32) -> Row {
             Value::Int(block.heading_depth().unwrap_or(0) as i64),
             Value::Str(block.code_lang().unwrap_or("").to_string()),
             Value::Str(properties_to_json(&block.properties)),
+            hash,
+            Value::Str(anchor.to_string()),
         ],
     }
 }

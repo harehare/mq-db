@@ -26,6 +26,7 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 mimalloc = {version = "0.1.48", optional = true}
 rustc-hash = "2"
+sha2 = "0.11"
 base64 = "0.23"
 regex = "1.13.1"
 fs2 = "0.4"

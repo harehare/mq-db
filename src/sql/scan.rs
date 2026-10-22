@@ -7,7 +7,10 @@ use super::join::{combine_rows, cross_join, hash_equi_join, null_extend_row, out
 use super::output::QueryOutput;
 use super::plan::{find_equi_join_exprs, zone_map_skip};
 use super::rewrite::fold_constants;
-use super::rows::{block_to_row, doc_to_row, ident_value, link_rows, qualify_row};
+use super::rows::{
+    QUERY_NEEDS_CONTENT_HASH, block_anchors, block_to_row, doc_to_row, ident_value, link_rows,
+    qualify_row, sql_needs_content_hash,
+};
 use super::value::{Row, Value};
 use crate::MqdbError;
 use crate::indexes::IndexHint;
@@ -170,6 +173,7 @@ impl<'a> SqlEngine<'a> {
                         global_idx += doc.blocks.len() as u32;
                         continue;
                     }
+                    let anchors = block_anchors(doc);
                     // Try index-based access first
                     if let Some(local_indices) = hint.resolve(doc_idx) {
                         // Only materialise the pre-filtered blocks
@@ -177,7 +181,12 @@ impl<'a> SqlEngine<'a> {
                             if let Some(block) = doc.blocks.get(local_i as usize) {
                                 let block_global_idx = global_idx + local_i;
                                 rows.push(qualify_row(
-                                    block_to_row(doc.id, block, block_global_idx),
+                                    block_to_row(
+                                        doc.id,
+                                        block,
+                                        block_global_idx,
+                                        &anchors[local_i as usize],
+                                    ),
                                     prefix,
                                 ));
                             }
@@ -186,7 +195,7 @@ impl<'a> SqlEngine<'a> {
                         // FullScan
                         for (i, block) in doc.blocks.iter().enumerate() {
                             rows.push(qualify_row(
-                                block_to_row(doc.id, block, global_idx + i as u32),
+                                block_to_row(doc.id, block, global_idx + i as u32, &anchors[i]),
                                 prefix,
                             ));
                         }
@@ -264,6 +273,10 @@ impl<'a> SqlEngine<'a> {
             )));
         }
         self.view_stack.borrow_mut().push(name.to_string());
+        let outer_needs_hash = QUERY_NEEDS_CONTENT_HASH.with(std::cell::Cell::get);
+        if sql_needs_content_hash(sql_text) {
+            QUERY_NEEDS_CONTENT_HASH.with(|c| c.set(true));
+        }
         let result = (|| {
             let stmts = Parser::parse_sql(&GenericDialect {}, sql_text)
                 .map_err(|e| MqdbError::SqlParse(e.to_string()))?;
@@ -276,6 +289,7 @@ impl<'a> SqlEngine<'a> {
             };
             self.exec_query(&query)
         })();
+        QUERY_NEEDS_CONTENT_HASH.with(|c| c.set(outer_needs_hash));
         self.view_stack.borrow_mut().pop();
         result
     }

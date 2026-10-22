@@ -3,7 +3,7 @@
 use super::fts::{BM25_CACHE, QUERY_HAS_BM25, QUERY_TOKENIZER};
 use super::output::QueryOutput;
 use super::plan::expr_str_val;
-use super::rows::ok_result;
+use super::rows::{QUERY_NEEDS_CONTENT_HASH, ok_result, sql_needs_content_hash};
 use crate::document::Document;
 use crate::indexes::DocumentIndex;
 use crate::store::DatabaseAlias;
@@ -117,6 +117,16 @@ impl<'a> SqlEngine<'a> {
         let prev_has_bm25 = QUERY_HAS_BM25.with(std::cell::Cell::get);
         QUERY_HAS_BM25.with(|c| c.set(trimmed.to_ascii_lowercase().contains("bm25(")));
         let _bm25_guard = Bm25QueryScope(prev_has_bm25);
+
+        struct ContentHashScope(bool);
+        impl Drop for ContentHashScope {
+            fn drop(&mut self) {
+                QUERY_NEEDS_CONTENT_HASH.with(|c| c.set(self.0));
+            }
+        }
+        let prev_needs_hash = QUERY_NEEDS_CONTENT_HASH.with(std::cell::Cell::get);
+        QUERY_NEEDS_CONTENT_HASH.with(|c| c.set(sql_needs_content_hash(trimmed)));
+        let _hash_guard = ContentHashScope(prev_needs_hash);
 
         match stmt {
             Statement::Query(q) => self.exec_query(&q),

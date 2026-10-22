@@ -3286,3 +3286,170 @@ fn test_sql_join_custom_table_text_key_to_block_id() {
         vec![vec!["beta".to_string()], vec!["One".to_string()]]
     );
 }
+
+#[test]
+fn test_sql_embeddings_keyed_by_content_hash() {
+    let hash_of = |md: &str, content: &str| {
+        let mut store = DocumentStore::new();
+        store.add_str(md).unwrap();
+        let engine = SqlEngine::new(&store).unwrap();
+        engine
+            .execute(&format!(
+                "SELECT content_hash FROM blocks WHERE content = '{content}'"
+            ))
+            .unwrap()
+            .rows[0][0]
+            .clone()
+    };
+    let alpha = hash_of("# One\n\nalpha\n", "alpha");
+
+    // `alpha` moved behind new content; `beta` has no embedding yet.
+    let mut store = DocumentStore::new();
+    store
+        .add_str("# New\n\nintro\n\n# One\n\nalpha\n\n# Two\n\nbeta\n")
+        .unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE TABLE emb (content_hash TEXT, embedding TEXT)")
+        .unwrap();
+    engine
+        .execute(&format!("INSERT INTO emb VALUES ('{alpha}', '[1,0]')"))
+        .unwrap();
+
+    let found = engine
+        .execute(
+            "SELECT b.content FROM emb e JOIN blocks b ON b.content_hash = e.content_hash \
+             ORDER BY cosine_similarity(e.embedding, '[1,0]') DESC",
+        )
+        .unwrap();
+    assert_eq!(found.rows, vec![vec!["alpha".to_string()]]);
+
+    let missing = engine
+        .execute(
+            "SELECT b.content FROM blocks b \
+             LEFT JOIN emb e ON b.content_hash = e.content_hash \
+             WHERE b.block_type = 'paragraph' AND e.content_hash IS NULL ORDER BY b.pre",
+        )
+        .unwrap();
+    assert_eq!(
+        missing.rows,
+        vec![vec!["intro".to_string()], vec!["beta".to_string()]]
+    );
+}
+
+fn anchors_of(md: &str) -> Vec<(String, String)> {
+    let mut store = DocumentStore::new();
+    store.add_str(md).unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("SELECT content, anchor FROM blocks ORDER BY pre")
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| (r[0].clone(), r[1].clone()))
+        .collect()
+}
+
+#[test]
+fn test_sql_block_anchor_paths() {
+    let got = anchors_of(
+        "intro\n\n# Guide\n\ntext\n\n## Install\n\na\n\n```sh\nx\n```\n\n## Install\n\nb\n\n# Guide\n\nc\n",
+    );
+    let anchors: Vec<&str> = got.iter().map(|(_, a)| a.as_str()).collect();
+    assert_eq!(
+        anchors,
+        vec![
+            "::paragraph:1",
+            "guide",
+            "guide::paragraph:1",
+            "guide/install",
+            "guide/install::paragraph:1",
+            "guide/install::code:1",
+            "guide/install-2",
+            "guide/install-2::paragraph:1",
+            "guide-2",
+            "guide-2::paragraph:1",
+        ]
+    );
+}
+
+#[test]
+fn test_sql_block_anchor_survives_unrelated_edits() {
+    let before = anchors_of("# A\n\none\n\n# B\n\ntwo\n");
+    let after = anchors_of("# New\n\nx\n\n# A\n\none\n\nmore\n\n# B\n\ntwo\n");
+    let find = |v: &[(String, String)], c: &str| v.iter().find(|(x, _)| x == c).unwrap().1.clone();
+    assert_eq!(find(&before, "two"), find(&after, "two"));
+    assert_eq!(find(&before, "one"), find(&after, "one"));
+}
+
+#[test]
+fn test_sql_content_hash_depends_on_type_and_content_only() {
+    let mut store = DocumentStore::new();
+    store
+        .add_str("# A\n\nsame\n\n# B\n\nsame\n\nother\n")
+        .unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let rows = engine
+        .execute(
+            "SELECT content, content_hash FROM blocks WHERE block_type = 'paragraph' ORDER BY pre",
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(rows[0][1], rows[1][1]);
+    assert_ne!(rows[0][1], rows[2][1]);
+    // SHA-256 of "paragraph\0same"; a change here invalidates stored keys.
+    assert_eq!(
+        rows[0][1],
+        "01d3ea3eebc4f7fbc779042206127485e0a9d81e8d4ca3efca038f1fda5ab3c1"
+    );
+}
+
+#[rstest]
+#[case("SELECT COUNT(*) FROM blocks", false)]
+#[case("SELECT count( * ) FROM blocks WHERE block_type = 'code'", false)]
+#[case("SELECT content FROM blocks", false)]
+#[case("SELECT content_hash FROM blocks", true)]
+#[case("SELECT b.CONTENT_HASH FROM blocks b", true)]
+#[case("SELECT * FROM blocks", true)]
+#[case("SELECT b.* FROM blocks b", true)]
+fn test_sql_needs_content_hash(#[case] sql: &str, #[case] expected: bool) {
+    assert_eq!(super::rows::sql_needs_content_hash(sql), expected);
+}
+
+#[test]
+fn test_sql_content_hash_through_view_and_wildcard() {
+    let mut store = DocumentStore::new();
+    store.add_str("# A\n\nsame\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE VIEW all_blocks AS SELECT * FROM blocks")
+        .unwrap();
+    for sql in [
+        "SELECT content_hash FROM blocks WHERE block_type = 'paragraph'",
+        "SELECT content_hash FROM all_blocks WHERE block_type = 'paragraph'",
+        "WITH t AS (SELECT content_hash AS h FROM blocks WHERE block_type = 'paragraph') SELECT h FROM t",
+    ] {
+        let rows = engine.execute(sql).unwrap().rows;
+        assert_eq!(rows[0][0].len(), 64, "{sql}");
+    }
+    let out = engine
+        .execute("SELECT * FROM blocks WHERE block_type = 'paragraph'")
+        .unwrap();
+    let i = out
+        .columns
+        .iter()
+        .position(|c| c == "content_hash")
+        .unwrap();
+    assert_eq!(out.rows[0][i].len(), 64);
+}
+
+#[test]
+fn test_sql_distinct_content_hash() {
+    let mut store = DocumentStore::new();
+    store.add_str("# A\n\nsame\n\n# B\n\nsame\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("SELECT DISTINCT content_hash, content FROM blocks WHERE block_type = 'paragraph'")
+        .unwrap();
+    assert_eq!(out.rows.len(), 1);
+}

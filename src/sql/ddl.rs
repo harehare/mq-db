@@ -107,6 +107,8 @@ impl<'a> SqlEngine<'a> {
                 ("depth", "integer"),
                 ("lang", "text"),
                 ("properties", "text"),
+                ("content_hash", "text"),
+                ("anchor", "text"),
             ]),
             "links" => Some(vec![
                 ("document_id", "integer"),
