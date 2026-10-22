@@ -38,12 +38,12 @@ pub(super) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             if a.len() != b.len() {
                 return Value::Null;
             }
-            let dot: f64 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+            let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
             match name.to_lowercase().as_str() {
                 "dot_product" => Value::Float(dot),
                 "l2_distance" => Value::Float(
                     a.iter()
-                        .zip(&b)
+                        .zip(b.iter())
                         .map(|(x, y)| (x - y).powi(2))
                         .sum::<f64>()
                         .sqrt(),
@@ -568,15 +568,39 @@ fn eval_mq_scalar(program: &str, content: &str) -> Value {
     }
 }
 
+type CachedVector = (String, std::rc::Rc<[f64]>);
+
+thread_local! {
+    /// The two most recently parsed vectors, most recent first. A similarity
+    /// query passes the same query vector for every row, so keeping it
+    /// alongside the current row's vector avoids re-parsing it each time.
+    static RECENT_VECTORS: std::cell::RefCell<Vec<CachedVector>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Parses a non-empty JSON array of numbers; `None` for anything else.
-fn parse_vector(value: &Value) -> Option<Vec<f64>> {
-    let serde_json::Value::Array(items) = serde_json::from_str(value.as_str()?).ok()? else {
-        return None;
-    };
-    if items.is_empty() {
+fn parse_vector(value: &Value) -> Option<std::rc::Rc<[f64]>> {
+    let text = value.as_str()?;
+    let hit = RECENT_VECTORS.with(|c| {
+        let mut recent = c.borrow_mut();
+        let pos = recent.iter().position(|(t, _)| t == text)?;
+        recent[..=pos].rotate_right(1);
+        Some(recent[0].1.clone())
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let parsed: Vec<f64> = serde_json::from_str(text).ok()?;
+    if parsed.is_empty() || !parsed.iter().all(|f| f.is_finite()) {
         return None;
     }
-    items.iter().map(serde_json::Value::as_f64).collect()
+    let vector: std::rc::Rc<[f64]> = parsed.into();
+    RECENT_VECTORS.with(|c| {
+        let mut recent = c.borrow_mut();
+        recent.insert(0, (text.to_string(), vector.clone()));
+        recent.truncate(2);
+    });
+    Some(vector)
 }
 
 /// Looks up `path` (`key`, `$.a.b`, `a[0].b`) in `json`.

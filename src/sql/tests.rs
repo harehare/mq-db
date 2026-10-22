@@ -3217,6 +3217,9 @@ fn test_sql_correlated_subquery_expression_forms(#[case] cond: &str, #[case] exp
 #[case("cosine_similarity('[]', '[]')", "NULL")]
 #[case("cosine_similarity('[1,\"a\"]', '[1,0]')", "NULL")]
 #[case("cosine_similarity('not json', '[1,0]')", "NULL")]
+#[case("dot_product('[+1,02]', '[3,4]')", "NULL")]
+#[case("dot_product('[.5,1.]', '[3,4]')", "NULL")]
+#[case("dot_product('[1,2,]', '[3,4]')", "NULL")]
 #[case("cosine_similarity(NULL, '[1,0]')", "NULL")]
 fn test_sql_vector_functions(#[case] expr: &str, #[case] expected: &str) {
     let store = DocumentStore::new();
