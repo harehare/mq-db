@@ -7,7 +7,10 @@ use super::join::{combine_rows, cross_join, hash_equi_join, null_extend_row, out
 use super::output::QueryOutput;
 use super::plan::{find_equi_join_exprs, zone_map_skip};
 use super::rewrite::fold_constants;
-use super::rows::{block_anchors, block_to_row, doc_to_row, ident_value, link_rows, qualify_row};
+use super::rows::{
+    QUERY_NEEDS_CONTENT_HASH, block_anchors, block_to_row, doc_to_row, ident_value, link_rows,
+    qualify_row, sql_needs_content_hash,
+};
 use super::value::{Row, Value};
 use crate::MqdbError;
 use crate::indexes::IndexHint;
@@ -270,6 +273,10 @@ impl<'a> SqlEngine<'a> {
             )));
         }
         self.view_stack.borrow_mut().push(name.to_string());
+        let outer_needs_hash = QUERY_NEEDS_CONTENT_HASH.with(std::cell::Cell::get);
+        if sql_needs_content_hash(sql_text) {
+            QUERY_NEEDS_CONTENT_HASH.with(|c| c.set(true));
+        }
         let result = (|| {
             let stmts = Parser::parse_sql(&GenericDialect {}, sql_text)
                 .map_err(|e| MqdbError::SqlParse(e.to_string()))?;
@@ -282,6 +289,7 @@ impl<'a> SqlEngine<'a> {
             };
             self.exec_query(&query)
         })();
+        QUERY_NEEDS_CONTENT_HASH.with(|c| c.set(outer_needs_hash));
         self.view_stack.borrow_mut().pop();
         result
     }

@@ -6,6 +6,7 @@ use crate::MqdbError;
 use crate::block::{Block, Properties, PropertyValue};
 use crate::document::Document;
 use rustc_hash::FxHashMap;
+use sha2::{Digest, Sha256};
 use sqlparser::ast::{ObjectName, ObjectNamePart, Value as SqlValue};
 
 fn pv_to_json(pv: &PropertyValue) -> String {
@@ -35,23 +36,38 @@ fn pairs_to_json<'a>(pairs: impl Iterator<Item = (&'a String, &'a PropertyValue)
     format!("{{{}}}", pairs.join(","))
 }
 
-/// FNV-1a over `block_type`, a NUL and `content`, as 16 hex digits.
-///
-/// Hand-rolled because the value is user-visible and must not change with
-/// the standard library or a dependency.
+thread_local! {
+    /// Whether the running query may read `blocks.content_hash`. Defaults to
+    /// true so a query run outside `SqlEngine::execute` is never given a
+    /// placeholder.
+    pub(super) static QUERY_NEEDS_CONTENT_HASH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(true) };
+}
+
+/// Cheap text scan, conservative: any `*` other than in `count(*)` may expand
+/// to `content_hash`.
+pub(super) fn sql_needs_content_hash(sql: &str) -> bool {
+    let sql: String = sql
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    sql.contains("content_hash") || sql.replace("count(*)", "").contains('*')
+}
+
+/// SHA-256 over `block_type`, a NUL and `content`, as 64 hex digits.
 fn content_hash(block: &Block) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in block
-        .block_type
-        .as_str()
-        .bytes()
-        .chain(std::iter::once(0))
-        .chain(block.content.bytes())
-    {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    let mut hasher = Sha256::new();
+    hasher.update(block.block_type.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(block.content.as_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in hasher.finalize() {
+        out.push(HEX[usize::from(b >> 4)] as char);
+        out.push(HEX[usize::from(b & 0xf)] as char);
     }
-    format!("{h:016x}")
+    out
 }
 
 /// A location key for every block of `doc` that survives edits elsewhere.
@@ -105,6 +121,11 @@ pub(super) fn block_anchors(doc: &Document) -> Vec<String> {
 }
 
 pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32, anchor: &str) -> Row {
+    let hash = if QUERY_NEEDS_CONTENT_HASH.with(std::cell::Cell::get) {
+        Value::Str(content_hash(block))
+    } else {
+        Value::Null
+    };
     Row {
         columns: vec![
             "id".into(),
@@ -129,7 +150,7 @@ pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32, anchor: &
             Value::Int(block.heading_depth().unwrap_or(0) as i64),
             Value::Str(block.code_lang().unwrap_or("").to_string()),
             Value::Str(properties_to_json(&block.properties)),
-            Value::Str(content_hash(block)),
+            hash,
             Value::Str(anchor.to_string()),
         ],
     }

@@ -3347,7 +3347,48 @@ fn test_sql_content_hash_depends_on_type_and_content_only() {
         .rows;
     assert_eq!(rows[0][1], rows[1][1]);
     assert_ne!(rows[0][1], rows[2][1]);
-    assert_eq!(rows[0][1].len(), 16);
-    // FNV-1a 64 of "paragraph\0same"; a change here invalidates stored keys.
-    assert_eq!(rows[0][1], "1c8d281685b6b265");
+    // SHA-256 of "paragraph\0same"; a change here invalidates stored keys.
+    assert_eq!(
+        rows[0][1],
+        "01d3ea3eebc4f7fbc779042206127485e0a9d81e8d4ca3efca038f1fda5ab3c1"
+    );
+}
+
+#[rstest]
+#[case("SELECT COUNT(*) FROM blocks", false)]
+#[case("SELECT count( * ) FROM blocks WHERE block_type = 'code'", false)]
+#[case("SELECT content FROM blocks", false)]
+#[case("SELECT content_hash FROM blocks", true)]
+#[case("SELECT b.CONTENT_HASH FROM blocks b", true)]
+#[case("SELECT * FROM blocks", true)]
+#[case("SELECT b.* FROM blocks b", true)]
+fn test_sql_needs_content_hash(#[case] sql: &str, #[case] expected: bool) {
+    assert_eq!(super::rows::sql_needs_content_hash(sql), expected);
+}
+
+#[test]
+fn test_sql_content_hash_through_view_and_wildcard() {
+    let mut store = DocumentStore::new();
+    store.add_str("# A\n\nsame\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE VIEW all_blocks AS SELECT * FROM blocks")
+        .unwrap();
+    for sql in [
+        "SELECT content_hash FROM blocks WHERE block_type = 'paragraph'",
+        "SELECT content_hash FROM all_blocks WHERE block_type = 'paragraph'",
+        "WITH t AS (SELECT content_hash AS h FROM blocks WHERE block_type = 'paragraph') SELECT h FROM t",
+    ] {
+        let rows = engine.execute(sql).unwrap().rows;
+        assert_eq!(rows[0][0].len(), 64, "{sql}");
+    }
+    let out = engine
+        .execute("SELECT * FROM blocks WHERE block_type = 'paragraph'")
+        .unwrap();
+    let i = out
+        .columns
+        .iter()
+        .position(|c| c == "content_hash")
+        .unwrap();
+    assert_eq!(out.rows[0][i].len(), 64);
 }
