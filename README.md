@@ -40,6 +40,8 @@ flowchart TD
 - **Zone Maps**: per-document statistics skip irrelevant files before scanning any blocks
 - **Dual query engines**: SQL via a custom `sqlparser`-based evaluator, and `mq` via `mq-lang`
 - **`WITH` / `WITH RECURSIVE` support**: common table expressions, usable in `FROM`, `JOIN`, and subqueries; recursive CTEs via iterative fixed-point evaluation
+- **Knowledge-base columns**: `documents.properties` (front matter as JSON), a `links` table, and stable block keys `blocks.content_hash` / `blocks.anchor`
+- **Vector search**: `cosine_similarity()` / `dot_product()` / `l2_distance()` over embeddings you load with `read_json`, see [Vector Search](https://db.mqlang.org/book/reference/vector-search)
 - **Full-text search**: `match()`/`score()`/`bm25()` SQL functions backed by a persisted per-document inverted index
 - **`EXPLAIN` / `EXPLAIN ANALYZE`**: see the zone-map/index/join plan a query resolves to, with actual row/timing stats under `ANALYZE`
 - **Incremental re-indexing**: re-running `index` skips unchanged files (content-hash based), replaces changed ones in place (same `DocumentId`), and can `--prune` deleted ones
