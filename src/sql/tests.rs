@@ -3492,3 +3492,20 @@ fn test_sql_order_by_mixed_null_and_numbers_is_total() {
         .collect();
     assert!(nums.windows(2).all(|w| w[0] >= w[1]));
 }
+
+#[test]
+fn test_sql_order_by_mixed_integer_and_numeric_string_keys() {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine.execute("CREATE TABLE v (name TEXT)").unwrap();
+    engine
+        .execute("INSERT INTO v VALUES ('first'), ('second'), ('third')")
+        .unwrap();
+    let out = engine
+        .execute(
+            "SELECT name FROM v ORDER BY CASE WHEN name = 'first' THEN 10 ELSE '2' END ASC, name",
+        )
+        .unwrap();
+    let names: Vec<&str> = out.rows.iter().map(|r| r[0].as_str()).collect();
+    assert_eq!(names, vec!["second", "third", "first"]);
+}
