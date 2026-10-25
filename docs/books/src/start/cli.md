@@ -96,22 +96,6 @@ mq-db repl --db store.mq-db --mode sql
 
 See [REPL](repl.md) for the full command list.
 
-## `lint`
-
-Run structural lint checks (currently: a heading at the given depth immediately followed by a list).
-
-```bash
-mq-db lint --db store.mq-db --depth 2
-```
-
-```text
-✗  1 violation  (H2 immediately followed by list)
-
-  file                                      heading
-  ────────────────────────────────────────  ──────────────────────────────
-  docs/DESIGN.md                            "Quick Start"
-```
-
 ## `stats`
 
 Show store-wide statistics: document/block counts, block-type distribution, code-language distribution.

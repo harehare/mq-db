@@ -93,7 +93,6 @@ use crate::{
     error::MqdbError,
     index,
     indexes::{DocumentIndex, TokenizerKind},
-    query::Query,
     storage::{
         Storage,
         catalog::{CatalogEntry, CustomTableEntry, ViewEntry},
@@ -199,9 +198,7 @@ impl VacuumReport {
 /// let mut store = DocumentStore::new();
 /// store.add_str("# Hello\n\nWorld").unwrap();
 ///
-/// let results = store.query().heading_depth(1).blocks();
-/// assert_eq!(results.len(), 1);
-/// assert_eq!(results[0].content, "Hello");
+/// assert_eq!(store.len(), 1);
 /// ```
 pub struct DocumentStore {
     documents: Vec<Document>,
@@ -738,11 +735,6 @@ impl DocumentStore {
     /// Returns `true` if the store contains no documents.
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
-    }
-
-    /// Creates a new query builder backed by this store.
-    pub fn query(&self) -> Query<'_> {
-        Query::new(self)
     }
 
     /// Aggregate block-type / code-language statistics across every

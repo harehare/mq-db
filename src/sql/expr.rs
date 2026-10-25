@@ -288,7 +288,10 @@ fn eval_binary(left: &Expr, op: &BinaryOperator, right: &Expr, row: &Row) -> Val
         BinaryOperator::Minus => arith_op(left, right, row, |a, b| a - b, |a, b| a - b),
         BinaryOperator::Multiply => arith_op(left, right, row, |a, b| a * b, |a, b| a * b),
         BinaryOperator::Divide => {
-            let (l, r) = (eval_expr(left, row), eval_expr(right, row));
+            let (l, r) = (
+                numeric(eval_expr(left, row)),
+                numeric(eval_expr(right, row)),
+            );
             match (&l, &r) {
                 (Value::Int(a), Value::Int(b)) if *b != 0 => Value::Int(a / b),
                 _ => match (l.as_f64(), r.as_f64()) {
@@ -315,6 +318,23 @@ fn cmp_op(l: &Expr, r: &Expr, row: &Row, f: impl Fn(std::cmp::Ordering) -> bool)
     )
 }
 
+/// A string holding a number, such as a custom table cell, as that number.
+/// Anything else is returned unchanged.
+fn numeric(v: Value) -> Value {
+    match &v {
+        Value::Str(s) => {
+            if let Ok(n) = s.trim().parse::<i64>() {
+                Value::Int(n)
+            } else if let Some(f) = s.trim().parse::<f64>().ok().filter(|f| f.is_finite()) {
+                Value::Float(f)
+            } else {
+                v
+            }
+        }
+        _ => v,
+    }
+}
+
 fn arith_op(
     l: &Expr,
     r: &Expr,
@@ -322,7 +342,7 @@ fn arith_op(
     int_f: impl Fn(i64, i64) -> i64,
     flt_f: impl Fn(f64, f64) -> f64,
 ) -> Value {
-    let (lv, rv) = (eval_expr(l, row), eval_expr(r, row));
+    let (lv, rv) = (numeric(eval_expr(l, row)), numeric(eval_expr(r, row)));
     match (&lv, &rv) {
         (Value::Int(a), Value::Int(b)) => Value::Int(int_f(*a, *b)),
         _ => match (lv.as_f64(), rv.as_f64()) {

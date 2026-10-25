@@ -16,38 +16,20 @@
 //!   slugs, code languages, front-matter keys/tags) that let the query
 //!   engine skip irrelevant documents before scanning their blocks.
 //!
-//! * **Chainable query API** – document-level and block-level predicates,
-//!   `UNDER heading` section scoping, built-in linter helpers.
-//!
 //! ## Quick Start
 //!
 //! ```rust
-//! use mq_db::{DocumentStore, block::BlockType};
+//! use mq_db::{DocumentStore, SqlEngine};
 //!
 //! let mut store = DocumentStore::new();
-//! store.add_str("# Hello\n\n## Architecture\n\nDetails\n\n```rust\ncode\n```\n").unwrap();
+//! store.add_str("# Hello\n\n## Architecture\n\nDetails\n").unwrap();
 //!
-//! // Extract all content under the "Architecture" H2
-//! let chunks = store.query()
-//!     .under_heading("Architecture", Some(2))
-//!     .filter(|b| matches!(b.block_type, BlockType::Paragraph | BlockType::Code))
-//!     .blocks();
+//! let engine = SqlEngine::new(&store).unwrap();
+//! let out = engine
+//!     .execute("SELECT content FROM blocks WHERE block_type = 'heading' ORDER BY pre")
+//!     .unwrap();
 //!
-//! assert_eq!(chunks.len(), 2);
-//! ```
-//!
-//! ## Structural Linting
-//!
-//! ```rust
-//! use mq_db::{DocumentStore, block::BlockType};
-//!
-//! let mut store = DocumentStore::new();
-//! store.add_str("## Section\n\n- item without intro paragraph\n").unwrap();
-//!
-//! let q = store.query();
-//! let violations = q.lint_heading_followed_by(2, &[BlockType::List]);
-//!
-//! assert_eq!(violations.len(), 1);
+//! assert_eq!(out.rows.len(), 2);
 //! ```
 
 pub mod block;
@@ -57,7 +39,6 @@ pub mod error;
 pub mod index;
 pub mod indexes;
 pub mod mq_engine;
-pub mod query;
 pub mod search;
 pub mod sql;
 pub mod storage;
@@ -67,7 +48,6 @@ pub mod tui;
 pub use document::Document;
 pub use error::MqdbError;
 pub use mq_engine::MqEngine;
-pub use query::{LintViolation, Query, QueryResult};
 pub use sql::{QueryOutput, SqlEngine};
 pub use storage::Storage;
 pub use storage::catalog::CatalogEntry;

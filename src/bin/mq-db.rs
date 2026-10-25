@@ -187,17 +187,6 @@ enum Commands {
         attach: Vec<String>,
     },
 
-    /// Run structural lint checks
-    Lint {
-        /// Path to .mq-db store file
-        #[arg(short, long, default_value = "store.mq-db")]
-        db: PathBuf,
-
-        /// Heading depth to check (H1=1 .. H6=6)
-        #[arg(long, default_value_t = 2)]
-        depth: u8,
-    },
-
     /// Show store statistics
     Stats {
         /// Path to .mq-db store file
@@ -894,43 +883,6 @@ async fn main() -> anyhow::Result<()> {
             run_repl(store, mode, write_back)?;
         }
 
-        // lint
-        Commands::Lint { db, depth } => {
-            let store = load_store(&db)?;
-            let q = store.query();
-            let violations = q.lint_heading_followed_by(depth, &[BlockType::List]);
-            if violations.is_empty() {
-                println!(
-                    "✓  No violations  (H{} must not be immediately followed by a list)",
-                    depth
-                );
-            } else {
-                let n = violations.len();
-                println!(
-                    "✗  {} violation{}  (H{} immediately followed by list)\n",
-                    n,
-                    if n == 1 { "" } else { "s" },
-                    depth
-                );
-                println!("  {:<40}  heading", "file");
-                println!("  {}  {}", "─".repeat(40), "─".repeat(30));
-                for v in &violations {
-                    let path = v
-                        .document
-                        .path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| format!("<doc {}>", v.document.id));
-                    let path_display = if path.len() > 40 {
-                        format!("…{}", &path[path.len() - 39..])
-                    } else {
-                        path
-                    };
-                    println!("  {:<40}  \"{}\"", path_display, v.heading.content);
-                }
-            }
-        }
-
         // stats
         Commands::Stats { db } => {
             let store = load_store(&db)?;
@@ -1473,27 +1425,9 @@ fn md_block_to_html(s: &str) -> String {
 
 // REPL
 
-/// Crude prefix check used to gate write-back before even attempting a
-/// parse. Only `INSERT INTO blocks` requires `--write-back`; custom tables
-/// don't touch Markdown files.
+/// Whether `sql` writes to Markdown files and so needs `--write-back`.
 fn is_write_statement(sql: &str) -> bool {
-    let trimmed = sql.trim().trim_end_matches(';');
-    let upper = trimmed.to_ascii_uppercase();
-    upper.starts_with("UPDATE ") || upper.starts_with("DELETE ") || is_insert_into_blocks(&upper)
-}
-
-fn is_insert_into_blocks(upper: &str) -> bool {
-    let Some(after_into) = upper.strip_prefix("INSERT INTO") else {
-        return false;
-    };
-    let table = after_into
-        .trim_start()
-        .trim_start_matches(['"', '`'])
-        .trim_start();
-    table == "BLOCKS"
-        || ["BLOCKS ", "BLOCKS(", "BLOCKS\"", "BLOCKS`"]
-            .iter()
-            .any(|p| table.starts_with(p))
+    mq_db::sql::statement_needs_write_back(sql)
 }
 
 fn run_repl(
