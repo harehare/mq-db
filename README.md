@@ -82,7 +82,7 @@ print!("{}", out.to_table());
 
 ## Documentation
 
-- [Install](https://db.mqlang.org/book/start/install) and [CLI](https://db.mqlang.org/book/start/cli) (`index`, `find`, `lint`, `stats`, `vacuum`, …)
+- [Install](https://db.mqlang.org/book/start/install) and [CLI](https://db.mqlang.org/book/start/cli) (`index`, `find`, `stats`, `vacuum`, …)
 - [Library API](https://db.mqlang.org/book/start/library), [HTTP server](https://db.mqlang.org/book/start/http-server)
 - [SQL schema](https://db.mqlang.org/book/reference/sql-schema), [functions](https://db.mqlang.org/book/reference/sql-functions) and [examples](https://db.mqlang.org/book/reference/sql-examples)
 - [Block model](https://db.mqlang.org/book/reference/block-model), [index layers](https://db.mqlang.org/book/reference/index-layers) and [storage format](https://db.mqlang.org/book/reference/storage-format)
