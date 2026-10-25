@@ -8,19 +8,12 @@ mq-db = "0.1"
 ```
 
 ```rust
-use mq_db::{DocumentStore, SqlEngine, MqEngine, block::BlockType};
+use mq_db::{DocumentStore, SqlEngine, MqEngine};
 
 // Build in memory
 let mut store = DocumentStore::new();
 store.add_file("docs/DESIGN.md")?;
 store.add_str("# Hello\n\n## Architecture\n\nDetails\n")?;
-
-// Chainable query API: zone-map skip + interval scope + block predicates
-let chunks = store.query()
-    .documents(|doc| doc.zone_maps.heading_contents.contains("Architecture"))
-    .under_heading("Architecture", Some(2))
-    .filter(|b| matches!(b.block_type, BlockType::Paragraph | BlockType::Code))
-    .blocks();
 
 // SQL engine (custom sqlparser-based evaluator, no SQLite dependency)
 let engine = SqlEngine::new(&store)?;
@@ -31,9 +24,6 @@ print!("{}", out.to_table());
 
 // mq engine
 let results = MqEngine::eval_store(".h1", &store)?;
-
-// Structural lint
-let violations = store.query().lint_heading_followed_by(2, &[BlockType::List]);
 
 // UPDATE/DELETE with write-back: rewrites the affected block's source file
 // (heading/paragraph content only), then re-parses it in place
@@ -66,14 +56,3 @@ let store = DocumentStore::load_catalog_only("store.mq-db")?;
 | `DocumentStore::load_catalog_only()` | Catalog only | `list` / `stats`-style metadata commands |
 
 When using `open()`, call `load_all_blocks()` and `load_all_indexes()` before running any `SqlEngine` query.
-
-## Query builder
-
-`store.query()` returns a chainable builder that applies the same three index layers used by the SQL engine, in order:
-
-1. `.documents(|doc| ...)`: zone-map predicate, skips whole documents
-2. `.under_heading(title, depth)` / interval-scope helpers: narrows to a `(pre, post)` range
-3. `.filter(|block| ...)`: per-block predicate over the remaining candidates
-4. `.blocks()`: materializes the final `Vec<&Block>`
-
-See [Index Layers](../reference/index-layers.md) for how each layer works.

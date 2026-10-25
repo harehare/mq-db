@@ -187,17 +187,6 @@ enum Commands {
         attach: Vec<String>,
     },
 
-    /// Run structural lint checks
-    Lint {
-        /// Path to .mq-db store file
-        #[arg(short, long, default_value = "store.mq-db")]
-        db: PathBuf,
-
-        /// Heading depth to check (H1=1 .. H6=6)
-        #[arg(long, default_value_t = 2)]
-        depth: u8,
-    },
-
     /// Show store statistics
     Stats {
         /// Path to .mq-db store file
@@ -892,43 +881,6 @@ async fn main() -> anyhow::Result<()> {
             let store = open_store_for_sql(&db)?;
             attach_all(&store, &attach)?;
             run_repl(store, mode, write_back)?;
-        }
-
-        // lint
-        Commands::Lint { db, depth } => {
-            let store = load_store(&db)?;
-            let q = store.query();
-            let violations = q.lint_heading_followed_by(depth, &[BlockType::List]);
-            if violations.is_empty() {
-                println!(
-                    "✓  No violations  (H{} must not be immediately followed by a list)",
-                    depth
-                );
-            } else {
-                let n = violations.len();
-                println!(
-                    "✗  {} violation{}  (H{} immediately followed by list)\n",
-                    n,
-                    if n == 1 { "" } else { "s" },
-                    depth
-                );
-                println!("  {:<40}  heading", "file");
-                println!("  {}  {}", "─".repeat(40), "─".repeat(30));
-                for v in &violations {
-                    let path = v
-                        .document
-                        .path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| format!("<doc {}>", v.document.id));
-                    let path_display = if path.len() > 40 {
-                        format!("…{}", &path[path.len() - 39..])
-                    } else {
-                        path
-                    };
-                    println!("  {:<40}  \"{}\"", path_display, v.heading.content);
-                }
-            }
         }
 
         // stats

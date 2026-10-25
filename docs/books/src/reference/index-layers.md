@@ -31,8 +31,6 @@ Built once per document and stored in the `.mq-db` file. Checked before any bloc
 | `depth = N` (`N > 0`) | `N` exceeds `max_heading_depth` |
 | `block_type = 'heading' AND content = 'X'` | `heading_contents` has no case-insensitive match for `X` |
 
-**Via the Rust API**: `store.query().documents(|doc| ...)` lets you filter on *any* zone-map field yourself (`heading_slugs`, `frontmatter_keys`, `title`, `tags`, …), not just the patterns `SqlEngine` recognizes automatically.
-
 ## Layer 2: Interval Index (section hierarchy)
 
 Heading hierarchy is encoded as `(pre, post)` pairs via Pre-Post Order (Nested Set) traversal:
