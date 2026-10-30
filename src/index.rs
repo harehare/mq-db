@@ -6,10 +6,10 @@ use crate::block::{Block, BlockId, BlockType, DocumentId, Properties, PropertyVa
 
 fn node_to_span(node: &Node) -> Option<Span> {
     node.position().map(|p| Span {
-        start_line: p.start.line,
-        start_col: p.start.column,
-        end_line: p.end.line,
-        end_col: p.end.column,
+        start_line: p.start.line as usize,
+        start_col: p.start.column as usize,
+        end_line: p.end.line as usize,
+        end_col: p.end.column as usize,
     })
 }
 
@@ -17,7 +17,7 @@ fn node_to_span(node: &Node) -> Option<Span> {
 
 fn heading_depth(node: &Node) -> Option<u8> {
     if let Node::Heading(h) = node {
-        Some(h.depth)
+        Some(h.depth.get())
     } else {
         None
     }
@@ -86,7 +86,7 @@ fn node_to_parts(node: &Node) -> Option<(BlockType, String, Properties)> {
 
     match node {
         Node::Heading(h) => {
-            props.set("depth", PropertyValue::Int(h.depth as i64));
+            props.set("depth", PropertyValue::Int(i64::from(h.depth)));
             let content: String = h.values.iter().map(|n| n.value()).collect();
             let slug = content
                 .to_lowercase()
