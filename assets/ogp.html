@@ -16,15 +16,16 @@
 />
 <style>
   :root {
-    /* dark ("manuscript by candlelight") palette — matches docs/index.html
-       @media (prefers-color-scheme: dark) :root values */
+    /* dark palette — matches docs/index.html @media (prefers-color-scheme: dark) */
     --c-paper: #1b1714;
     --c-paper-alt: #231e1a;
     --c-paper-deep: #383028;
+    --c-line: #2c2620;
+    --c-term: #131010;
     --c-ink: #ece4d8;
     --c-ink-dim: #a89c8c;
+    --c-ink-faint: #6b6156;
     --c-accent: #d9714f;
-    --c-accent-hover: #e68c6c;
     --c-mark: #d6a84c;
   }
   * { box-sizing: border-box; }
@@ -36,132 +37,118 @@
     color: var(--c-ink);
     overflow: hidden;
   }
-  /* Social platforms crop og:image to varying aspect ratios (2:1, 1.91:1, and
-     square thumbnails on some unfurlers) before display, trimming from every
-     edge. Keep all content inside a safe area well clear of the 1200x630
-     bounds so nothing load-bearing (logo, headline) gets clipped. */
-  .card {
-    width: 1200px;
-    height: 630px;
-    padding: 64px 76px 56px;
-    display: flex;
-    flex-direction: column;
-    position: relative;
-  }
-  .topbar {
-    display: flex;
-    align-items: center;
-  }
+  .abs { position: absolute; }
+  .mono { font-family: "JetBrains Mono", monospace; }
+
+  /* left column: x 60..600 */
+  .logo { left: 39px; top: 98px; width: 118px; height: 118px; }
   .brand {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-  .brand span {
+    left: 164px; top: 112px;
     font-family: "Space Grotesk", sans-serif;
-    font-weight: 700;
-    font-size: 26px;
+    font-weight: 700; font-size: 84px; line-height: 1;
+    letter-spacing: -0.03em;
+  }
+  .tagline {
+    left: 60px; top: 264px;
+    font-family: "Space Grotesk", sans-serif;
+    font-weight: 700; font-size: 40px; line-height: 1.2;
     letter-spacing: -0.02em;
-    color: var(--c-ink);
   }
-  h1 {
-    font-family: "Space Grotesk", sans-serif;
-    font-weight: 700;
-    font-size: 56px;
-    line-height: 1.1;
-    letter-spacing: -0.025em;
-    margin: 30px 0 20px;
-    max-width: 920px;
-  }
-  h1 em {
-    font-style: normal;
-    color: var(--c-accent);
-  }
-  p.tagline {
-    font-family: "Inter", sans-serif;
-    font-size: 20px;
-    line-height: 1.55;
+  .tagline em { font-style: normal; color: var(--c-accent); }
+  .desc {
+    left: 60px; top: 394px; width: 540px;
+    font-size: 20px; line-height: 28px;
     color: var(--c-ink-dim);
-    max-width: 780px;
-    margin: 0 0 28px;
   }
-  p.tagline b {
-    color: var(--c-ink);
-    font-weight: 600;
-  }
-  .panel {
+  .desc b { color: var(--c-ink); font-weight: 600; }
+  .cmd {
+    left: 60px; top: 472px; height: 48px;
+    padding: 0 22px;
+    display: flex; align-items: center; gap: 10px;
     border: 1px solid var(--c-paper-deep);
-    border-radius: 10px;
+    border-radius: 4px;
+    background: var(--c-paper-alt);
+    font-size: 17px; font-weight: 500;
+  }
+  .cmd .p, .term .p { color: var(--c-accent); }
+
+  /* right column: card x 664..1154, y 65..565 */
+  .card {
+    left: 664px; top: 65px; width: 490px; height: 500px;
+    border: 1px solid var(--c-paper-deep);
+    border-radius: 8px;
     background: var(--c-paper-alt);
     overflow: hidden;
-    box-shadow: 0 1px 2px rgba(42,36,32,0.06);
   }
-  .panel-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 20px;
+  .card-head {
+    height: 45px; padding: 0 24px;
+    display: flex; align-items: center; justify-content: space-between;
     border-bottom: 1px solid var(--c-paper-deep);
+    font-size: 14px; color: var(--c-ink-dim);
   }
-  .dots { display: flex; gap: 7px; }
-  .dots span {
-    width: 10px; height: 10px; border-radius: 50%;
-    background: var(--c-ink-dim); opacity: 0.35;
+  .card-head .tag { color: var(--c-mark); }
+  .rows { padding: 0 24px; }
+  .row {
+    height: 66px;
+    display: flex; align-items: center; gap: 14px;
+    border-bottom: 1px solid var(--c-line);
+    font-size: 20px; font-weight: 500;
   }
-  .panel-head .label {
-    font-family: "Inter", sans-serif;
-    font-size: 13px;
-    color: var(--c-ink-dim);
+  .row:last-child { border-bottom: 0; }
+  .row .bar { width: 4px; height: 26px; border-radius: 2px; background: transparent; }
+  .row .name { flex: 1; }
+  .row .iv { font-size: 14px; font-weight: 400; color: var(--c-ink-dim); }
+  .row.sec .name { font-weight: 700; color: var(--c-ink); }
+  .row.sec .bar { background: var(--c-mark); }
+  .row.in .name { padding-left: 24px; }
+  .row.in .bar { background: var(--c-accent); }
+  .row.in .iv { color: var(--c-accent); }
+  .row.out .name, .row.out .iv { color: var(--c-ink-faint); }
+
+  .term {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 145px;
+    padding: 24px 24px 0;
+    background: var(--c-term);
   }
-  .panel-head .tag {
-    font-family: "JetBrains Mono", monospace;
-    font-size: 13px;
-    color: var(--c-mark);
-  }
-  pre {
-    margin: 0;
-    padding: 20px 24px 22px;
-    font-family: "JetBrains Mono", monospace;
-    font-size: 15px;
-    line-height: 1.62;
-    white-space: pre;
-  }
-  .kw { color: var(--c-accent); }
-  .str { color: var(--c-mark); }
-  .cm { color: var(--c-ink-dim); font-style: italic; }
+  .term .l1 { font-size: 16px; color: var(--c-ink); white-space: nowrap; }
+  .term .out { margin-top: 18px; font-size: 15px; line-height: 24px; color: var(--c-ink-dim); white-space: pre; }
+  .term .out b { color: var(--c-ink); font-weight: 400; }
 </style>
 </head>
 <body>
-  <div class="card">
-    <div class="topbar">
-      <div class="brand">
-        <svg width="34" height="34" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-          <ellipse cx="50" cy="78" rx="32" ry="12" fill="#B3402C"/>
-          <rect x="18" y="28" width="64" height="50" fill="#B3402C"/>
-          <ellipse cx="50" cy="28" rx="32" ry="12" fill="#B3402C"/>
-          <path d="M30 66 L30 46 L40 58 L50 46 L60 58 L70 46 L70 66" fill="none" stroke="#FAF6EF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <span>mq-db</span>
-      </div>
+  <svg class="abs logo" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+    <ellipse cx="50" cy="78" rx="32" ry="12" fill="#B3402C"/>
+    <rect x="18" y="28" width="64" height="50" fill="#B3402C"/>
+    <ellipse cx="50" cy="28" rx="32" ry="12" fill="#B3402C"/>
+    <path d="M30 66 L30 46 L40 58 L50 46 L60 58 L70 46 L70 66" fill="none" stroke="#FAF6EF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <div class="abs brand">mq-db</div>
+
+  <div class="abs tagline">Your Markdown is<br />already <em>a database.</em></div>
+
+  <div class="abs desc">
+    Interval-indexed block storage for Markdown.<br />
+    Query it with <b>SQL</b> or <b>mq</b>. No SQLite dependency.
+  </div>
+
+  <div class="abs cmd mono"><span class="p">$</span><span>mq-db sql "SELECT …"</span></div>
+
+  <div class="abs card">
+    <div class="card-head mono">
+      <span>architecture.md</span>
+      <span class="tag">under()</span>
     </div>
-
-    <h1>Your Markdown is<br />already <em>a database.</em></h1>
-
-    <p class="tagline">
-      Interval-indexed block storage for Markdown — query it with <b>SQL</b> or <b>mq</b>,
-      persist it to a compact page-file format. No SQLite dependency.
-    </p>
-
-    <div class="panel">
-      <div class="panel-head">
-        <div class="dots"><span></span><span></span><span></span></div>
-        <div class="label">sql&gt; every block nested under a heading, in one comparison</div>
-        <div class="tag">under()</div>
-      </div>
-      <pre><span class="cm">-- all blocks nested under the "Architecture" heading</span>
-<span class="kw">SELECT</span> block_type, content <span class="kw">FROM</span> blocks
-<span class="kw">WHERE</span> under(pre, post, arch.pre, arch.post)
-<span class="kw">ORDER BY</span> pre;</pre>
+    <div class="rows mono">
+      <div class="row sec"><span class="bar"></span><span class="name"># Architecture</span><span class="iv">1 · 8</span></div>
+      <div class="row in"><span class="bar"></span><span class="name">## Storage</span><span class="iv">2 · 5</span></div>
+      <div class="row in"><span class="bar"></span><span class="name">## Indexing</span><span class="iv">6 · 7</span></div>
+      <div class="row out"><span class="bar"></span><span class="name"># Roadmap</span><span class="iv">9 · 12</span></div>
+    </div>
+    <div class="term mono">
+      <div class="l1"><span class="p">$</span> mq-db sql "… WHERE under(…)"</div>
+      <div class="out"><b>block_type  content</b>
+heading     Storage
+heading     Indexing</div>
     </div>
   </div>
 </body>
