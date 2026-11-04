@@ -38,7 +38,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
       - uses: Swatinem/rust-cache@v2.9.3
       - name: Install tools
-        uses: taiki-e/install-action@v2.87.32
+        uses: taiki-e/install-action@v2.88.0
         with:
           tool: nextest,cargo-llvm-cov
       - name: Run tests
