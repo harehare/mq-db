@@ -6,6 +6,10 @@ workflows:
     '.github/workflows/audit.yml':
         - 'actions/checkout@v7.0.1'
         - 'rustsec/audit-check@v2.0.0'
+    '.github/workflows/cargo-publish.yml':
+        - 'actions-rust-lang/setup-rust-toolchain@v2.0.0'
+        - 'actions/checkout@v7.0.1'
+        - 'rust-lang/crates-io-auth-action@v1.0.6'
     '.github/workflows/ci.yml':
         - 'actions-rust-lang/setup-rust-toolchain@v2.0.0'
         - 'actions/checkout@v7.0.1'
@@ -72,6 +76,11 @@ dependencies:
         commit: 'sha1-9b3254085494b55a0f7c4c2b3d2d52cc712ce370'
         owner_id: 9919
         repo_id: 259445878
+    'rust-lang/crates-io-auth-action@v1.0.6':
+        ref: 'v1.0.6'
+        commit: 'sha1-3268eb413133e2960fa4ae0e963ca76380c54cd9'
+        owner_id: 5430905
+        repo_id: 1008931044
     'rustsec/audit-check@v2.0.0':
         ref: 'v2.0.0'
         commit: 'sha1-69366f33c96575abad1ee0dba8212993eecbe998'
