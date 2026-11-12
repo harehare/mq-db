@@ -265,7 +265,7 @@ pub(super) fn fold_constants(expr: &Expr) -> Expr {
         return folded;
     }
     let dummy = Row {
-        columns: vec![],
+        columns: vec![].into(),
         values: vec![],
     };
     value_to_expr(&eval_expr(&folded, &dummy))

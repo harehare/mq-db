@@ -384,7 +384,7 @@ fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
     };
 
     let empty = Row {
-        columns: vec![],
+        columns: vec![].into(),
         values: vec![],
     };
     rows.iter()

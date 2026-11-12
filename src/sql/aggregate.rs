@@ -312,7 +312,7 @@ fn eval_agg_expr_value(
 ) -> Value {
     let substituted = substitute_having_expr(expr, group_by_exprs, key_vals, group_rows);
     let dummy = Row {
-        columns: vec![],
+        columns: vec![].into(),
         values: vec![],
     };
     eval_expr(&substituted, &dummy)

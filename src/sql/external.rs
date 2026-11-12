@@ -99,7 +99,7 @@ fn read_csv_rows(path: &str, prefix: &str) -> Result<Vec<Row>, MqdbError> {
                 .collect();
             qualify_row(
                 Row {
-                    columns: header.clone(),
+                    columns: header.clone().into(),
                     values,
                 },
                 prefix,
@@ -163,7 +163,7 @@ fn read_json_rows(path: &str, prefix: &str) -> Result<Vec<Row>, MqdbError> {
                 .collect();
             qualify_row(
                 Row {
-                    columns: columns.clone(),
+                    columns: columns.clone().into(),
                     values,
                 },
                 prefix,

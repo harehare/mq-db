@@ -42,7 +42,7 @@ fn target(twj: &TableWithJoins) -> Result<(String, String), MqdbError> {
 fn row_of(columns: &[String], cells: &[String], prefix: &str) -> Row {
     qualify_row(
         Row {
-            columns: columns.to_vec(),
+            columns: columns.to_vec().into(),
             values: cells.iter().map(|c| Value::Str(c.clone())).collect(),
         },
         prefix,

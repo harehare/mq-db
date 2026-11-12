@@ -183,7 +183,7 @@ pub(super) fn value_join_key(v: &Value) -> Option<JoinKey> {
 
 #[derive(Debug, Clone)]
 pub(super) struct Row {
-    pub(super) columns: Vec<String>,
+    pub(super) columns: std::sync::Arc<[String]>,
     pub(super) values: Vec<Value>,
 }
 

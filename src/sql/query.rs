@@ -223,7 +223,7 @@ impl<'a> SqlEngine<'a> {
             SetExpr::Select(select) => self.exec_select(select, &None, None, None),
             SetExpr::Values(Values { rows, .. }) => {
                 let empty = Row {
-                    columns: vec![],
+                    columns: vec![].into(),
                     values: vec![],
                 };
                 let out: Vec<Vec<String>> = rows
@@ -308,7 +308,7 @@ impl<'a> SqlEngine<'a> {
         // than false-reject; the tradeoff is a real typo against an empty
         // table still silently passing, same as before this check existed.
         let known_columns: Vec<String> =
-            rows.first().map(|r| r.columns.clone()).unwrap_or_default();
+            rows.first().map(|r| r.columns.to_vec()).unwrap_or_default();
         if !known_columns.is_empty() {
             if let Some(where_expr) = &select.selection {
                 validate_expr_columns(where_expr, &known_columns)?;
@@ -451,7 +451,7 @@ impl<'a> SqlEngine<'a> {
                 let out = self.exec_query(&q)?;
                 let needle_expr = self.resolve_subqueries(e, outer_row)?;
                 let empty = Row {
-                    columns: vec![],
+                    columns: vec![].into(),
                     values: vec![],
                 };
                 let needle_val = eval_expr(&needle_expr, outer_row.unwrap_or(&empty));

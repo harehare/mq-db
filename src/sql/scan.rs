@@ -9,7 +9,7 @@ use super::plan::{find_equi_join_exprs, zone_map_skip};
 use super::rewrite::fold_constants;
 use super::rows::{
     QUERY_NEEDS_CONTENT_HASH, block_anchors, block_to_row, doc_to_row, ident_value, link_rows,
-    qualify_row, sql_needs_content_hash,
+    qualified_block_columns, qualify_row, sql_needs_content_hash,
 };
 use super::value::{Row, Value};
 use crate::MqdbError;
@@ -27,7 +27,7 @@ impl<'a> SqlEngine<'a> {
     ) -> Result<Vec<Row>, MqdbError> {
         if from.is_empty() {
             return Ok(vec![Row {
-                columns: vec![],
+                columns: vec![].into(),
                 values: vec![],
             }]);
         }
@@ -161,6 +161,7 @@ impl<'a> SqlEngine<'a> {
         match table_name {
             "blocks" => {
                 let prefix = alias.unwrap_or("blocks");
+                let columns = qualified_block_columns(prefix);
                 let mut rows = Vec::new();
                 let mut global_idx: u32 = 0;
 
@@ -180,23 +181,24 @@ impl<'a> SqlEngine<'a> {
                         for local_i in local_indices {
                             if let Some(block) = doc.blocks.get(local_i as usize) {
                                 let block_global_idx = global_idx + local_i;
-                                rows.push(qualify_row(
-                                    block_to_row(
-                                        doc.id,
-                                        block,
-                                        block_global_idx,
-                                        &anchors[local_i as usize],
-                                    ),
-                                    prefix,
+                                rows.push(block_to_row(
+                                    &columns,
+                                    doc.id,
+                                    block,
+                                    block_global_idx,
+                                    &anchors[local_i as usize],
                                 ));
                             }
                         }
                     } else {
                         // FullScan
                         for (i, block) in doc.blocks.iter().enumerate() {
-                            rows.push(qualify_row(
-                                block_to_row(doc.id, block, global_idx + i as u32, &anchors[i]),
-                                prefix,
+                            rows.push(block_to_row(
+                                &columns,
+                                doc.id,
+                                block,
+                                global_idx + i as u32,
+                                &anchors[i],
                             ));
                         }
                     }
@@ -241,7 +243,7 @@ impl<'a> SqlEngine<'a> {
                         .map(|row_vals| {
                             qualify_row(
                                 Row {
-                                    columns: state.columns.clone(),
+                                    columns: state.columns.clone().into(),
                                     values: row_vals
                                         .iter()
                                         .map(|v| Value::Str(v.clone()))

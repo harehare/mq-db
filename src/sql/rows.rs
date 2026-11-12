@@ -8,6 +8,7 @@ use crate::document::Document;
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{ObjectName, ObjectNamePart, Value as SqlValue};
+use std::sync::Arc;
 
 fn pv_to_json(pv: &PropertyValue) -> String {
     match pv {
@@ -120,26 +121,45 @@ pub(super) fn block_anchors(doc: &Document) -> Vec<String> {
     anchors
 }
 
-pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32, anchor: &str) -> Row {
+const BLOCK_COLUMNS: [&str; 11] = [
+    "id",
+    "document_id",
+    "block_type",
+    "content",
+    "pre",
+    "post",
+    "depth",
+    "lang",
+    "properties",
+    "content_hash",
+    "anchor",
+];
+
+/// The `blocks` column names, qualified with `prefix`, built once per scan and
+/// shared by every row of it.
+pub(super) fn qualified_block_columns(prefix: &str) -> Arc<[String]> {
+    BLOCK_COLUMNS
+        .iter()
+        .map(|c| format!("{prefix}.{c}"))
+        .collect()
+}
+
+/// A `blocks` row whose column names are `columns` (see
+/// [`qualified_block_columns`]).
+pub(super) fn block_to_row(
+    columns: &Arc<[String]>,
+    doc_id: u32,
+    block: &Block,
+    block_idx: u32,
+    anchor: &str,
+) -> Row {
     let hash = if QUERY_NEEDS_CONTENT_HASH.with(std::cell::Cell::get) {
         Value::Str(content_hash(block))
     } else {
         Value::Null
     };
     Row {
-        columns: vec![
-            "id".into(),
-            "document_id".into(),
-            "block_type".into(),
-            "content".into(),
-            "pre".into(),
-            "post".into(),
-            "depth".into(),
-            "lang".into(),
-            "properties".into(),
-            "content_hash".into(),
-            "anchor".into(),
-        ],
+        columns: Arc::clone(columns),
         values: vec![
             Value::Int(block_idx as i64),
             Value::Int(doc_id as i64),
@@ -179,7 +199,8 @@ pub(super) fn link_rows(doc_id: u32, block: &Block, block_idx: u32) -> Vec<Row> 
                     "url".into(),
                     "text".into(),
                     "title".into(),
-                ],
+                ]
+                .into(),
                 values: vec![
                     Value::Int(doc_id as i64),
                     Value::Int(block_idx as i64),
@@ -216,7 +237,8 @@ pub(super) fn doc_to_row(doc: &Document) -> Row {
             "code_languages".into(),
             "frontmatter_keys".into(),
             "properties".into(),
-        ],
+        ]
+        .into(),
         values: vec![
             Value::Int(doc.id as i64),
             Value::Str(
