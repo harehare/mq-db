@@ -1915,7 +1915,11 @@ fn write_back_delete_removes_matched_block_and_blank_line() {
 #[test]
 fn write_back_update_rejects_table_blocks() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_md(&dir, "doc.md", "# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+    let path = write_md(
+        &dir,
+        "doc.md",
+        "# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n",
+    );
 
     let mut store = DocumentStore::new();
     store.add_file(&path).unwrap();
@@ -3707,7 +3711,11 @@ fn create_view_with_column_list() {
 #[test]
 fn write_back_update_code_block_keeps_lang_and_fence() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_md(&dir, "doc.md", "# Title\n\n```rust\nfn main() {}\n```\n\nTail\n");
+    let path = write_md(
+        &dir,
+        "doc.md",
+        "# Title\n\n```rust\nfn main() {}\n```\n\nTail\n",
+    );
     let mut store = DocumentStore::new();
     store.add_file(&path).unwrap();
 
@@ -3728,9 +3736,7 @@ fn write_back_update_code_block_with_backticks_uses_longer_fence() {
     store.add_file(&path).unwrap();
 
     store
-        .execute_sql_mut(
-            "UPDATE blocks SET content = '```inner```' WHERE block_type = 'code'",
-        )
+        .execute_sql_mut("UPDATE blocks SET content = '```inner```' WHERE block_type = 'code'")
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
@@ -3790,4 +3796,43 @@ fn write_back_insert_lang_only_valid_for_code() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("lang is only valid"));
+}
+
+#[test]
+fn uncorrelated_scalar_subquery_in_where_matches_per_row_result() {
+    let store = make_multi_doc_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let uncorrelated = engine
+        .execute(
+            "SELECT id FROM documents \
+             WHERE id > (SELECT min(document_id) FROM blocks) ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        uncorrelated.rows,
+        vec![vec!["1".to_string()], vec!["2".to_string()]]
+    );
+    // Correlated: still evaluated per row.
+    let correlated = engine
+        .execute(
+            "SELECT d.id FROM documents d \
+             WHERE d.id = (SELECT max(b.document_id) FROM blocks b WHERE b.document_id = d.id) \
+             ORDER BY d.id",
+        )
+        .unwrap();
+    assert_eq!(correlated.rows.len(), 3);
+}
+
+#[test]
+fn uncorrelated_exists_in_where_is_resolved_once() {
+    let store = make_multi_doc_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let all = engine
+        .execute("SELECT count(*) FROM documents WHERE EXISTS (SELECT 1 FROM blocks)")
+        .unwrap();
+    let none = engine
+        .execute("SELECT count(*) FROM documents WHERE EXISTS (SELECT 1 FROM blocks WHERE 1 = 0)")
+        .unwrap();
+    assert_eq!(all.rows[0][0], "3");
+    assert_eq!(none.rows[0][0], "0");
 }

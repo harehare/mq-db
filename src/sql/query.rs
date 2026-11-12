@@ -1,6 +1,8 @@
 //! `SELECT` execution: CTEs, set expressions and subqueries.
 
-use super::analysis::{expr_has_subquery, validate_expr_columns, validate_projection_columns};
+use super::analysis::{
+    collect_subqueries, expr_has_subquery, validate_expr_columns, validate_projection_columns,
+};
 use super::engine::SqlEngine;
 use super::expr::eval_expr;
 use super::external::table_factor_ident;
@@ -328,7 +330,7 @@ impl<'a> SqlEngine<'a> {
             && matches!(where_expr.map(unwrap_nested), Some(Expr::Function(_)))
             && from_names_unshadowed_blocks(&select.from[0], &self.cte_scopes.borrow());
         if !where_fully_indexed && let Some(where_expr) = &select.selection {
-            if expr_has_subquery(where_expr) {
+            if expr_has_subquery(where_expr) && self.where_is_correlated(where_expr, rows.first()) {
                 // A subquery may be correlated (reference this row's
                 // columns), so it must be re-resolved per row rather than
                 // once up front.
@@ -356,6 +358,22 @@ impl<'a> SqlEngine<'a> {
 
         // 3. PROJECT / GROUP / ORDER / LIMIT
         self.project_and_aggregate(select, rows, order_by, limit, offset, &known_columns)
+    }
+
+    /// Whether `expr` must be resolved per row: some subquery references the
+    /// outer row's columns, or is an `IN (SELECT ...)`, whose left-hand side
+    /// is evaluated against the row while resolving. Substitution depends only on column names, which are identical for
+    /// every row, so one sample row decides it for all of them. No rows
+    /// means nothing is evaluated per row, so "uncorrelated" is safe.
+    fn where_is_correlated(&self, expr: &Expr, sample: Option<&Row>) -> bool {
+        let Some(sample) = sample else {
+            return false;
+        };
+        let mut subqueries = Vec::new();
+        collect_subqueries(expr, &mut subqueries);
+        subqueries
+            .into_iter()
+            .any(|(q, is_in)| is_in || substitute_outer_refs_query(q, sample) != *q)
     }
 
     /// Resolves scalar subqueries, `[NOT] IN (SELECT ...)`, and

@@ -167,11 +167,7 @@ fn render_markdown_for(
             .collect::<Vec<_>>()
             .join("\n")),
         BlockType::Code => {
-            let longest_run = content
-                .split(|c| c != '`')
-                .map(str::len)
-                .max()
-                .unwrap_or(0);
+            let longest_run = content.split(|c| c != '`').map(str::len).max().unwrap_or(0);
             let fence = "`".repeat((longest_run + 1).max(3));
             let mut info = opts.lang.clone().unwrap_or_default();
             if let Some(meta) = opts.meta.as_deref().filter(|m| !m.is_empty()) {
