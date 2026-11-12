@@ -1167,7 +1167,7 @@ mod detect_tokenizer_tests {
         let ja = dir.path().join("ja.md");
         std::fs::write(&en, "# Hello\n\nplain text").unwrap();
         std::fs::write(&ja, "# こんにちは\n\n日本語の文書").unwrap();
-        assert_eq!(detect_tokenizer(&[en.clone()]), TokenizerKind::Word);
+        assert_eq!(detect_tokenizer(std::slice::from_ref(&en)), TokenizerKind::Word);
         assert_eq!(detect_tokenizer(&[en, ja]), TokenizerKind::Bigram);
         assert_eq!(detect_tokenizer(&[]), TokenizerKind::Word);
     }

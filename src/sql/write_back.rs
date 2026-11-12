@@ -121,31 +121,105 @@ fn collect_matched_edits(
         .collect()
 }
 
-/// Renders Markdown source text for a `Heading`/`Paragraph` block. Shared by
-/// `UPDATE`/`INSERT INTO blocks` write-back. Other block types (tables,
-/// code, lists, ...) aren't supported.
+/// Extra rendering inputs for non-text blocks.
+#[derive(Default, Clone)]
+struct RenderOpts {
+    depth: Option<u8>,
+    lang: Option<String>,
+    meta: Option<String>,
+    /// `false` renders an indented (non-fenced) code block.
+    indented_code: bool,
+}
+
+/// Whether write-back can render and replace blocks of this type.
+fn is_writable_type(bt: &BlockType) -> bool {
+    matches!(
+        bt,
+        BlockType::Heading
+            | BlockType::Paragraph
+            | BlockType::Code
+            | BlockType::Blockquote
+            | BlockType::Math
+            | BlockType::Html
+    )
+}
+
+const WRITABLE_TYPES: &str = "heading/paragraph/code/blockquote/math/html";
+
+/// Renders Markdown source text for a writable block. Shared by
+/// `UPDATE`/`INSERT INTO blocks` write-back. Tables and lists aren't
+/// supported (they are split into per-cell / per-item blocks).
 fn render_markdown_for(
     block_type: &BlockType,
-    depth: Option<u8>,
+    opts: &RenderOpts,
     content: &str,
 ) -> Result<String, MqdbError> {
     match block_type {
         BlockType::Heading => Ok(format!(
             "{} {}",
-            "#".repeat(depth.unwrap_or(1).max(1) as usize),
+            "#".repeat(opts.depth.unwrap_or(1).max(1) as usize),
             content
         )),
-        BlockType::Paragraph => Ok(content.to_string()),
+        BlockType::Paragraph | BlockType::Html => Ok(content.to_string()),
+        BlockType::Code if opts.indented_code => Ok(content
+            .lines()
+            .map(|l| format!("    {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")),
+        BlockType::Code => {
+            let longest_run = content
+                .split(|c| c != '`')
+                .map(str::len)
+                .max()
+                .unwrap_or(0);
+            let fence = "`".repeat((longest_run + 1).max(3));
+            let mut info = opts.lang.clone().unwrap_or_default();
+            if let Some(meta) = opts.meta.as_deref().filter(|m| !m.is_empty()) {
+                info.push(' ');
+                info.push_str(meta);
+            }
+            Ok(format!("{fence}{info}\n{content}\n{fence}"))
+        }
+        BlockType::Math => Ok(format!("$$\n{content}\n$$")),
+        BlockType::Blockquote => Ok(content
+            .lines()
+            .map(|l| {
+                if l.is_empty() {
+                    ">".to_string()
+                } else {
+                    format!("> {l}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")),
         other => Err(MqdbError::SqlExec(format!(
-            "write-back is only supported for heading/paragraph blocks (found {})",
+            "write-back is only supported for {WRITABLE_TYPES} blocks (found {})",
             other.as_str()
         ))),
     }
 }
 
-/// Renders `edit`'s replacement text for an existing matched block.
+/// Renders `edit`'s replacement text for an existing matched block,
+/// keeping its depth / language / fence style.
 fn render_replacement(block: &Block, new_content: &str) -> Result<String, MqdbError> {
-    render_markdown_for(&block.block_type, block.heading_depth(), new_content)
+    let prop_str = |k: &str| {
+        block
+            .properties
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let opts = RenderOpts {
+        depth: block.heading_depth(),
+        lang: prop_str("lang"),
+        meta: prop_str("meta"),
+        indented_code: block
+            .properties
+            .get("fence")
+            .and_then(|v| v.as_bool())
+            .is_some_and(|f| !f),
+    };
+    render_markdown_for(&block.block_type, &opts, new_content)
 }
 
 /// Applies `edits` (grouped by document) as a source-text patch + reparse:
@@ -264,14 +338,22 @@ struct NewBlockSpec {
     pub(super) content: String,
     /// Required (1-6) iff `block_type` is `Heading`.
     pub(super) depth: Option<u8>,
+    /// Info-string language; only valid for `Code`.
+    lang: Option<String>,
     /// `pre` of the block to insert after; `None` appends at document end.
     after_pre: Option<u32>,
     /// Position within `VALUES`, to preserve order among same-anchor rows.
     row_index: usize,
 }
 
-const INSERT_BLOCKS_COLUMNS: [&str; 5] =
-    ["document_id", "block_type", "content", "depth", "after_pre"];
+const INSERT_BLOCKS_COLUMNS: [&str; 6] = [
+    "document_id",
+    "block_type",
+    "content",
+    "depth",
+    "after_pre",
+    "lang",
+];
 
 /// Parses an `INSERT INTO blocks (...) VALUES (...)` statement into
 /// [`NewBlockSpec`]s. Only an explicit column list and a literal `VALUES`
@@ -325,6 +407,7 @@ fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
             let mut content: Option<String> = None;
             let mut depth: Option<u8> = None;
             let mut after_pre: Option<u32> = None;
+            let mut lang: Option<String> = None;
 
             for (name, expr) in col_names.iter().zip(row.iter()) {
                 let value = eval_expr(expr, &empty);
@@ -339,10 +422,10 @@ fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
                             MqdbError::SqlExec("block_type must be a string".into())
                         })?;
                         let bt = BlockType::from_str(&s.to_lowercase())
-                            .filter(|bt| matches!(bt, BlockType::Heading | BlockType::Paragraph))
+                            .filter(is_writable_type)
                             .ok_or_else(|| {
                                 MqdbError::SqlExec(format!(
-                                    "write-back is only supported for heading/paragraph blocks (found {s})"
+                                    "write-back is only supported for {WRITABLE_TYPES} blocks (found {s})"
                                 ))
                             })?;
                         block_type = Some(bt);
@@ -359,6 +442,12 @@ fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
                             other => Some(other.as_i64().ok_or_else(|| {
                                 MqdbError::SqlExec("depth must be an integer".into())
                             })? as u8),
+                        };
+                    }
+                    "lang" => {
+                        lang = match value {
+                            Value::Null => None,
+                            other => Some(other.display()),
                         };
                     }
                     "after_pre" => {
@@ -397,12 +486,17 @@ fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
                     }
                     Some(_) => {}
                 },
-                BlockType::Paragraph if depth.is_some() => {
+                _ if depth.is_some() => {
                     return Err(MqdbError::SqlExec(
                         "depth is only valid for block_type 'heading'".into(),
                     ));
                 }
                 _ => {}
+            }
+            if lang.is_some() && block_type != BlockType::Code {
+                return Err(MqdbError::SqlExec(
+                    "lang is only valid for block_type 'code'".into(),
+                ));
             }
 
             Ok(NewBlockSpec {
@@ -410,6 +504,7 @@ fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
                 block_type,
                 content,
                 depth,
+                lang,
                 after_pre,
                 row_index,
             })
@@ -470,7 +565,12 @@ fn apply_new_blocks(
                     }
                     None => usize::MAX,
                 };
-                let rendered = render_markdown_for(&spec.block_type, spec.depth, &spec.content)?;
+                let opts = RenderOpts {
+                    depth: spec.depth,
+                    lang: spec.lang.clone(),
+                    ..RenderOpts::default()
+                };
+                let rendered = render_markdown_for(&spec.block_type, &opts, &spec.content)?;
                 insertions.push(Insertion {
                     at,
                     row_index: spec.row_index,

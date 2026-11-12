@@ -26,7 +26,7 @@ print!("{}", out.to_table());
 let results = MqEngine::eval_store(".h1", &store)?;
 
 // UPDATE/DELETE with write-back: rewrites the affected block's source file
-// (heading/paragraph content only), then re-parses it in place
+// (heading, paragraph, code, blockquote, math and html blocks), then re-parses it in place
 store.execute_sql_mut(
     "UPDATE blocks SET content = 'New Title' WHERE block_type = 'heading' AND content = 'Old Title'"
 )?;

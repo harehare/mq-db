@@ -18,11 +18,15 @@ mq-db sql "INSERT INTO blocks (document_id, block_type, content, depth, after_pr
 
 mq-db sql "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'Appended at the end')" \
   --db store.mq-db --write-back
+
+mq-db sql "INSERT INTO blocks (document_id, block_type, content, lang) VALUES (0, 'code', 'let x = 1;', 'rust')" \
+  --db store.mq-db --write-back
 ```
 
 ## Limitations in this version
 
-- `UPDATE ... SET content` and `INSERT INTO blocks` only support `heading`/`paragraph` blocks (not tables, code, lists, ...)
-- `INSERT INTO blocks` requires an explicit column list drawn from `document_id`, `block_type`, `content`, `depth` (required for `heading`, 1-6), `after_pre` (optional); `INSERT ... SELECT` is not supported, only `VALUES`
+- `UPDATE ... SET content` and `INSERT INTO blocks` support `heading`, `paragraph`, `code`, `blockquote`, `math` and `html` blocks (not tables or lists, which are stored as per-cell / per-item blocks)
+- `UPDATE` on a `code` block keeps its language, info string and fence style; a longer fence is used if the new content contains backticks
+- `INSERT INTO blocks` requires an explicit column list drawn from `document_id`, `block_type`, `content`, `depth` (required for `heading`, 1-6), `lang` (`code` only), `after_pre` (optional); `INSERT ... SELECT` is not supported, only `VALUES`
 - Only documents indexed **with spans** (the default; not `--no-spans`) and from a real file (not added via the library's `add_str`) are eligible
 - Not available over `serve`'s HTTP endpoint or from `mq-mcp`: CLI (`sql`/`repl` with `--write-back`) and the library (`DocumentStore::execute_sql_mut`) only

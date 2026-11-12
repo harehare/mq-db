@@ -1913,17 +1913,17 @@ fn write_back_delete_removes_matched_block_and_blank_line() {
 }
 
 #[test]
-fn write_back_update_rejects_non_heading_paragraph_block_type() {
+fn write_back_update_rejects_table_blocks() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_md(&dir, "doc.md", "# Title\n\n```rust\nfn main() {}\n```\n");
+    let path = write_md(&dir, "doc.md", "# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n");
 
     let mut store = DocumentStore::new();
     store.add_file(&path).unwrap();
 
     let err = store
-        .execute_sql_mut("UPDATE blocks SET content = 'fn other() {}' WHERE block_type = 'code'")
+        .execute_sql_mut("UPDATE blocks SET content = 'x' WHERE block_type = 'table_cell'")
         .unwrap_err();
-    assert!(err.to_string().contains("heading/paragraph"));
+    assert!(err.to_string().contains("only supported for"));
 }
 
 #[test]
@@ -2131,10 +2131,10 @@ fn write_back_insert_rejects_unsupported_block_type() {
 
     let err = store
         .execute_sql_mut(
-            "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'code', 'fn f(){}')",
+            "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'list', 'x')",
         )
         .unwrap_err();
-    assert!(err.to_string().contains("heading/paragraph"));
+    assert!(err.to_string().contains("only supported for"));
 }
 
 #[test]
@@ -3702,4 +3702,92 @@ fn create_view_with_column_list() {
         .execute("CREATE VIEW w (x) AS SELECT 1, 2")
         .unwrap_err();
     assert!(err.to_string().contains("column names"));
+}
+
+#[test]
+fn write_back_update_code_block_keeps_lang_and_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# Title\n\n```rust\nfn main() {}\n```\n\nTail\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    store
+        .execute_sql_mut("UPDATE blocks SET content = 'fn other() {}' WHERE block_type = 'code'")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# Title\n\n```rust\nfn other() {}\n```\n\nTail\n"
+    );
+}
+
+#[test]
+fn write_back_update_code_block_with_backticks_uses_longer_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# T\n\n```md\nx\n```\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    store
+        .execute_sql_mut(
+            "UPDATE blocks SET content = '```inner```' WHERE block_type = 'code'",
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# T\n\n````md\n```inner```\n````\n"
+    );
+    let code = store.documents()[0]
+        .blocks
+        .iter()
+        .find(|b| b.block_type == crate::block::BlockType::Code)
+        .unwrap();
+    assert_eq!(code.content, "```inner```");
+}
+
+#[test]
+fn write_back_update_blockquote() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# T\n\n> old\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    store
+        .execute_sql_mut("UPDATE blocks SET content = 'new' WHERE block_type = 'blockquote'")
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# T\n\n> new\n");
+}
+
+#[test]
+fn write_back_insert_code_block_with_lang() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    store
+        .execute_sql_mut(
+            "INSERT INTO blocks (document_id, block_type, content, lang) \
+             VALUES (0, 'code', 'let x = 1;', 'rust')",
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# Title\n\nBody\n\n```rust\nlet x = 1;\n```\n"
+    );
+}
+
+#[test]
+fn write_back_insert_lang_only_valid_for_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# Title\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    let err = store
+        .execute_sql_mut(
+            "INSERT INTO blocks (document_id, block_type, content, lang) \
+             VALUES (0, 'paragraph', 'x', 'rust')",
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("lang is only valid"));
 }
