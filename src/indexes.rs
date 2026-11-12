@@ -273,6 +273,28 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// Picks [`TokenizerKind::Bigram`] if any of `paths` contains CJK text in its
+/// first 64 KiB (at most 256 files sampled), else [`TokenizerKind::Word`].
+pub fn detect_tokenizer(paths: &[std::path::PathBuf]) -> TokenizerKind {
+    use std::io::Read;
+    const SAMPLE_BYTES: u64 = 64 * 1024;
+    const MAX_FILES: usize = 256;
+    for path in paths.iter().take(MAX_FILES) {
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        if file.take(SAMPLE_BYTES).read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        // A truncated trailing multi-byte char becomes U+FFFD, which is not CJK.
+        if String::from_utf8_lossy(&buf).chars().any(is_cjk) {
+            return TokenizerKind::Bigram;
+        }
+    }
+    TokenizerKind::Word
+}
+
 /// Tokenizes `text` per `kind`. Used at both index build time and query time
 /// (`src/sql/`); the two **must** pass the same `kind`, or the index
 /// silently drops true matches instead of just mis-ranking them.
@@ -1131,5 +1153,22 @@ mod tests {
 
         assert!(!original.is_empty());
         assert_eq!(original, round_tripped);
+    }
+}
+
+#[cfg(test)]
+mod detect_tokenizer_tests {
+    use super::*;
+
+    #[test]
+    fn detects_cjk_and_defaults_to_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let en = dir.path().join("en.md");
+        let ja = dir.path().join("ja.md");
+        std::fs::write(&en, "# Hello\n\nplain text").unwrap();
+        std::fs::write(&ja, "# こんにちは\n\n日本語の文書").unwrap();
+        assert_eq!(detect_tokenizer(&[en.clone()]), TokenizerKind::Word);
+        assert_eq!(detect_tokenizer(&[en, ja]), TokenizerKind::Bigram);
+        assert_eq!(detect_tokenizer(&[]), TokenizerKind::Word);
     }
 }

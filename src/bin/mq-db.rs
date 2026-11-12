@@ -531,11 +531,19 @@ async fn main() -> anyhow::Result<()> {
                 if no_spans {
                     store.set_store_spans(false);
                 }
-                if let Some(tokenizer) = tokenizer {
-                    store
-                        .set_tokenizer(tokenizer.into())
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                }
+                let kind = match tokenizer {
+                    Some(t) => t.into(),
+                    None => {
+                        let detected = mq_db::indexes::detect_tokenizer(&files);
+                        if detected != TokenizerKind::Word {
+                            eprintln!(
+                                "note: CJK text detected, using the {detected:?} tokenizer (override with --tokenizer)"
+                            );
+                        }
+                        detected
+                    }
+                };
+                store.set_tokenizer(kind).map_err(|e| anyhow::anyhow!(e))?;
                 store
             } else {
                 maybe_migrate(&output)?;
