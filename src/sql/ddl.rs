@@ -316,12 +316,6 @@ impl<'a> SqlEngine<'a> {
                 "cannot override built-in table '{view_name}'"
             )));
         }
-        if !cv.columns.is_empty() {
-            return Err(MqdbError::SqlExec(
-                "explicit view columns (CREATE VIEW v (a, b) AS ...) are not supported".into(),
-            ));
-        }
-
         // Guard the cross-kind check too, or a concurrent CREATE TABLE can slip in.
         let _catalog_guard = self.store.catalog_commit.lock().unwrap();
         if self
@@ -351,8 +345,29 @@ impl<'a> SqlEngine<'a> {
 
         // Validate the query now so a bad CREATE VIEW fails immediately
         // rather than on first use.
-        self.exec_query(&cv.query)?;
-        let sql_text = cv.query.to_string();
+        let probe = self.exec_query(&cv.query)?;
+        if !cv.columns.is_empty() && cv.columns.len() != probe.columns.len() {
+            return Err(MqdbError::SqlExec(format!(
+                "view '{view_name}' has {} column names but its query returns {} columns",
+                cv.columns.len(),
+                probe.columns.len()
+            )));
+        }
+        // Stored as text, so a column list is persisted as a wrapping CTE.
+        let sql_text = if cv.columns.is_empty() {
+            cv.query.to_string()
+        } else {
+            let cols: Vec<String> = cv
+                .columns
+                .iter()
+                .map(|c| format!("\"{}\"", c.name.value.replace('"', "\"\"")))
+                .collect();
+            format!(
+                "WITH __view({}) AS ({}) SELECT * FROM __view",
+                cols.join(", "),
+                cv.query
+            )
+        };
         if sql_text.len() > u16::MAX as usize {
             return Err(MqdbError::SqlExec(
                 "view query is too long to persist (max 65535 bytes)".into(),

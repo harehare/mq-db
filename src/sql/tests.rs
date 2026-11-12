@@ -1626,19 +1626,6 @@ fn cte_name_collision_with_custom_table_prefers_cte() {
 }
 
 #[test]
-fn cte_column_alias_list_rejected() {
-    let store = make_store();
-    let engine = SqlEngine::new(&store).unwrap();
-    let err = engine
-        .execute(
-            "WITH h(a) AS (SELECT content FROM blocks WHERE block_type = 'heading')
-             SELECT a FROM h",
-        )
-        .unwrap_err();
-    assert!(err.to_string().contains("column aliases"));
-}
-
-#[test]
 fn cte_shadowing_across_nested_subquery_with_same_name() {
     let store = make_store();
     let engine = SqlEngine::new(&store).unwrap();
@@ -3663,4 +3650,56 @@ fn test_sql_arithmetic_on_numeric_text(#[case] sql: &str, #[case] expected: &str
     let store = DocumentStore::new();
     let engine = SqlEngine::new(&store).unwrap();
     assert_eq!(engine.execute(sql).unwrap().rows[0][0], expected, "{sql}");
+}
+
+#[test]
+fn cte_column_aliases_rename_columns() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("WITH t(a, b) AS (SELECT 1, 2) SELECT b, a FROM t")
+        .unwrap();
+    assert_eq!(out.rows, vec![vec!["2".to_string(), "1".to_string()]]);
+}
+
+#[test]
+fn cte_column_alias_count_mismatch_errors() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let err = engine
+        .execute("WITH t(a) AS (SELECT 1, 2) SELECT a FROM t")
+        .unwrap_err();
+    assert!(err.to_string().contains("column aliases"));
+}
+
+#[test]
+fn recursive_cte_with_column_aliases() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute(
+            "WITH RECURSIVE seq(i) AS (
+               SELECT 1
+               UNION ALL
+               SELECT i + 1 FROM seq WHERE i < 3
+             )
+             SELECT i FROM seq ORDER BY i",
+        )
+        .unwrap();
+    assert_eq!(out.rows.len(), 3);
+}
+
+#[test]
+fn create_view_with_column_list() {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE VIEW v (x, y) AS SELECT 1, 2")
+        .unwrap();
+    let out = engine.execute("SELECT y, x FROM v").unwrap();
+    assert_eq!(out.rows, vec![vec!["2".to_string(), "1".to_string()]]);
+    let err = engine
+        .execute("CREATE VIEW w (x) AS SELECT 1, 2")
+        .unwrap_err();
+    assert!(err.to_string().contains("column names"));
 }

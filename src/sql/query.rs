@@ -35,6 +35,26 @@ fn select_references_table(select: &Select, name: &str) -> bool {
     })
 }
 
+/// Renames `out`'s columns to `aliases` (`WITH name(a, b) AS ...`); no-op if empty.
+fn apply_column_aliases(
+    name: &str,
+    out: &mut QueryOutput,
+    aliases: &[String],
+) -> Result<(), MqdbError> {
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    if aliases.len() != out.columns.len() {
+        return Err(MqdbError::SqlExec(format!(
+            "CTE '{name}' has {} column aliases but its query returns {} columns",
+            aliases.len(),
+            out.columns.len()
+        )));
+    }
+    out.columns = aliases.to_vec();
+    Ok(())
+}
+
 impl<'a> SqlEngine<'a> {
     /// Materialises any `WITH` clause's CTEs into a new scope frame, then
     /// delegates to [`Self::exec_query_body`].
@@ -46,15 +66,17 @@ impl<'a> SqlEngine<'a> {
         self.cte_scopes.borrow_mut().push(FxHashMap::default());
         let result = (|| {
             for cte in &with.cte_tables {
-                if !cte.alias.columns.is_empty() {
-                    return Err(MqdbError::SqlExec(
-                        "CTE column aliases (WITH x(a, b) AS ...) are not supported".into(),
-                    ));
-                }
                 let name = cte.alias.name.value.to_lowercase();
+                let aliases: Vec<String> = cte
+                    .alias
+                    .columns
+                    .iter()
+                    .map(|c| c.name.value.clone())
+                    .collect();
                 // `name` isn't in scope yet, so no self-reference outside
                 // `exec_cte_body`'s own recursive-CTE handling.
-                let out = self.exec_cte_body(&name, &cte.query, with.recursive)?;
+                let mut out = self.exec_cte_body(&name, &cte.query, with.recursive, &aliases)?;
+                apply_column_aliases(&name, &mut out, &aliases)?;
                 self.cte_scopes
                     .borrow_mut()
                     .last_mut()
@@ -78,6 +100,7 @@ impl<'a> SqlEngine<'a> {
         name: &str,
         query: &Query,
         recursive: bool,
+        aliases: &[String],
     ) -> Result<QueryOutput, MqdbError> {
         if recursive
             && let SetExpr::SetOperation {
@@ -96,7 +119,7 @@ impl<'a> SqlEngine<'a> {
                 )));
             }
             let all = matches!(set_quantifier, SetQuantifier::All);
-            return self.exec_recursive_cte(name, anchor, term, all);
+            return self.exec_recursive_cte(name, anchor, term, all, aliases);
         }
         self.exec_query(query)
     }
@@ -114,8 +137,10 @@ impl<'a> SqlEngine<'a> {
         anchor: &Select,
         recursive: &Select,
         all: bool,
+        aliases: &[String],
     ) -> Result<QueryOutput, MqdbError> {
-        let anchor_out = self.exec_select(anchor, &None, None, None)?;
+        let mut anchor_out = self.exec_select(anchor, &None, None, None)?;
+        apply_column_aliases(name, &mut anchor_out, aliases)?;
         let columns = anchor_out.columns.clone();
         let mut result_rows = anchor_out.rows.clone();
         let mut working = anchor_out.rows;
