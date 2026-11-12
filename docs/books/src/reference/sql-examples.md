@@ -4,9 +4,10 @@
 -- All text/code under a specific section (RAG extraction)
 SELECT b.block_type, b.content
 FROM blocks b
-WHERE under(b.pre, b.post,
-  (SELECT pre FROM blocks WHERE block_type = 'heading' AND content = 'Architecture'),
-  (SELECT post FROM blocks WHERE block_type = 'heading' AND content = 'Architecture'))
+WHERE b.document_id = (SELECT document_id FROM blocks WHERE block_type = 'heading' AND content = 'Architecture')
+  AND under(b.pre, b.post,
+    (SELECT pre  FROM blocks WHERE block_type = 'heading' AND content = 'Architecture'),
+    (SELECT post FROM blocks WHERE block_type = 'heading' AND content = 'Architecture'))
   AND b.block_type IN ('paragraph', 'code')
 ORDER BY b.pre;
 
