@@ -5,11 +5,12 @@ use super::expr::eval_expr;
 use super::output::QueryOutput;
 use super::rewrite::fold_constants;
 use super::rows::{ident_value, ok_result, require_unqualified};
+use super::text_edit;
 use super::value::{Row, Value};
 use crate::block::{Block, BlockType};
 use crate::indexes::IndexHint;
 use crate::{DocumentStore, MqdbError};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use sqlparser::ast::{
     AssignmentTarget, Expr, FromTable, Insert, SetExpr, Statement, TableFactor, TableObject,
     TableWithJoins, Values,
@@ -131,8 +132,8 @@ struct RenderOpts {
     indented_code: bool,
 }
 
-/// Whether write-back can render and replace blocks of this type.
-fn is_writable_type(bt: &BlockType) -> bool {
+/// Whether `UPDATE ... SET content` can rewrite blocks of this type.
+fn is_updatable_type(bt: &BlockType) -> bool {
     matches!(
         bt,
         BlockType::Heading
@@ -141,14 +142,22 @@ fn is_writable_type(bt: &BlockType) -> bool {
             | BlockType::Blockquote
             | BlockType::Math
             | BlockType::Html
+            | BlockType::List
+            | BlockType::TableCell
     )
 }
 
-const WRITABLE_TYPES: &str = "heading/paragraph/code/blockquote/math/html";
+/// Whether `INSERT INTO blocks` can create blocks of this type. A table cell
+/// cannot be inserted on its own.
+fn is_insertable_type(bt: &BlockType) -> bool {
+    is_updatable_type(bt) && *bt != BlockType::TableCell
+}
 
-/// Renders Markdown source text for a writable block. Shared by
-/// `UPDATE`/`INSERT INTO blocks` write-back. Tables and lists aren't
-/// supported (they are split into per-cell / per-item blocks).
+const WRITABLE_TYPES: &str = "heading/paragraph/code/blockquote/math/html/list";
+
+/// Renders Markdown source text for a block that is replaced or inserted as
+/// whole lines. List items and table cells are edited in place instead, see
+/// [`Action`].
 fn render_markdown_for(
     block_type: &BlockType,
     opts: &RenderOpts,
@@ -218,12 +227,210 @@ fn render_replacement(block: &Block, new_content: &str) -> Result<String, MqdbEr
     render_markdown_for(&block.block_type, &opts, new_content)
 }
 
+/// One planned change to a document's source text. Line numbers are
+/// 1-based; columns count UTF-16 units, as the parser reports them.
+enum Action {
+    /// Replace lines `start_line..=end_line` with `text`.
+    ReplaceLines {
+        start_line: usize,
+        end_line: usize,
+        text: String,
+    },
+    /// Replace the text between two `(line, column)` points. Used for list
+    /// items, whose span is just their text: the indent, marker and task
+    /// checkbox before it stay as they are.
+    ReplaceRange {
+        start: (usize, usize),
+        end: (usize, usize),
+        text: String,
+    },
+    /// Replace one cell of the table row on `line`.
+    SetCell {
+        line: usize,
+        column: usize,
+        text: String,
+    },
+    /// Remove lines `start_line..=end_line`.
+    RemoveLines { start_line: usize, end_line: usize },
+}
+
+impl Action {
+    /// Where the change starts. Applying from the largest to the smallest
+    /// keeps the positions of the changes still to come valid.
+    fn position(&self) -> (usize, usize) {
+        match self {
+            Action::ReplaceLines { start_line, .. } | Action::RemoveLines { start_line, .. } => {
+                (*start_line, 0)
+            }
+            Action::ReplaceRange { start, .. } => *start,
+            Action::SetCell { line, column, .. } => (*line, *column),
+        }
+    }
+}
+
+fn single_line(what: &str, text: &str) -> Result<(), MqdbError> {
+    if text.contains(['\n', '\r']) {
+        return Err(MqdbError::SqlExec(format!(
+            "{what} content must be a single line"
+        )));
+    }
+    Ok(())
+}
+
+/// Decides how to apply `edit` to `block`. `matched` holds the `pre` of every
+/// block the statement touches in this document.
+fn plan_edit(
+    blocks: &[Block],
+    block: &Block,
+    edit: &MatchedBlockEdit,
+    matched: &FxHashSet<u32>,
+) -> Result<Action, MqdbError> {
+    let span = block.span.as_ref().ok_or_else(|| {
+        MqdbError::SqlExec("write-back requires source spans; reindex without --no-spans".into())
+    })?;
+    let Some(new_content) = edit.new_content.as_deref() else {
+        // DELETE
+        match block.block_type {
+            BlockType::TableCell | BlockType::TableAlign | BlockType::TableRow => {
+                return Err(MqdbError::SqlExec(
+                    "write-back cannot delete a table cell or row on its own; \
+                     UPDATE the cell's content instead"
+                        .into(),
+                ));
+            }
+            BlockType::List => {
+                let nested = list_descendants(blocks, block);
+                if nested.iter().any(|b| !matched.contains(&b.pre)) {
+                    return Err(MqdbError::SqlExec(format!(
+                        "list item '{}' has nested items; delete those in the same \
+                         statement, or the nested items would be left behind",
+                        block.content.lines().next().unwrap_or("")
+                    )));
+                }
+            }
+            _ => {}
+        }
+        return Ok(Action::RemoveLines {
+            start_line: span.start_line,
+            end_line: span.end_line,
+        });
+    };
+    // UPDATE
+    match block.block_type {
+        BlockType::List => {
+            single_line("list item", new_content)?;
+            Ok(Action::ReplaceRange {
+                start: (span.start_line, span.start_col),
+                end: (span.end_line, span.end_col),
+                text: new_content.to_string(),
+            })
+        }
+        BlockType::TableCell => {
+            let column = block
+                .properties
+                .get("column")
+                .and_then(|v| v.as_int())
+                .and_then(|c| usize::try_from(c).ok())
+                .ok_or_else(|| MqdbError::SqlExec("table cell has no column number".into()))?;
+            text_edit::escape_cell(new_content)?;
+            Ok(Action::SetCell {
+                line: span.start_line,
+                column,
+                text: new_content.to_string(),
+            })
+        }
+        _ => Ok(Action::ReplaceLines {
+            start_line: span.start_line,
+            end_line: span.end_line,
+            text: render_replacement(block, new_content)?,
+        }),
+    }
+}
+
+/// The list items nested under `item`: the run of list blocks right after it
+/// with a deeper level.
+fn list_descendants<'a>(blocks: &'a [Block], item: &Block) -> Vec<&'a Block> {
+    let level = list_level(item);
+    let Some(idx) = blocks.iter().position(|b| b.pre == item.pre) else {
+        return Vec::new();
+    };
+    blocks[idx + 1..]
+        .iter()
+        .take_while(|b| b.block_type == BlockType::List && list_level(b) > level)
+        .collect()
+}
+
+fn list_level(block: &Block) -> i64 {
+    block
+        .properties
+        .get("level")
+        .and_then(|v| v.as_int())
+        .unwrap_or(0)
+}
+
+/// Applies one [`Action`] to `lines`.
+fn apply_action(lines: &mut Vec<String>, action: &Action) -> Result<(), MqdbError> {
+    let stale = |line: usize| {
+        MqdbError::SqlExec(format!(
+            "line {line} no longer matches the index; the file changed since it was indexed (re-run `mq-db index`)"
+        ))
+    };
+    match action {
+        Action::ReplaceLines {
+            start_line,
+            end_line,
+            text,
+        } => {
+            let start = start_line.saturating_sub(1);
+            let end = (*end_line).min(lines.len());
+            if start < end && start < lines.len() {
+                lines.splice(start..end, std::iter::once(text.clone()));
+            }
+        }
+        Action::RemoveLines {
+            start_line,
+            end_line,
+        } => {
+            let start = start_line.saturating_sub(1);
+            let end = (*end_line).min(lines.len());
+            if start < end && start < lines.len() {
+                text_edit::remove_lines(lines, start, end);
+            }
+        }
+        Action::ReplaceRange { start, end, text } => {
+            let (first, last) = (start.0.checked_sub(1), end.0.checked_sub(1));
+            let (Some(first), Some(last)) = (first, last) else {
+                return Err(stale(start.0));
+            };
+            if first > last || last >= lines.len() {
+                return Err(stale(start.0));
+            }
+            let from =
+                text_edit::byte_offset(&lines[first], start.1).ok_or_else(|| stale(start.0))?;
+            let to = text_edit::byte_offset(&lines[last], end.1).ok_or_else(|| stale(end.0))?;
+            let prefix = &lines[first][..from];
+            if !text_edit::is_list_prefix(prefix) {
+                return Err(stale(start.0));
+            }
+            let replaced = format!("{prefix}{text}{}", &lines[last][to..]);
+            lines.splice(first..=last, std::iter::once(replaced));
+        }
+        Action::SetCell { line, column, text } => {
+            let idx = line.checked_sub(1).filter(|i| *i < lines.len());
+            let idx = idx.ok_or_else(|| stale(*line))?;
+            lines[idx] = text_edit::set_table_cell(&lines[idx], *column, text)?;
+        }
+    }
+    Ok(())
+}
+
 /// Applies `edits` (grouped by document) as a source-text patch + reparse:
-/// for each affected document, reads the *current* file off disk, splices
-/// in the rendered replacement (or removes the lines entirely for a
-/// `DELETE`) at each matched block's `Span`, writes the patched text back to
-/// the file, then calls [`DocumentStore::replace_document`] to re-parse it
-/// in place (same `DocumentId`, fresh blocks/index/catalog entry).
+/// for each affected document, reads the *current* file off disk, applies
+/// each matched block's planned [`Action`] (replacing its lines, its list-item
+/// text or a table cell, or removing its lines for a `DELETE`), writes the
+/// patched text back to the file, then calls
+/// [`DocumentStore::replace_document`] to re-parse it in place (same
+/// `DocumentId`, fresh blocks/index/catalog entry).
 ///
 /// Returns the number of blocks affected.
 fn apply_matched_edits(
@@ -237,13 +444,7 @@ fn apply_matched_edits(
 
     let mut affected = 0usize;
     for (doc_id, doc_edits) in by_doc {
-        struct LineEdit {
-            start_line: usize,
-            end_line: usize,
-            replacement: Option<String>,
-        }
-
-        let (path, mut line_edits) = {
+        let (path, mut actions) = {
             let doc = store
                 .get_document(doc_id)
                 .ok_or_else(|| MqdbError::SqlExec(format!("no such document: {doc_id}")))?;
@@ -253,30 +454,17 @@ fn apply_matched_edits(
                 )
             })?;
 
-            let mut line_edits = Vec::with_capacity(doc_edits.len());
+            let matched: FxHashSet<u32> = doc_edits.iter().map(|e| e.pre).collect();
+            let mut actions = Vec::with_capacity(doc_edits.len());
             for edit in &doc_edits {
                 let block = doc
                     .blocks
                     .iter()
                     .find(|b| b.pre == edit.pre)
                     .ok_or_else(|| MqdbError::SqlExec("matched block no longer exists".into()))?;
-                let span = block.span.as_ref().ok_or_else(|| {
-                    MqdbError::SqlExec(
-                        "write-back requires source spans; reindex without --no-spans".into(),
-                    )
-                })?;
-                let replacement = edit
-                    .new_content
-                    .as_deref()
-                    .map(|c| render_replacement(block, c))
-                    .transpose()?;
-                line_edits.push(LineEdit {
-                    start_line: span.start_line,
-                    end_line: span.end_line,
-                    replacement,
-                });
+                actions.push(plan_edit(&doc.blocks, block, edit, &matched)?);
             }
-            (path, line_edits)
+            (path, actions)
         };
 
         let original = std::fs::read_to_string(&path)?;
@@ -284,37 +472,14 @@ fn apply_matched_edits(
         let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
 
         // Apply from the bottom up so earlier edits don't shift later
-        // (already-resolved) line numbers.
-        line_edits.sort_by_key(|edit| std::cmp::Reverse(edit.start_line));
-        for edit in &line_edits {
-            let start = edit.start_line.saturating_sub(1);
-            let end = edit.end_line.min(lines.len());
-            if start >= end || start >= lines.len() {
-                continue;
-            }
-            match &edit.replacement {
-                Some(text) => {
-                    lines.splice(start..end, std::iter::once(text.clone()));
-                }
-                None => {
-                    let mut remove_start = start;
-                    let mut remove_end = end;
-                    if remove_end < lines.len() && lines[remove_end].trim().is_empty() {
-                        // Blank line after (the common case: an interior or
-                        // first block): swallow it.
-                        remove_end += 1;
-                    } else if remove_start > 0 && lines[remove_start - 1].trim().is_empty() {
-                        // No blank line after (block was the last one in the
-                        // file): swallow the blank line before it instead.
-                        remove_start -= 1;
-                    }
-                    lines.splice(remove_start..remove_end, std::iter::empty());
-                }
-            }
+        // (already-resolved) positions.
+        actions.sort_by_key(|a| std::cmp::Reverse(a.position()));
+        for action in &actions {
+            apply_action(&mut lines, action)?;
         }
 
         let mut patched = lines.join("\n");
-        if had_trailing_newline {
+        if had_trailing_newline && !patched.is_empty() {
             patched.push('\n');
         }
 
@@ -418,7 +583,7 @@ fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
                             MqdbError::SqlExec("block_type must be a string".into())
                         })?;
                         let bt = BlockType::from_str(&s.to_lowercase())
-                            .filter(is_writable_type)
+                            .filter(is_insertable_type)
                             .ok_or_else(|| {
                                 MqdbError::SqlExec(format!(
                                     "write-back is only supported for {WRITABLE_TYPES} blocks (found {s})"
@@ -467,6 +632,9 @@ fn collect_new_blocks(ins: &Insert) -> Result<Vec<NewBlockSpec>, MqdbError> {
                 MqdbError::SqlExec("INSERT INTO blocks requires non-NULL content".into())
             })?;
 
+            if block_type == BlockType::List {
+                single_line("list item", &content)?;
+            }
             match block_type {
                 BlockType::Heading => match depth {
                     None => {
@@ -524,12 +692,27 @@ fn apply_new_blocks(
 
     let mut inserted = 0usize;
     for (doc_id, doc_specs) in by_doc {
+        /// What to write for one inserted block.
+        enum Rendered {
+            /// Ready-made text, separated from its neighbours by blank lines.
+            Block(String),
+            /// A sibling of the list item whose text starts at
+            /// (`marker_line`, `text_col`): it copies that item's indent and
+            /// marker, and goes in without blank lines so the list stays
+            /// tight. Resolved once the file's lines are known.
+            ListItem {
+                marker_line: usize,
+                text_col: usize,
+                content: String,
+            },
+        }
+
         struct Insertion {
             /// 0-indexed line to insert before. `usize::MAX` means "end of
             /// file", resolved once the line count is known, below.
             at: usize,
             row_index: usize,
-            rendered: String,
+            rendered: Rendered,
         }
 
         let (path, mut insertions) = {
@@ -544,29 +727,59 @@ fn apply_new_blocks(
 
             let mut insertions = Vec::with_capacity(doc_specs.len());
             for spec in &doc_specs {
-                let at = match spec.after_pre {
+                let anchor = match spec.after_pre {
                     Some(pre) => {
-                        let block = doc.blocks.iter().find(|b| b.pre == pre).ok_or_else(|| {
+                        Some(doc.blocks.iter().find(|b| b.pre == pre).ok_or_else(|| {
                             MqdbError::SqlExec(format!(
                                 "after_pre {pre} does not match any block in document {doc_id}"
                             ))
-                        })?;
-                        let span = block.span.as_ref().ok_or_else(|| {
-                            MqdbError::SqlExec(
-                                "write-back requires source spans; reindex without --no-spans"
-                                    .into(),
-                            )
-                        })?;
-                        span.end_line
+                        })?)
                     }
-                    None => usize::MAX,
+                    None => None,
                 };
-                let opts = RenderOpts {
-                    depth: spec.depth,
-                    lang: spec.lang.clone(),
-                    ..RenderOpts::default()
+                let anchor_span = match anchor {
+                    Some(block) => Some(block.span.as_ref().ok_or_else(|| {
+                        MqdbError::SqlExec(
+                            "write-back requires source spans; reindex without --no-spans".into(),
+                        )
+                    })?),
+                    None => None,
                 };
-                let rendered = render_markdown_for(&spec.block_type, &opts, &spec.content)?;
+                let mut at = anchor_span.map_or(usize::MAX, |span| span.end_line);
+
+                let rendered = match (&spec.block_type, anchor, anchor_span) {
+                    (BlockType::List, Some(block), Some(span))
+                        if block.block_type == BlockType::List =>
+                    {
+                        // After the anchor's whole subtree, not between it and
+                        // its nested items.
+                        let subtree_end = list_descendants(&doc.blocks, block)
+                            .iter()
+                            .filter_map(|b| b.span.as_ref())
+                            .map(|s| s.end_line)
+                            .fold(span.end_line, usize::max);
+                        at = subtree_end;
+                        Rendered::ListItem {
+                            marker_line: span.start_line,
+                            text_col: span.start_col,
+                            content: spec.content.clone(),
+                        }
+                    }
+                    // A list item with no list item to follow starts a new list.
+                    (BlockType::List, _, _) => Rendered::Block(format!("- {}", spec.content)),
+                    _ => {
+                        let opts = RenderOpts {
+                            depth: spec.depth,
+                            lang: spec.lang.clone(),
+                            ..RenderOpts::default()
+                        };
+                        Rendered::Block(render_markdown_for(
+                            &spec.block_type,
+                            &opts,
+                            &spec.content,
+                        )?)
+                    }
+                };
                 insertions.push(Insertion {
                     at,
                     row_index: spec.row_index,
@@ -592,15 +805,34 @@ fn apply_new_blocks(
 
         for insertion in &insertions {
             let at = insertion.at.min(lines.len());
-            let needs_leading_blank = at > 0 && !lines[at - 1].trim().is_empty();
-            let needs_trailing_blank = at < lines.len() && !lines[at].trim().is_empty();
-
-            let mut new_lines = vec![insertion.rendered.clone()];
-            if needs_trailing_blank {
-                new_lines.push(String::new());
-            }
-            if needs_leading_blank {
-                new_lines.insert(0, String::new());
+            let (text, tight) = match &insertion.rendered {
+                Rendered::Block(text) => (text.clone(), false),
+                Rendered::ListItem {
+                    marker_line,
+                    text_col,
+                    content,
+                } => {
+                    let stale = || {
+                        MqdbError::SqlExec(format!(
+                            "line {marker_line} no longer matches the index; the file changed since it was indexed (re-run `mq-db index`)"
+                        ))
+                    };
+                    let line = lines.get(marker_line - 1).ok_or_else(stale)?;
+                    let offset = text_edit::byte_offset(line, *text_col).ok_or_else(stale)?;
+                    let prefix = text_edit::sibling_prefix(&line[..offset]).ok_or_else(stale)?;
+                    (format!("{prefix}{content}"), true)
+                }
+            };
+            let mut new_lines = vec![text];
+            if !tight {
+                let needs_leading_blank = at > 0 && !lines[at - 1].trim().is_empty();
+                let needs_trailing_blank = at < lines.len() && !lines[at].trim().is_empty();
+                if needs_trailing_blank {
+                    new_lines.push(String::new());
+                }
+                if needs_leading_blank {
+                    new_lines.insert(0, String::new());
+                }
             }
             lines.splice(at..at, new_lines);
         }

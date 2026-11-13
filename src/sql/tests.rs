@@ -1913,24 +1913,6 @@ fn write_back_delete_removes_matched_block_and_blank_line() {
 }
 
 #[test]
-fn write_back_update_rejects_table_blocks() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_md(
-        &dir,
-        "doc.md",
-        "# Title\n\n| a | b |\n|---|---|\n| 1 | 2 |\n",
-    );
-
-    let mut store = DocumentStore::new();
-    store.add_file(&path).unwrap();
-
-    let err = store
-        .execute_sql_mut("UPDATE blocks SET content = 'x' WHERE block_type = 'table_cell'")
-        .unwrap_err();
-    assert!(err.to_string().contains("only supported for"));
-}
-
-#[test]
 fn write_back_rejects_document_with_no_source_path() {
     let mut store = DocumentStore::new();
     store.add_str("# Title\n\nBody\n").unwrap();
@@ -2135,7 +2117,7 @@ fn write_back_insert_rejects_unsupported_block_type() {
 
     let err = store
         .execute_sql_mut(
-            "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'list', 'x')",
+            "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'table_cell', 'x')",
         )
         .unwrap_err();
     assert!(err.to_string().contains("only supported for"));
@@ -3959,4 +3941,428 @@ fn empty_wildcard_query_keeps_schema_columns_for_aliases() {
             names.join(", ")
         ))
         .unwrap();
+}
+
+/// Runs `sql` with write-back against a file holding `md`; returns the file
+/// afterwards, and the store.
+fn write_back(md: &str, sql: &str) -> (String, DocumentStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", md);
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+    store.execute_sql_mut(sql).unwrap();
+    let out = std::fs::read_to_string(&path).unwrap();
+    (out, store)
+}
+
+fn write_back_err(md: &str, sql: &str) -> (String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", md);
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+    let err = store.execute_sql_mut(sql).unwrap_err().to_string();
+    (err, std::fs::read_to_string(&path).unwrap())
+}
+
+fn contents(store: &DocumentStore, block_type: &str) -> Vec<String> {
+    store.documents()[0]
+        .blocks
+        .iter()
+        .filter(|b| b.block_type.as_str() == block_type)
+        .map(|b| b.content.clone())
+        .collect()
+}
+
+#[test]
+fn write_back_update_list_item_keeps_marker_checkbox_and_indent() {
+    let md = "# T\n\n- one\n- two\n\n1. first\n2. [x] done\n   - nested\n";
+    let (out, store) = write_back(
+        md,
+        "UPDATE blocks SET content = '2' WHERE block_type = 'list' AND content = 'two'",
+    );
+    assert_eq!(
+        out,
+        "# T\n\n- one\n- 2\n\n1. first\n2. [x] done\n   - nested\n"
+    );
+    assert_eq!(
+        contents(&store, "list"),
+        ["one", "2", "first", "done", "nested"]
+    );
+
+    let (out, _) = write_back(
+        md,
+        "UPDATE blocks SET content = 'finished' WHERE block_type = 'list' AND content = 'done'",
+    );
+    assert!(out.contains("\n2. [x] finished\n"), "{out}");
+    let (out, _) = write_back(
+        md,
+        "UPDATE blocks SET content = 'inner' WHERE block_type = 'list' AND content = 'nested'",
+    );
+    assert!(out.contains("\n   - inner\n"), "{out}");
+}
+
+#[test]
+fn write_back_update_list_item_with_continuation_lines_and_unicode() {
+    let (out, store) = write_back(
+        "- two with `code`\n  continued\n- next\n",
+        "UPDATE blocks SET content = 'short' WHERE content LIKE 'two%'",
+    );
+    assert_eq!(out, "- short\n- next\n");
+    assert_eq!(contents(&store, "list"), ["short", "next"]);
+
+    // Japanese and an emoji before the end of the item's text.
+    let (out, _) = write_back(
+        "- a😀b\n- 日本語です\n",
+        "UPDATE blocks SET content = 'X' WHERE block_type = 'list'",
+    );
+    assert_eq!(out, "- X\n- X\n");
+}
+
+#[test]
+fn write_back_list_rejects_multi_line_content() {
+    let (err, file) = write_back_err(
+        "- a\n",
+        "UPDATE blocks SET content = 'x\ny' WHERE block_type = 'list'",
+    );
+    assert!(err.contains("single line"), "{err}");
+    assert_eq!(file, "- a\n");
+    let (err, _) = write_back_err(
+        "# T\n",
+        "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'list', 'x\ny')",
+    );
+    assert!(err.contains("single line"), "{err}");
+}
+
+#[test]
+fn write_back_delete_list_items_without_disturbing_the_rest() {
+    let md = "para\n\n- a\n- b\n- c\n\nafter\n";
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content = 'b'");
+    assert_eq!(out, "para\n\n- a\n- c\n\nafter\n");
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content = 'a'");
+    assert_eq!(out, "para\n\n- b\n- c\n\nafter\n");
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content = 'c'");
+    assert_eq!(out, "para\n\n- a\n- b\n\nafter\n");
+    let (out, store) = write_back(md, "DELETE FROM blocks WHERE block_type = 'list'");
+    assert_eq!(out, "para\n\nafter\n");
+    assert!(contents(&store, "list").is_empty());
+}
+
+#[test]
+fn write_back_delete_list_item_with_nested_items_needs_them_too() {
+    let md = "- a\n  - a1\n  - a2\n- b\n";
+    let (err, file) = write_back_err(md, "DELETE FROM blocks WHERE content = 'a'");
+    assert!(err.contains("nested items"), "{err}");
+    assert_eq!(
+        file, md,
+        "nothing is written when the statement is rejected"
+    );
+
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content IN ('a', 'a1', 'a2')");
+    assert_eq!(out, "- b\n");
+    // A nested item alone is fine.
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content = 'a1'");
+    assert_eq!(out, "- a\n  - a2\n- b\n");
+}
+
+#[test]
+fn write_back_delete_block_followed_directly_by_text_keeps_paragraphs_apart() {
+    let (out, _) = write_back(
+        "para\n\n# H\ntext\n",
+        "DELETE FROM blocks WHERE block_type = 'heading'",
+    );
+    assert_eq!(out, "para\n\ntext\n");
+}
+
+#[test]
+fn write_back_insert_list_item_after_an_item() {
+    let md = "# T\n\n- one\n- two\n\nTail\n";
+    // after_pre of "one"
+    let pre: u32 = {
+        let mut s = DocumentStore::new();
+        s.add_str(md).unwrap();
+        s.documents()[0]
+            .blocks
+            .iter()
+            .find(|b| b.content == "one")
+            .unwrap()
+            .pre
+    };
+    let (out, store) = write_back(
+        md,
+        &format!(
+            "INSERT INTO blocks (document_id, block_type, content, after_pre) \
+             VALUES (0, 'list', 'new', {pre})"
+        ),
+    );
+    assert_eq!(out, "# T\n\n- one\n- new\n- two\n\nTail\n");
+    assert_eq!(contents(&store, "list"), ["one", "new", "two"]);
+}
+
+#[test]
+fn write_back_insert_list_item_goes_after_nested_items_and_copies_the_marker() {
+    let md = "1. [x] first\n   - child\n2. second\n";
+    let pre = |text: &str| -> u32 {
+        let mut s = DocumentStore::new();
+        s.add_str(md).unwrap();
+        s.documents()[0]
+            .blocks
+            .iter()
+            .find(|b| b.content == text)
+            .unwrap()
+            .pre
+    };
+    // After the checked, ordered parent: past its child, unchecked, same marker.
+    let (out, _) = write_back(
+        md,
+        &format!(
+            "INSERT INTO blocks (document_id, block_type, content, after_pre) \
+             VALUES (0, 'list', 'mid', {})",
+            pre("first")
+        ),
+    );
+    assert_eq!(out, "1. [x] first\n   - child\n1. mid\n2. second\n");
+    // After the nested child: keeps the child's indent.
+    let (out, _) = write_back(
+        md,
+        &format!(
+            "INSERT INTO blocks (document_id, block_type, content, after_pre) \
+             VALUES (0, 'list', 'sibling', {})",
+            pre("child")
+        ),
+    );
+    assert_eq!(out, "1. [x] first\n   - child\n   - sibling\n2. second\n");
+}
+
+#[test]
+fn write_back_insert_list_item_in_order_and_as_a_new_list() {
+    let md = "# T\n\n- a\n- b\n";
+    let pre_a: u32 = {
+        let mut s = DocumentStore::new();
+        s.add_str(md).unwrap();
+        s.documents()[0]
+            .blocks
+            .iter()
+            .find(|b| b.content == "a")
+            .unwrap()
+            .pre
+    };
+    // Several rows after the same item keep their VALUES order.
+    let (out, _) = write_back(
+        md,
+        &format!(
+            "INSERT INTO blocks (document_id, block_type, content, after_pre) \
+             VALUES (0, 'list', 'x', {pre_a}), (0, 'list', 'y', {pre_a})"
+        ),
+    );
+    assert_eq!(out, "# T\n\n- a\n- x\n- y\n- b\n");
+    // No list item to follow: a new bullet list, set off by a blank line.
+    let (out, _) = write_back(
+        "# T\n\ntext\n",
+        "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'list', 'first')",
+    );
+    assert_eq!(out, "# T\n\ntext\n\n- first\n");
+}
+
+const TABLE_MD: &str = "# T\n\n| a | b |\n|---|:-:|\n| 1 \\| x |   2|\n| 3 | 4 |\n\nTail\n";
+
+#[test]
+fn write_back_update_table_cell_changes_only_that_cell() {
+    let (out, store) = write_back(
+        TABLE_MD,
+        "UPDATE blocks SET content = 'B' WHERE block_type = 'table_cell' AND content = 'b'",
+    );
+    assert_eq!(
+        out,
+        "# T\n\n| a | B |\n|---|:-:|\n| 1 \\| x |   2|\n| 3 | 4 |\n\nTail\n"
+    );
+    assert_eq!(
+        contents(&store, "table_cell"),
+        ["a", "B", "1 | x", "2", "3", "4"]
+    );
+
+    // A body cell whose neighbour has an escaped pipe and odd spacing.
+    let (out, _) = write_back(
+        TABLE_MD,
+        "UPDATE blocks SET content = 'two' WHERE block_type = 'table_cell' AND content = '2'",
+    );
+    assert!(out.contains("| 1 \\| x | two |\n"), "{out}");
+}
+
+#[test]
+fn write_back_update_several_cells_of_one_row() {
+    let (out, store) = write_back(
+        TABLE_MD,
+        "UPDATE blocks SET content = 'z' WHERE block_type = 'table_cell' AND content IN ('3', '4')",
+    );
+    assert!(out.contains("\n| z | z |\n"), "{out}");
+    assert_eq!(
+        contents(&store, "table_cell"),
+        ["a", "b", "1 | x", "2", "z", "z"]
+    );
+}
+
+#[test]
+fn write_back_update_table_cell_escapes_pipes_and_rejects_line_breaks() {
+    let (out, store) = write_back(
+        TABLE_MD,
+        "UPDATE blocks SET content = 'p|q' WHERE block_type = 'table_cell' AND content = '3'",
+    );
+    assert!(out.contains("| p\\|q | 4 |"), "{out}");
+    assert_eq!(
+        contents(&store, "table_cell")[4],
+        "p|q",
+        "the escaped pipe reads back as the text that was written"
+    );
+
+    let (err, file) = write_back_err(
+        TABLE_MD,
+        "UPDATE blocks SET content = 'a\nb' WHERE block_type = 'table_cell' AND content = '3'",
+    );
+    assert!(err.contains("line break"), "{err}");
+    assert_eq!(file, TABLE_MD);
+}
+
+#[test]
+fn write_back_cannot_delete_or_insert_table_cells() {
+    let (err, file) = write_back_err(
+        TABLE_MD,
+        "DELETE FROM blocks WHERE block_type = 'table_cell' AND content = '3'",
+    );
+    assert!(err.contains("table cell"), "{err}");
+    assert_eq!(file, TABLE_MD);
+    let (err, _) = write_back_err(
+        TABLE_MD,
+        "DELETE FROM blocks WHERE block_type = 'table_align'",
+    );
+    assert!(err.contains("table cell"), "{err}");
+    let (err, _) = write_back_err(
+        TABLE_MD,
+        "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'table_cell', 'x')",
+    );
+    assert!(err.contains("only supported for"), "{err}");
+}
+
+/// Updating any one list item or table cell changes that block's content to
+/// the new text and nothing else: the block count and every other block's
+/// content stay as they were. Covers nesting, ordered/checked items, wrapped
+/// items, Japanese and emoji text, escaped pipes and uneven table spacing.
+#[test]
+fn write_back_update_of_any_single_list_item_or_cell_is_isolated() {
+    let md = "# Title\n\nintro 😀 text\n\n- one\n- two with `code`\n  wrapped line\n  - nested 日本語\n    - deeper 😀x\n- [ ] todo\n- [x] done\n\n1. first\n2. second\n   - child\n10. tenth\n\n| a | b | c |\n|---|:-:|--:|\n| 1 \\| x |   2| `p` |\n|  日本 | 😀 | z |\n| 3 | 4 | 5 |\n\n- other list\n\nTail paragraph\n";
+    let mut baseline = DocumentStore::new();
+    baseline.add_str(md).unwrap();
+    let blocks: Vec<(u32, String, String)> = baseline.documents()[0]
+        .blocks
+        .iter()
+        .map(|b| (b.pre, b.block_type.as_str().to_string(), b.content.clone()))
+        .collect();
+    let targets: Vec<&(u32, String, String)> = blocks
+        .iter()
+        .filter(|(_, t, _)| t == "list" || t == "table_cell")
+        .collect();
+    assert!(
+        targets.len() >= 20,
+        "the document should have plenty to edit"
+    );
+
+    for (pre, block_type, original) in targets {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", md);
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+        store
+            .execute_sql_mut(&format!(
+                "UPDATE blocks SET content = 'NEW' WHERE pre = {pre}"
+            ))
+            .unwrap_or_else(|e| panic!("{block_type} {original:?}: {e}"));
+
+        let after: Vec<(String, String)> = store.documents()[0]
+            .blocks
+            .iter()
+            .map(|b| (b.block_type.as_str().to_string(), b.content.clone()))
+            .collect();
+        assert_eq!(
+            after.len(),
+            blocks.len(),
+            "{block_type} {original:?}: block count changed\n{}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        for (i, ((_, t, before), (t_after, c_after))) in blocks.iter().zip(&after).enumerate() {
+            assert_eq!(
+                t, t_after,
+                "{block_type} {original:?}: block {i} changed type"
+            );
+            let expected = if blocks[i].0 == *pre {
+                "NEW"
+            } else {
+                before.as_str()
+            };
+            assert_eq!(
+                c_after,
+                expected,
+                "{block_type} {original:?}: block {i} is wrong\n{}",
+                std::fs::read_to_string(&path).unwrap()
+            );
+        }
+    }
+}
+
+/// Deleting any one block (that can be deleted on its own) removes exactly
+/// that block: every other block keeps its type and content, so removing
+/// lines never glues a paragraph to a list or two lists together.
+#[test]
+fn write_back_delete_of_any_single_block_removes_only_that_block() {
+    let md = "---\ntitle: x\n---\n\n# Title\ntext right under the heading\n\nintro\n\n- one\n- two\n  - nested\n- three\n\n1. first\n2. second\n\n```rust\nfn f() {}\n```\n\n> quoted\n\nplain paragraph\n## Sub\n\n- last list\n\nTail\n";
+    let mut baseline = DocumentStore::new();
+    baseline.add_str(md).unwrap();
+    let blocks: Vec<(u32, String, String)> = baseline.documents()[0]
+        .blocks
+        .iter()
+        .map(|b| (b.pre, b.block_type.as_str().to_string(), b.content.clone()))
+        .collect();
+
+    let mut deleted = 0;
+    for (i, (pre, block_type, content)) in blocks.iter().enumerate() {
+        // A nested parent is only deletable together with its children.
+        let has_children = baseline.documents()[0]
+            .blocks
+            .get(i + 1)
+            .zip(baseline.documents()[0].blocks.get(i))
+            .is_some_and(|(next, this)| {
+                this.block_type.as_str() == "list"
+                    && next.block_type.as_str() == "list"
+                    && next.properties.get("level").and_then(|v| v.as_int())
+                        > this.properties.get("level").and_then(|v| v.as_int())
+            });
+        if has_children {
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", md);
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+        store
+            .execute_sql_mut(&format!("DELETE FROM blocks WHERE pre = {pre}"))
+            .unwrap_or_else(|e| panic!("{block_type} {content:?}: {e}"));
+        deleted += 1;
+
+        let after: Vec<(String, String)> = store.documents()[0]
+            .blocks
+            .iter()
+            .map(|b| (b.block_type.as_str().to_string(), b.content.clone()))
+            .collect();
+        let expected: Vec<(String, String)> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| j != &i)
+            .map(|(_, (_, t, c))| (t.clone(), c.clone()))
+            .collect();
+        assert_eq!(
+            after,
+            expected,
+            "deleting {block_type} {content:?} changed something else\n{}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+    }
+    assert!(deleted >= 12, "only {deleted} blocks were exercised");
 }

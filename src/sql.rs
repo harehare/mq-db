@@ -77,6 +77,7 @@ mod scalar;
 mod scan;
 #[cfg(test)]
 mod tests;
+mod text_edit;
 mod value;
 mod vector_index;
 mod write_back;
