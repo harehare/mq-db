@@ -299,18 +299,27 @@ pub fn detect_tokenizer(paths: &[std::path::PathBuf]) -> TokenizerKind {
 /// (`src/sql/`); the two **must** pass the same `kind`, or the index
 /// silently drops true matches instead of just mis-ranking them.
 pub fn tokenize(text: &str, kind: TokenizerKind) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for_each_token(text, kind, |t| tokens.push(t.to_string()));
+    tokens
+}
+
+/// Calls `f` with every token [`tokenize`] would return, in the same order,
+/// without allocating a `String` per token (every token is a slice of the
+/// lowercased text).
+pub fn for_each_token(text: &str, kind: TokenizerKind, mut f: impl FnMut(&str)) {
     let lower = text.to_lowercase();
     let Some(n) = kind.ngram_size() else {
-        return lower
+        lower
             .split(|c: char| !c.is_alphanumeric())
             .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
+            .for_each(f);
+        return;
     };
 
     // A script transition (CJK <-> non-CJK) is also a run boundary, so
     // "abc日本語" splits into "abc" + a CJK run instead of staying one token.
-    #[derive(PartialEq)]
+    #[derive(PartialEq, Clone, Copy)]
     enum Class {
         Other,
         Cjk,
@@ -326,33 +335,38 @@ pub fn tokenize(text: &str, kind: TokenizerKind) -> Vec<String> {
         }
     }
 
-    let mut tokens = Vec::new();
-    let chars: Vec<char> = lower.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let class = classify(chars[i]);
-        let start = i;
-        while i < chars.len() && classify(chars[i]) == class {
-            i += 1;
+    // Byte offset of each char of the current CJK run, plus its end.
+    let mut offsets: Vec<usize> = Vec::new();
+    let mut chars = lower.char_indices().peekable();
+    while let Some(&(start, first)) = chars.peek() {
+        let class = classify(first);
+        offsets.clear();
+        let mut end = start;
+        while let Some(&(i, c)) = chars.peek() {
+            if classify(c) != class {
+                break;
+            }
+            offsets.push(i);
+            end = i + c.len_utf8();
+            chars.next();
         }
-        if class == Class::Skip {
-            continue;
-        }
-        let run = &chars[start..i];
-        if class == Class::Other {
-            tokens.push(run.iter().collect());
-        } else {
-            // All window sizes up to n, not just n, so a query shorter than
-            // n (e.g. one character against Bigram) can still match inside
-            // a longer indexed run.
-            for w in 1..=n.min(run.len()) {
-                for win in run.windows(w) {
-                    tokens.push(win.iter().collect());
+        match class {
+            Class::Skip => {}
+            Class::Other => f(&lower[start..end]),
+            Class::Cjk => {
+                offsets.push(end);
+                let len = offsets.len() - 1;
+                // All window sizes up to n, not just n, so a query shorter than
+                // n (e.g. one character against Bigram) can still match inside
+                // a longer indexed run.
+                for w in 1..=n.min(len) {
+                    for i in 0..=len - w {
+                        f(&lower[offsets[i]..offsets[i + w]]);
+                    }
                 }
             }
         }
     }
-    tokens
 }
 
 /// Inverted index on tokenized `content`: term → sorted, deduped block

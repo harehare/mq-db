@@ -2,7 +2,7 @@
 
 use super::engine::SqlEngine;
 use super::rows::ident_value;
-use crate::indexes::{DocumentIndex, TokenizerKind, tokenize};
+use crate::indexes::{DocumentIndex, TokenizerKind, for_each_token, tokenize};
 use crate::{DocumentStore, MqdbError};
 use rustc_hash::FxHashMap;
 use sqlparser::ast::TableFactor;
@@ -134,6 +134,9 @@ pub(super) struct Bm25Corpus {
     avgdl: f64,
     df: FxHashMap<String, u32>,
     pub(super) tokenizer: TokenizerKind,
+    /// Tokens of the last scored query; `score` runs once per row with the
+    /// same query.
+    last_query: std::cell::RefCell<Option<(String, std::rc::Rc<Vec<String>>)>>,
 }
 
 impl Bm25Corpus {
@@ -145,7 +148,12 @@ impl Bm25Corpus {
             n += u64::from(idx.term.block_count);
             total_tokens += idx.term.total_token_count;
             for (term, count) in idx.term.document_frequencies() {
-                *df.entry(term.to_string()).or_default() += count;
+                // `entry()` would allocate the key on every call.
+                if let Some(slot) = df.get_mut(term) {
+                    *slot += count;
+                } else {
+                    df.insert(term.to_string(), count);
+                }
             }
         }
         let avgdl = if n == 0 {
@@ -158,26 +166,47 @@ impl Bm25Corpus {
             avgdl,
             df,
             tokenizer,
+            last_query: std::cell::RefCell::new(None),
         }
+    }
+
+    fn query_tokens(&self, query: &str) -> std::rc::Rc<Vec<String>> {
+        if let Some((q, tokens)) = self.last_query.borrow().as_ref()
+            && q == query
+        {
+            return tokens.clone();
+        }
+        let tokens = std::rc::Rc::new(tokenize(query, self.tokenizer));
+        *self.last_query.borrow_mut() = Some((query.to_string(), tokens.clone()));
+        tokens
     }
 
     pub(super) fn score(&self, content: &str, query: &str) -> f64 {
         if self.n == 0 {
             return 0.0;
         }
-        let content_terms = tokenize(content, self.tokenizer);
-        let dl = content_terms.len() as f64;
+        let query_tokens = self.query_tokens(query);
+        // Only the query terms' frequencies matter, so count those directly
+        // instead of building a map over every term of `content`.
+        let mut counts = vec![0u32; query_tokens.len()];
+        let mut dl_tokens = 0u32;
+        for_each_token(content, self.tokenizer, |tok| {
+            dl_tokens += 1;
+            for (count, qt) in counts.iter_mut().zip(query_tokens.iter()) {
+                if qt == tok {
+                    *count += 1;
+                }
+            }
+        });
+        let dl = f64::from(dl_tokens);
         if dl == 0.0 {
             return 0.0;
         }
-        let mut freq: FxHashMap<&str, u32> = FxHashMap::default();
-        for t in &content_terms {
-            *freq.entry(t.as_str()).or_default() += 1;
-        }
-        tokenize(query, self.tokenizer)
+        query_tokens
             .iter()
-            .map(|qt| {
-                let f = f64::from(*freq.get(qt.as_str()).unwrap_or(&0));
+            .zip(&counts)
+            .map(|(qt, &count)| {
+                let f = f64::from(count);
                 if f == 0.0 {
                     return 0.0;
                 }
