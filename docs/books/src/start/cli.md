@@ -122,7 +122,10 @@ Computes embeddings for new or changed blocks through an OpenAI-compatible API a
 
 ```bash
 mq-db embed --db store.mq-db --endpoint http://localhost:11434/v1 --model nomic-embed-text
+mq-db find "how do I handle errors?" --semantic --db store.mq-db
 ```
+
+`embed` also keeps an HNSW index up to date; `find --semantic` ranks by meaning instead of keywords.
 
 ## `vacuum`
 

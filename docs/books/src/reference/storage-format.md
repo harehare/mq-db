@@ -41,7 +41,7 @@ Page 0 always has `page_type = 1` and `page_id = 0`.
 | Offset in body | Size | Field                | Type         | Value                          |
 | -------------- | ---- | --------------------- | ------------ | ------------------------------- |
 | 0               | 4    | `magic`               | `u32 LE`     | `0x4D514442` (`"MQDB"`)         |
-| 4               | 4    | `version`             | `u32 LE`     | `7` (readers also accept legacy `4`, `5`, `6`) |
+| 4               | 4    | `version`             | `u32 LE`     | `8` (readers also accept legacy `4`, `5`, `6`, `7`) |
 | 8               | 4    | `page_size`           | `u32 LE`     | `8192`                          |
 | 12              | 4    | `num_pages`           | `u32 LE`     | Total pages currently in file   |
 | 16              | 4    | `catalog_start_page`  | `u32 LE`     | Always `1`                      |
@@ -57,7 +57,7 @@ Page 1 (Catalog) --> Page 12 (Catalog) --> Page 18 (Catalog) --> 0
 
 ### Catalog body format
 
-The catalog holds document entries, custom tables, content hashes, view definitions, and the store's tokenizer, in this order:
+The catalog holds document entries, custom tables, content hashes, view definitions, the store's tokenizer, and vector indexes, in this order:
 
 | Section         | Fields                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------ |
@@ -66,8 +66,15 @@ The catalog holds document entries, custom tables, content hashes, view definiti
 | Content hashes   | `num_hashes: u32`, then per entry: `document_id: u32`, `hash: u64`                                |
 | Views            | `num_views: u32`, then per view: `name_len: u16` + `name`, `sql_len: u16` + `sql`                |
 | Tokenizer        | `tokenizer: u8` (`0=Word`, `1=Bigram`, `2=Trigram`)                                               |
+| Vector indexes   | `num_indexes: u32`, then per index: `name`, `table`, `column` (each `len: u16` + bytes), `first_page: u32`, `table_rows: u32`. Only written when at least one index exists. |
 
-`index_start_page` is `0` when no secondary index is persisted for that document. Every trailing section (custom tables onward) is optional: a catalog blob written by an older `mq-db` version simply ends early, and readers default the missing sections to empty (tokenizer defaults to `Word`).
+`index_start_page` is `0` when no secondary index is persisted for that document. Every trailing section (custom tables onward) is optional: a catalog blob written by an older `mq-db` version simply ends early, and readers default the missing sections to empty (tokenizer defaults to `Word`). A reader that predates a section stops before it, so adding one needs no version bump: the vector-index section is ignored by older versions, which also drop it the next time they write the catalog.
+
+### Vector index blob
+
+Each vector index is one blob in its own page chain (an `Index` page followed by `Overflow` pages, like a document's secondary index), starting at `first_page`. The blob is `MQVI`, a format byte (`1`), then little-endian `dim`, `m`, `ef_construction`, `node_count`, `entry_point` (`0xFFFFFFFF` if empty) and `max_level` as `u32`s, the table row number of each node (`u32`), the unit-length vectors (`f32`, `dim` per node), and for each node its level count (`u8`) followed by, per level, a neighbour count (`u16`) and the neighbour node ids (`u32`). The blob is padded to a whole page; readers validate every count and id against the buffer before use.
+
+`table_rows` is the table's row count when the index was built. If the table has a different number of rows later, the index is stale and `vector_search()` ignores it.
 
 ## Block Data Pages
 

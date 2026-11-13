@@ -20,6 +20,10 @@ pub struct EmbedConfig {
     pub dimensions: Option<usize>,
     /// Drop every stored embedding first instead of refusing a model change.
     pub rebuild: bool,
+    /// Keep an hnsw index on the table's `embedding` column up to date, so
+    /// `vector_search()` stays fast. Writing to the table drops the index,
+    /// so it is rebuilt here whenever it is missing.
+    pub build_index: bool,
 }
 
 impl Default for EmbedConfig {
@@ -31,6 +35,7 @@ impl Default for EmbedConfig {
             batch_size: 64,
             dimensions: None,
             rebuild: false,
+            build_index: true,
         }
     }
 }
@@ -44,6 +49,8 @@ pub struct EmbedReport {
     pub up_to_date: usize,
     /// Stored embeddings dropped because no block has that hash any more.
     pub removed: usize,
+    /// Whether the hnsw index was (re)built by this run.
+    pub index_built: bool,
 }
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -207,6 +214,7 @@ pub fn sync_embeddings(
         embedded: 0,
         up_to_date: total_blocks.saturating_sub(todo.len()),
         removed,
+        index_built: false,
     };
 
     for chunk in todo.chunks(cfg.batch_size) {
@@ -231,7 +239,107 @@ pub fn sync_embeddings(
         report.embedded += chunk.len();
         progress(report.embedded, todo.len());
     }
+
+    if cfg.build_index && store.find_vector_index(table, "embedding").is_none() {
+        let has_rows = engine
+            .execute(&format!("SELECT count(*) FROM {table}"))?
+            .rows[0][0]
+            != "0";
+        if has_rows {
+            let index = format!("{table}_hnsw");
+            engine.execute(&format!("DROP INDEX IF EXISTS {index}"))?;
+            engine.execute(&format!(
+                "CREATE INDEX {index} ON {table} USING hnsw (embedding)"
+            ))?;
+            report.index_built = true;
+        }
+    }
     Ok(report)
+}
+
+/// Embeds `query` and returns the `limit` blocks whose stored embedding is
+/// closest to it, as search hits (`score` is cosine similarity).
+///
+/// The query is embedded with the model the table was built with, since
+/// vectors from different models cannot be compared; `cfg.model` is only a
+/// fallback and is ignored when the table records one.
+pub fn semantic_hits(
+    store: &DocumentStore,
+    cfg: &EmbedConfig,
+    table: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<crate::search::FindHit>, MqdbError> {
+    if !valid_identifier(table) {
+        return Err(MqdbError::Embed(format!("invalid table name '{table}'")));
+    }
+    let engine = SqlEngine::new(store)?;
+    let models = engine
+        .execute(&format!("SELECT DISTINCT model FROM {table}"))
+        .map_err(|_| {
+            MqdbError::Embed(format!(
+                "table '{table}' does not exist; run `mq-db embed` first"
+            ))
+        })?
+        .rows;
+    let model = match models.as_slice() {
+        [] => {
+            return Err(MqdbError::Embed(format!(
+                "table '{table}' has no embeddings; run `mq-db embed` first"
+            )));
+        }
+        [one] => one[0].clone(),
+        _ => {
+            return Err(MqdbError::Embed(format!(
+                "table '{table}' mixes embeddings from several models; run `mq-db embed --rebuild`"
+            )));
+        }
+    };
+    let stored_dims = engine
+        .execute(&format!("SELECT embedding FROM {table} LIMIT 1"))?
+        .rows
+        .first()
+        .and_then(|r| crate::vector::parse_vector_text(&r[0]))
+        .map(|v| v.len());
+
+    let query_cfg = EmbedConfig {
+        model,
+        ..cfg.clone()
+    };
+    let vector = embed_batch(&query_cfg, &[query.to_string()])?
+        .pop()
+        .ok_or_else(|| MqdbError::Embed("the API returned no embedding for the query".into()))?;
+    if let Some(dims) = stored_dims
+        && dims != vector.len()
+    {
+        return Err(MqdbError::Embed(format!(
+            "the query embedding has {} dimensions but the stored ones have {dims}; \
+             pass --dimensions {dims} if the model supports it",
+            vector.len()
+        )));
+    }
+
+    let out = engine.execute(&format!(
+        "SELECT d.path, b.block_type, b.content, v.score \
+         FROM vector_search('{table}', 'embedding', {}, {limit}) v \
+         JOIN blocks b ON b.content_hash = v.content_hash \
+         JOIN documents d ON d.id = b.document_id \
+         ORDER BY v.score DESC, d.path ASC LIMIT {limit}",
+        sql_quote(&vector_json(&vector))
+    ))?;
+    Ok(out
+        .rows
+        .into_iter()
+        .filter_map(|row| {
+            let [path, block_type, content, score] = <[String; 4]>::try_from(row).ok()?;
+            Some(crate::search::FindHit {
+                path,
+                block_type,
+                content,
+                score: score.parse().unwrap_or(0.0),
+            })
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -361,6 +469,7 @@ mod tests {
         let first = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
         assert_eq!(first.embedded, 3); // heading + 2 paragraphs
         assert_eq!(first.up_to_date, 0);
+        assert!(first.index_built);
         assert_eq!(requests.lock().unwrap().len(), 2); // batch size 2
 
         let again = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
@@ -369,7 +478,8 @@ mod tests {
             EmbedReport {
                 embedded: 0,
                 up_to_date: 3,
-                removed: 0
+                removed: 0,
+                index_built: false
             }
         );
         assert_eq!(requests.lock().unwrap().len(), 2, "no new requests");
@@ -413,5 +523,93 @@ mod tests {
         assert!(sync_embeddings(&store, &c, "a b", |_, _| {}).is_err());
         let zero = EmbedConfig { batch_size: 0, ..c };
         assert!(sync_embeddings(&store, &zero, "emb", |_, _| {}).is_err());
+    }
+
+    #[test]
+    fn sync_keeps_the_hnsw_index_current() {
+        let (endpoint, _) = mock_server();
+        let mut store = store_with(&["# T\n\nbody\n"]);
+        let c = cfg(endpoint);
+        sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert!(store.find_vector_index("emb", "embedding").is_some());
+
+        // Nothing changed: the index is left alone.
+        let idle = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert!(!idle.index_built);
+
+        // New content writes to the table, which drops the index; sync
+        // brings it back.
+        store.add_str("# U\n\nmore text\n").unwrap();
+        let again = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert!(again.embedded > 0 && again.index_built);
+        assert!(store.find_vector_index("emb", "embedding").is_some());
+    }
+
+    #[test]
+    fn sync_can_skip_the_index() {
+        let (endpoint, _) = mock_server();
+        let store = store_with(&["# T\n\nbody\n"]);
+        let c = EmbedConfig {
+            build_index: false,
+            ..cfg(endpoint)
+        };
+        let report = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert!(!report.index_built);
+        assert!(store.find_vector_index("emb", "embedding").is_none());
+    }
+
+    #[test]
+    fn semantic_hits_rank_by_embedding_and_use_the_tables_model() {
+        let (endpoint, requests) = mock_server();
+        // The mock embeds a text as [length, 0.5, -1], so the closest block to
+        // a query is the one whose text has the closest length.
+        let store = store_with(&["# a\n\nabcde\n\nabcdefghijklmnopqrstuvwxyz\n"]);
+        let c = cfg(endpoint);
+        sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        requests.lock().unwrap().clear();
+
+        let asking = EmbedConfig {
+            model: "a-different-model".into(),
+            ..c
+        };
+        let hits = semantic_hits(&store, &asking, "emb", "vwxyz", 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].content, "abcde");
+        assert!(hits[0].score >= hits[1].score);
+        assert_eq!(
+            requests.lock().unwrap()[0]["model"],
+            "test-model",
+            "the query is embedded with the model the table was built with"
+        );
+    }
+
+    #[test]
+    fn semantic_hits_explain_what_is_missing() {
+        let (endpoint, _) = mock_server();
+        let store = store_with(&["# T\n\nbody\n"]);
+        let c = cfg(endpoint);
+
+        let no_table = semantic_hits(&store, &c, "emb", "q", 3).unwrap_err();
+        assert!(no_table.to_string().contains("mq-db embed"));
+
+        SqlEngine::new(&store)
+            .unwrap()
+            .execute("CREATE TABLE emb (content_hash TEXT, embedding TEXT, model TEXT)")
+            .unwrap();
+        let empty = semantic_hits(&store, &c, "emb", "q", 3).unwrap_err();
+        assert!(empty.to_string().contains("no embeddings"));
+
+        // Stored vectors of another size than the API returns (3).
+        SqlEngine::new(&store)
+            .unwrap()
+            .execute("INSERT INTO emb VALUES ('h', '[1,2,3,4,5]', 'test-model')")
+            .unwrap();
+        let mismatch = semantic_hits(&store, &c, "emb", "q", 3).unwrap_err();
+        assert!(
+            mismatch.to_string().contains("--dimensions 5"),
+            "{mismatch}"
+        );
+
+        assert!(semantic_hits(&store, &c, "bad name", "q", 3).is_err());
     }
 }

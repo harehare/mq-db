@@ -24,7 +24,7 @@ It parses Markdown into a flat block list with an interval index (pre/post order
 ## Features
 
 - Query Markdown with [SQL](https://db.mqlang.org/book/reference/sql-schema) or mq, and hierarchy queries with `under()`
-- [Full-text search](https://db.mqlang.org/book/reference/full-text-search) (`match()` / `bm25()`) and [vector search](https://db.mqlang.org/book/reference/vector-search)
+- [Full-text search](https://db.mqlang.org/book/reference/full-text-search) (`match()` / `bm25()`) and [vector search](https://db.mqlang.org/book/reference/vector-search) with `mq-db embed`, an HNSW index and `find --semantic`
 - [CTEs](https://db.mqlang.org/book/reference/cte), [`EXPLAIN`](https://db.mqlang.org/book/reference/explain), [custom tables, views and `ATTACH`](https://db.mqlang.org/book/reference/sql-ddl)
 - [`read_csv()` / `read_json()`](https://db.mqlang.org/book/reference/external-files) to query external files in `FROM`
 - [`INSERT` / `UPDATE` / `DELETE` with write-back](https://db.mqlang.org/book/reference/write-back) to the source Markdown

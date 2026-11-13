@@ -15,6 +15,9 @@
 | `CREATE VIEW name AS SELECT …` | Create a live (non-materialized) [view](#views) |
 | `CREATE OR REPLACE VIEW name AS …` | Overwrite an existing view's definition |
 | `DROP VIEW name` | Drop a view |
+| `CREATE INDEX [name] ON t USING hnsw (col)` | Build a [vector index](vector-search.md#hnsw-index) on a column of JSON-array vectors |
+| `DROP INDEX name` | Drop a vector index |
+| `SHOW INDEXES` | List vector indexes and whether each is current |
 | `ATTACH DATABASE 'path' AS alias` | Mount another `.mq-db` store as `alias.<table>` |
 | `DETACH alias` | Unmount a previously attached store |
 
