@@ -4366,3 +4366,165 @@ fn write_back_delete_of_any_single_block_removes_only_that_block() {
     }
     assert!(deleted >= 12, "only {deleted} blocks were exercised");
 }
+
+#[test]
+fn write_back_refuses_a_file_edited_since_it_was_indexed() {
+    let md = "# Title\n\nfirst\n\nsecond\n\n- item\n";
+    for sql in [
+        "UPDATE blocks SET content = 'x' WHERE content = 'first'",
+        "DELETE FROM blocks WHERE content = 'first'",
+        "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'new')",
+        "UPDATE blocks SET content = 'x' WHERE content = 'item'",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", md);
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+        // The file gains a line above everything after it was indexed.
+        let edited = format!("added above\n\n{md}");
+        std::fs::write(&path, &edited).unwrap();
+        let err = store.execute_sql_mut(sql).unwrap_err().to_string();
+        assert!(err.contains("changed since it was indexed"), "{sql}: {err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "{sql}");
+    }
+}
+
+#[test]
+fn write_back_works_on_a_store_read_back_from_its_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let md_path = write_md(
+        &dir,
+        "doc.md",
+        "# T\n\nfirst\n\n- a\n\n| x | y |\n|---|---|\n| 1 | 2 |\n",
+    );
+    let db = dir.path().join("s.mq-db");
+    let mut base = DocumentStore::new();
+    base.add_file(&md_path).unwrap();
+    base.save(&db).unwrap();
+
+    // Like the CLI: open lazily, load everything, then write back. The blocks
+    // decoded from the file must compare equal to a fresh parse.
+    let mut store = DocumentStore::open(&db).unwrap();
+    store.load_all_blocks().unwrap();
+    store.load_all_indexes().unwrap();
+    for sql in [
+        "UPDATE blocks SET content = 'one' WHERE content = 'first'",
+        "UPDATE blocks SET content = 'b' WHERE content = 'a'",
+        "UPDATE blocks SET content = '9' WHERE content = '2'",
+    ] {
+        store.execute_sql_mut(sql).unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(&md_path).unwrap(),
+        "# T\n\none\n\n- b\n\n| x | y |\n|---|---|\n| 1 | 9 |\n"
+    );
+}
+
+#[test]
+fn write_back_keeps_crlf_line_endings() {
+    let md =
+        "# Title\r\n\r\nfirst\r\n\r\n- a\r\n- b\r\n\r\n| x | y |\r\n|---|---|\r\n| 1 | 2 |\r\n";
+    let (out, _) = write_back(
+        md,
+        "UPDATE blocks SET content = 'edited' WHERE content = 'first'",
+    );
+    assert_eq!(out, md.replace("first", "edited"));
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content = 'a'");
+    assert_eq!(out, md.replace("- a\r\n", ""));
+    let (out, _) = write_back(md, "UPDATE blocks SET content = '9' WHERE content = '2'");
+    assert_eq!(out, md.replace("| 2 |", "| 9 |"));
+    // A multi-line replacement (a code block) uses CRLF too.
+    let (out, _) = write_back(
+        md,
+        "INSERT INTO blocks (document_id, block_type, content, lang) VALUES (0, 'code', 'let x = 1;\nlet y = 2;', 'rust')",
+    );
+    assert!(
+        out.ends_with("```rust\r\nlet x = 1;\r\nlet y = 2;\r\n```\r\n"),
+        "{out:?}"
+    );
+    assert!(
+        !out.replace("\r\n", "").contains('\n'),
+        "no bare line feeds: {out:?}"
+    );
+}
+
+#[test]
+fn write_back_refuses_mixed_line_endings_and_leaves_the_file_alone() {
+    let md = "# Title\r\n\r\nfirst\n\nsecond\r\n";
+    let (err, file) = write_back_err(
+        md,
+        "UPDATE blocks SET content = 'x' WHERE content = 'first'",
+    );
+    assert!(err.contains("mixes"), "{err}");
+    assert_eq!(file, md);
+}
+
+#[test]
+fn write_back_preserves_a_missing_final_newline_and_a_lone_blank_line() {
+    let (out, _) = write_back(
+        "# T\n\nbody",
+        "UPDATE blocks SET content = 'x' WHERE content = 'body'",
+    );
+    assert_eq!(out, "# T\n\nx");
+    let (out, _) = write_back(
+        "# T\n\nbody\n\n\n",
+        "UPDATE blocks SET content = 'x' WHERE content = 'body'",
+    );
+    assert_eq!(out, "# T\n\nx\n\n\n");
+}
+
+#[test]
+fn write_back_statements_can_follow_one_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# T\n\none\n\ntwo\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+    store
+        .execute_sql_mut("UPDATE blocks SET content = '1' WHERE content = 'one'")
+        .unwrap();
+    store
+        .execute_sql_mut("DELETE FROM blocks WHERE content = 'two'")
+        .unwrap();
+    store
+        .execute_sql_mut(
+            "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'three')",
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# T\n\n1\n\nthree\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_back_over_several_files_is_all_or_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = write_md(&dir_a, "a.md", "# A\n\nshared\n");
+    let b = write_md(&dir_b, "b.md", "# B\n\nshared\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&a).unwrap();
+    store.add_file(&b).unwrap();
+
+    // The second file's directory refuses new files, so replacing it fails.
+    std::fs::set_permissions(dir_b.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result =
+        store.execute_sql_mut("UPDATE blocks SET content = 'changed' WHERE content = 'shared'");
+    std::fs::set_permissions(dir_b.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    if result.is_ok() {
+        return; // running as root: directory permissions do not apply
+    }
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "# A\n\nshared\n",
+        "rolled back"
+    );
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "# B\n\nshared\n");
+    // The store still agrees with the files.
+    let still = store
+        .execute_sql_mut("SELECT count(*) FROM blocks WHERE content = 'shared'")
+        .unwrap();
+    assert_eq!(still.rows[0][0], "2");
+}

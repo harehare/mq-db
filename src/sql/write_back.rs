@@ -5,6 +5,7 @@ use super::expr::eval_expr;
 use super::output::QueryOutput;
 use super::rewrite::fold_constants;
 use super::rows::{ident_value, ok_result, require_unqualified};
+use super::source_file;
 use super::text_edit;
 use super::value::{Row, Value};
 use crate::block::{Block, BlockType};
@@ -424,6 +425,50 @@ fn apply_action(lines: &mut Vec<String>, action: &Action) -> Result<(), MqdbErro
     Ok(())
 }
 
+/// One document's new source text, computed and checked but not yet written.
+struct Patch {
+    doc_id: u32,
+    path: std::path::PathBuf,
+    original: String,
+    patched: String,
+}
+
+/// Writes every patch, then re-parses each document in the store.
+///
+/// All the patches were computed and checked before this runs, so a bad
+/// statement writes nothing. Each file is replaced atomically. If a later
+/// write fails, the files already replaced are put back, so a multi-file
+/// statement is applied to all of its files or to none.
+fn commit_patches(store: &mut DocumentStore, patches: &[Patch]) -> Result<(), MqdbError> {
+    let restore = |patches: &[Patch]| {
+        for p in patches {
+            let _ = source_file::write_atomic(&p.path, &p.original);
+        }
+    };
+    for (written, patch) in patches.iter().enumerate() {
+        if let Err(e) = source_file::write_atomic(&patch.path, &patch.patched) {
+            restore(&patches[..written]);
+            return Err(e);
+        }
+    }
+    for (done, patch) in patches.iter().enumerate() {
+        if let Err(e) =
+            store.replace_document(patch.doc_id, &patch.patched, Some(patch.path.clone()))
+        {
+            restore(patches);
+            for earlier in &patches[..done] {
+                let _ = store.replace_document(
+                    earlier.doc_id,
+                    &earlier.original,
+                    Some(earlier.path.clone()),
+                );
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 /// Applies `edits` (grouped by document) as a source-text patch + reparse:
 /// for each affected document, reads the *current* file off disk, applies
 /// each matched block's planned [`Action`] (replacing its lines, its list-item
@@ -443,8 +488,9 @@ fn apply_matched_edits(
     }
 
     let mut affected = 0usize;
+    let mut patches = Vec::with_capacity(by_doc.len());
     for (doc_id, doc_edits) in by_doc {
-        let (path, mut actions) = {
+        let (path, original, mut actions) = {
             let doc = store
                 .get_document(doc_id)
                 .ok_or_else(|| MqdbError::SqlExec(format!("no such document: {doc_id}")))?;
@@ -453,6 +499,9 @@ fn apply_matched_edits(
                     "cannot write back: document has no source file (added via add_str)".into(),
                 )
             })?;
+
+            let original = std::fs::read_to_string(&path)?;
+            source_file::ensure_fresh(doc, &original)?;
 
             let matched: FxHashSet<u32> = doc_edits.iter().map(|e| e.pre).collect();
             let mut actions = Vec::with_capacity(doc_edits.len());
@@ -464,30 +513,27 @@ fn apply_matched_edits(
                     .ok_or_else(|| MqdbError::SqlExec("matched block no longer exists".into()))?;
                 actions.push(plan_edit(&doc.blocks, block, edit, &matched)?);
             }
-            (path, actions)
+            (path, original, actions)
         };
 
-        let original = std::fs::read_to_string(&path)?;
-        let had_trailing_newline = original.ends_with('\n');
-        let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
-
+        let mut source = source_file::SourceLines::parse(&original)?;
         // Apply from the bottom up so earlier edits don't shift later
         // (already-resolved) positions.
         actions.sort_by_key(|a| std::cmp::Reverse(a.position()));
         for action in &actions {
-            apply_action(&mut lines, action)?;
+            apply_action(&mut source.lines, action)?;
         }
-
-        let mut patched = lines.join("\n");
-        if had_trailing_newline && !patched.is_empty() {
-            patched.push('\n');
-        }
-
-        std::fs::write(&path, &patched)?;
         affected += doc_edits.len();
-        store.replace_document(doc_id, &patched, Some(path))?;
+        patches.push(Patch {
+            doc_id,
+            path,
+            original,
+            patched: source.join(),
+        });
     }
 
+    // Everything is planned and checked; only now touch any file.
+    commit_patches(store, &patches)?;
     Ok(affected)
 }
 
@@ -691,6 +737,7 @@ fn apply_new_blocks(
     }
 
     let mut inserted = 0usize;
+    let mut patches = Vec::with_capacity(by_doc.len());
     for (doc_id, doc_specs) in by_doc {
         /// What to write for one inserted block.
         enum Rendered {
@@ -715,7 +762,7 @@ fn apply_new_blocks(
             rendered: Rendered,
         }
 
-        let (path, mut insertions) = {
+        let (path, original, mut insertions) = {
             let doc = store
                 .get_document(doc_id)
                 .ok_or_else(|| MqdbError::SqlExec(format!("no such document: {doc_id}")))?;
@@ -724,6 +771,9 @@ fn apply_new_blocks(
                     "cannot write back: document has no source file (added via add_str)".into(),
                 )
             })?;
+
+            let original = std::fs::read_to_string(&path)?;
+            source_file::ensure_fresh(doc, &original)?;
 
             let mut insertions = Vec::with_capacity(doc_specs.len());
             for spec in &doc_specs {
@@ -786,12 +836,11 @@ fn apply_new_blocks(
                     rendered,
                 });
             }
-            (path, insertions)
+            (path, original, insertions)
         };
 
-        let original = std::fs::read_to_string(&path)?;
-        let had_trailing_newline = original.ends_with('\n');
-        let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+        let mut source = source_file::SourceLines::parse(&original)?;
+        let lines = &mut source.lines;
 
         for insertion in &mut insertions {
             if insertion.at == usize::MAX {
@@ -837,16 +886,17 @@ fn apply_new_blocks(
             lines.splice(at..at, new_lines);
         }
 
-        let mut patched = lines.join("\n");
-        if had_trailing_newline {
-            patched.push('\n');
-        }
-
-        std::fs::write(&path, &patched)?;
         inserted += doc_specs.len();
-        store.replace_document(doc_id, &patched, Some(path))?;
+        patches.push(Patch {
+            doc_id,
+            path,
+            original,
+            patched: source.join(),
+        });
     }
 
+    // Everything is planned and checked; only now touch any file.
+    commit_patches(store, &patches)?;
     Ok(inserted)
 }
 

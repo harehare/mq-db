@@ -75,6 +75,7 @@ mod rewrite;
 mod rows;
 mod scalar;
 mod scan;
+mod source_file;
 #[cfg(test)]
 mod tests;
 mod text_edit;

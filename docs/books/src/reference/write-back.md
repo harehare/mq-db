@@ -53,3 +53,12 @@ WHERE block_type = 'table_cell' AND content = '41'
 - **`DELETE` of a list item** removes just its lines. An item that has nested items is refused unless the same statement deletes those too, so nested items are never left behind.
 - **Table cells**: `UPDATE` replaces one cell, escaping `|` for you; the new content cannot contain a line break. The row's other cells keep their exact spacing, so a table that was column-aligned may no longer be. `DELETE` of a cell, row or alignment row, and `INSERT` of a cell, are refused: change a cell's content instead.
 - Removing a block never joins the text around it: blank lines are only collapsed where two would end up side by side.
+
+## Safety
+
+- **The file must match the index.** Before writing, the current file is parsed again and compared with the blocks the store holds. If they differ (the file was edited after `mq-db index`), the statement is refused with `changed since it was indexed` and nothing is written; run `mq-db index` and try again. Without this check, positions recorded earlier would point at the wrong text.
+- **Line endings are kept.** A CRLF file stays CRLF and a file without a final newline stays that way. A file that mixes `\n` and `\r\n` is refused rather than silently normalised.
+- **Writes are atomic.** The new text goes to a temporary file in the same directory, is flushed to disk, and is renamed over the original, so a crash cannot leave a half-written file. Permissions are kept, and a symlink is followed so the link survives.
+- **A statement touching several files applies to all of them or none.** Every file is checked and its new text computed before any is written; if a later write fails, the files already replaced are put back.
+- **`ROLLBACK` does not undo file changes.** It restores the store, but a file already written stays written (you are told which). Keep the Markdown under version control.
+- Changes made in an editor that has the file open and unsaved can still be overwritten: write-back reads and replaces the file on disk.
