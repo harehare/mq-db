@@ -20,6 +20,8 @@ pub struct EmbedConfig {
     pub dimensions: Option<usize>,
     /// Drop every stored embedding first instead of refusing a model change.
     pub rebuild: bool,
+    /// Base delay before a retry, doubled each time (milliseconds).
+    pub retry_backoff_ms: u64,
     /// Keep an hnsw index on the table's `embedding` column up to date, so
     /// `vector_search()` stays fast. Writing to the table drops the index,
     /// so it is rebuilt here whenever it is missing.
@@ -35,6 +37,7 @@ impl Default for EmbedConfig {
             batch_size: 64,
             dimensions: None,
             rebuild: false,
+            retry_backoff_ms: 1000,
             build_index: true,
         }
     }
@@ -55,6 +58,9 @@ pub struct EmbedReport {
 
 const MAX_ATTEMPTS: u32 = 3;
 
+/// Pending rows are written once they reach about this many bytes of SQL.
+const FLUSH_BYTES: usize = 32 * 1024 * 1024;
+
 /// Embeds `inputs` in one request; the result is in `inputs` order.
 pub fn embed_batch(cfg: &EmbedConfig, inputs: &[String]) -> Result<Vec<Vec<f32>>, MqdbError> {
     if inputs.is_empty() {
@@ -73,7 +79,7 @@ pub fn embed_batch(cfg: &EmbedConfig, inputs: &[String]) -> Result<Vec<Vec<f32>>
     let mut last_err = String::new();
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
-            std::thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+            std::thread::sleep(Duration::from_millis(cfg.retry_backoff_ms << (attempt - 1)));
         }
         let mut req = agent.post(&url);
         if let Some(key) = &cfg.api_key {
@@ -217,27 +223,55 @@ pub fn sync_embeddings(
         index_built: false,
     };
 
-    for chunk in todo.chunks(cfg.batch_size) {
-        let texts: Vec<String> = chunk.iter().map(|r| r[1].clone()).collect();
-        let vectors = embed_batch(cfg, &texts)?;
-        let values: Vec<String> = chunk
-            .iter()
-            .zip(&vectors)
-            .map(|(row, v)| {
-                format!(
-                    "({}, {}, {})",
-                    sql_quote(&row[0]),
-                    sql_quote(&vector_json(v)),
-                    sql_quote(&cfg.model)
-                )
-            })
-            .collect();
+    // Every INSERT rewrites the table's whole row chain, and the old chain
+    // stays in the file until `vacuum`, so inserting per API batch would grow
+    // the file quadratically. Collect rows and write them in a few large
+    // INSERTs instead: when enough has piled up, at the end, and before
+    // returning an error so a failed run keeps what it already paid for.
+    let mut pending: Vec<String> = Vec::new();
+    let mut pending_bytes = 0usize;
+    let flush = |pending: &mut Vec<String>, pending_bytes: &mut usize| -> Result<(), MqdbError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
         engine.execute(&format!(
             "INSERT INTO {table} (content_hash, embedding, model) VALUES {}",
-            values.join(", ")
+            pending.join(", ")
         ))?;
+        pending.clear();
+        *pending_bytes = 0;
+        Ok(())
+    };
+
+    let mut failure = None;
+    for chunk in todo.chunks(cfg.batch_size) {
+        let texts: Vec<String> = chunk.iter().map(|r| r[1].clone()).collect();
+        let vectors = match embed_batch(cfg, &texts) {
+            Ok(v) => v,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        };
+        for (row, v) in chunk.iter().zip(&vectors) {
+            let tuple = format!(
+                "({}, {}, {})",
+                sql_quote(&row[0]),
+                sql_quote(&vector_json(v)),
+                sql_quote(&cfg.model)
+            );
+            pending_bytes += tuple.len();
+            pending.push(tuple);
+        }
         report.embedded += chunk.len();
+        if pending_bytes >= FLUSH_BYTES {
+            flush(&mut pending, &mut pending_bytes)?;
+        }
         progress(report.embedded, todo.len());
+    }
+    flush(&mut pending, &mut pending_bytes)?;
+    if let Some(e) = failure {
+        return Err(e);
     }
 
     if cfg.build_index && store.find_vector_index(table, "embedding").is_none() {
@@ -352,6 +386,14 @@ mod tests {
     /// Serves one `/embeddings` response per request: a 3-dim vector whose
     /// first component is the text's length, so tests can tell inputs apart.
     fn mock_server() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        mock_server_failing_after(usize::MAX)
+    }
+
+    /// Like [`mock_server`] but answers 500 to every request after the first
+    /// `ok_requests`.
+    fn mock_server_failing_after(
+        ok_requests: usize,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -395,7 +437,18 @@ mod tests {
                         })
                     })
                     .collect();
-                seen.lock().unwrap().push(req);
+                let served = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(req);
+                    seen.len()
+                };
+                if served > ok_requests {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    continue;
+                }
                 let payload = serde_json::json!({ "data": data }).to_string();
                 let _ = write!(
                     stream,
@@ -413,6 +466,7 @@ mod tests {
             endpoint,
             model: "test-model".into(),
             batch_size: 2,
+            retry_backoff_ms: 1,
             ..EmbedConfig::default()
         }
     }
@@ -611,5 +665,75 @@ mod tests {
         );
 
         assert!(semantic_hits(&store, &c, "bad name", "q", 3).is_err());
+    }
+
+    /// A file-backed store with `docs` documents of `paras` paragraphs each.
+    fn file_store(
+        docs: usize,
+        paras: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf, DocumentStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.mq-db");
+        let mut base = DocumentStore::new();
+        for d in 0..docs {
+            let body: Vec<String> = (0..paras)
+                .map(|p| format!("paragraph {d}-{p} text"))
+                .collect();
+            base.add_str(&format!("# Doc {d}\n\n{}\n", body.join("\n\n")))
+                .unwrap();
+        }
+        base.save(&path).unwrap();
+        // Like the CLI: open lazily, then read every block.
+        let mut store = DocumentStore::open(&path).unwrap();
+        store.load_all_blocks().unwrap();
+        store.load_all_indexes().unwrap();
+        (dir, path, store)
+    }
+
+    #[test]
+    fn sync_does_not_grow_the_file_per_batch() {
+        let (endpoint, requests) = mock_server();
+        let (_dir, path, mut store) = file_store(10, 9);
+        let c = cfg(endpoint); // batch size 2 => about 50 API batches
+        let report = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert_eq!(report.embedded, 100);
+        assert!(requests.lock().unwrap().len() >= 50);
+
+        let before = std::fs::metadata(&path).unwrap().len();
+        store.vacuum(&path).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        // One INSERT per API batch used to leave dozens of dead copies of the
+        // table behind; a handful of writes leaves at most a few.
+        assert!(
+            before <= after * 3,
+            "file is {before} bytes before vacuum, {after} after: embed rewrote the table per batch"
+        );
+    }
+
+    #[test]
+    fn a_failed_run_keeps_the_embeddings_it_already_has() {
+        // 3 batches of 2 succeed, then the API starts failing.
+        let (endpoint, _) = mock_server_failing_after(3);
+        let store = store_with(&["# T\n\na1\n\na2\n\na3\n\na4\n\na5\n\na6\n\na7\n\na8\n"]);
+        let c = cfg(endpoint);
+        let err = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("failed after"), "{err}");
+
+        let kept = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SELECT count(*) FROM emb")
+            .unwrap();
+        assert_eq!(
+            kept.rows[0][0], "6",
+            "the three finished batches were saved"
+        );
+
+        // A later run only embeds what is missing.
+        let (endpoint, requests) = mock_server();
+        let c = cfg(endpoint);
+        let resumed = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert_eq!(resumed.up_to_date, 6);
+        assert_eq!(resumed.embedded, 3);
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 }
