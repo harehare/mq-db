@@ -30,6 +30,7 @@ base64 = "0.23"
 regex = "1.13.1"
 fs2 = "0.4"
 saphyr = "0.3.4"
+ureq = { version = "3", features = ["json"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
@@ -57,6 +58,7 @@ strip = true
 
 
 [features]
-default = ["std", "use_mimalloc"]
+default = ["std", "use_mimalloc", "embed"]
 use_mimalloc = ["dep:mimalloc"]
+embed = ["dep:ureq"]
 std = []

@@ -1,12 +1,40 @@
 # Vector Search
 
-mq-db does not compute embeddings. Compute them with any model, keep them in a custom table as JSON arrays, and rank with `cosine_similarity`, `dot_product` or `l2_distance`.
+`mq-db embed` computes embeddings through any OpenAI-compatible `/embeddings` API and keeps them in a custom table as JSON arrays; rank them with `cosine_similarity`, `dot_product` or `l2_distance`. You can also compute them yourself and load them, see [Bring your own embeddings](#bring-your-own-embeddings).
 
 ## Key embeddings on `content_hash`
 
 `blocks.id` shifts when an earlier document changes, so do not key embeddings on it. [`blocks.content_hash`](sql-schema.md) depends only on a block's type and content: an unchanged block keeps its embedding across re-indexing and moves, and an edited block has a new hash, so it shows up as missing.
 
-## Workflow
+## `mq-db embed`
+
+```bash
+# Ollama (no key needed)
+MQ_DB_EMBED_ENDPOINT=http://localhost:11434/v1 MQ_DB_EMBED_MODEL=nomic-embed-text \
+  mq-db embed --db store.mq-db
+
+# OpenAI
+export OPENAI_API_KEY=...
+mq-db embed --db store.mq-db --model text-embedding-3-small
+```
+
+It embeds the blocks that have no row in the table yet, in batches, and deletes rows whose block no longer exists, so re-running after `mq-db index` only pays for what changed. Front matter and empty blocks are skipped, and blocks with identical type and content share one embedding.
+
+| Option | Default | |
+|--------|---------|---|
+| `--endpoint` (`MQ_DB_EMBED_ENDPOINT`) | `https://api.openai.com/v1` | Base URL; `/embeddings` is appended |
+| `--model` (`MQ_DB_EMBED_MODEL`) | `text-embedding-3-small` | Model name sent to the API |
+| `--api-key-env` | `OPENAI_API_KEY` | Name of the environment variable holding the key. The key is never read from the command line. |
+| `--table` | `embeddings` | Table with columns `content_hash`, `embedding`, `model` |
+| `--batch-size` | `64` | Texts per request |
+| `--dimensions` | none | Forwarded to models that can shorten their vectors |
+| `--rebuild` | off | Replace every stored embedding |
+
+The table remembers which model produced its vectors. Running with a different `--model` is refused, because vectors from different models cannot be compared; pass `--rebuild` or use another `--table`.
+
+Search it with the query from [Searching](#searching). Failed requests are retried twice; text is sent to the configured endpoint, so use a local server for private documents.
+
+## Bring your own embeddings
 
 ```bash
 # 1. Export the blocks that have no embedding yet (all of them the first time).

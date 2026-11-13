@@ -35,6 +35,8 @@
 pub mod block;
 pub mod discover;
 pub mod document;
+#[cfg(feature = "embed")]
+pub mod embed;
 pub mod error;
 pub mod index;
 pub mod indexes;

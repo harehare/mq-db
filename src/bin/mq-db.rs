@@ -202,6 +202,55 @@ enum Commands {
         db: PathBuf,
     },
 
+    /// Compute embeddings for blocks that have none yet, using an
+    /// OpenAI-compatible `/embeddings` endpoint, and store them in a table
+    /// for `cosine_similarity()` search. Re-running only embeds new or
+    /// changed blocks.
+    #[cfg(feature = "embed")]
+    Embed {
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
+        db: PathBuf,
+
+        /// Base URL of the embeddings API (`/embeddings` is appended), e.g.
+        /// http://localhost:11434/v1 for Ollama
+        #[arg(
+            long,
+            env = "MQ_DB_EMBED_ENDPOINT",
+            default_value = "https://api.openai.com/v1"
+        )]
+        endpoint: String,
+
+        /// Embedding model name
+        #[arg(
+            long,
+            env = "MQ_DB_EMBED_MODEL",
+            default_value = "text-embedding-3-small"
+        )]
+        model: String,
+
+        /// Environment variable holding the API key (not needed for local
+        /// servers). The key is never taken from the command line.
+        #[arg(long, default_value = "OPENAI_API_KEY")]
+        api_key_env: String,
+
+        /// Table that holds the embeddings (content_hash, embedding, model)
+        #[arg(long, default_value = "embeddings")]
+        table: String,
+
+        /// Texts per request
+        #[arg(long, default_value_t = 64)]
+        batch_size: usize,
+
+        /// Ask the model for vectors of this size, if it supports that
+        #[arg(long)]
+        dimensions: Option<usize>,
+
+        /// Replace all stored embeddings, e.g. after changing model
+        #[arg(long)]
+        rebuild: bool,
+    },
+
     /// Show all blocks in a document
     Show {
         /// Document ID to show
@@ -945,6 +994,41 @@ async fn main() -> anyhow::Result<()> {
             println!("  Pages before   {}", report.pages_before);
             println!("  Pages after    {}", report.pages_after);
             println!("  Reclaimed      {}", format_bytes(reclaimed));
+        }
+
+        // embed
+        #[cfg(feature = "embed")]
+        Commands::Embed {
+            db,
+            endpoint,
+            model,
+            api_key_env,
+            table,
+            batch_size,
+            dimensions,
+            rebuild,
+        } => {
+            let store = open_store_for_sql(&db)?;
+            let cfg = mq_db::embed::EmbedConfig {
+                endpoint,
+                model,
+                // Empty counts as unset: local servers need no key.
+                api_key: std::env::var(&api_key_env).ok().filter(|k| !k.is_empty()),
+                batch_size,
+                dimensions,
+                rebuild,
+            };
+            let report = mq_db::embed::sync_embeddings(&store, &cfg, &table, |done, total| {
+                eprint!("\r  embedded {done}/{total}");
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if report.embedded > 0 {
+                eprintln!();
+            }
+            println!(
+                "{} embedded, {} up to date, {} removed → table '{}'",
+                report.embedded, report.up_to_date, report.removed, table
+            );
         }
 
         // show
