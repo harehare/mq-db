@@ -73,8 +73,6 @@ pub(super) fn states_from_entries(
         .collect()
 }
 
-// TEMPORARY: the SQL layer that calls these arrives in the next commit.
-#[allow(dead_code)]
 impl DocumentStore {
     /// Loads the index named `name`, reading it from the backing file the
     /// first time. `Ok(None)` if there is no such index.
@@ -204,14 +202,22 @@ impl DocumentStore {
         guard.len() != before
     }
 
-    /// `(name, table, column)` of every index, sorted by name.
-    pub(crate) fn vector_index_list(&self) -> Vec<(String, String, String)> {
+    /// `(name, table, column, current)` of every index, sorted by name.
+    /// `current` is false once the table's row count no longer matches the
+    /// count the index was built from.
+    pub(crate) fn vector_index_list(&self) -> Vec<(String, String, String, bool)> {
+        let tables = self.custom_tables.read().unwrap();
         let mut list: Vec<_> = self
             .vector_indexes
             .read()
             .unwrap()
             .iter()
-            .map(|(n, s)| (n.clone(), s.table.clone(), s.column.clone()))
+            .map(|(n, s)| {
+                let current = tables
+                    .get(&s.table)
+                    .is_some_and(|t| t.rows.len() == s.table_rows as usize);
+                (n.clone(), s.table.clone(), s.column.clone(), current)
+            })
             .collect();
         list.sort();
         list
@@ -275,7 +281,7 @@ mod tests {
         let r = DocumentStore::open(&path).unwrap();
         assert_eq!(
             r.vector_index_list(),
-            vec![("emb_hnsw".into(), "emb".into(), "v".into())]
+            vec![("emb_hnsw".into(), "emb".into(), "v".into(), true)]
         );
         assert!(
             r.vector_indexes.read().unwrap()["emb_hnsw"].index.is_none(),
@@ -300,12 +306,28 @@ mod tests {
         let (_dir, _path, s) = store_with_table(20);
         index_it(&s, "emb_hnsw");
         assert!(s.find_vector_index("emb", "v").is_some());
+        // Changed behind the store's back (no SQL hook drops the index).
+        s.custom_tables
+            .write()
+            .unwrap()
+            .get_mut("emb")
+            .unwrap()
+            .rows
+            .push(vec!["x".into(), "[1,0,0,0]".into()]);
+        assert_eq!(s.find_vector_index("emb", "v"), None);
+        assert!(s.has_vector_index("emb_hnsw"), "still listed until dropped");
+        assert!(!s.vector_index_list()[0].3, "reported as not current");
+    }
+
+    #[test]
+    fn sql_writes_drop_the_index_outright() {
+        let (_dir, _path, s) = store_with_table(20);
+        index_it(&s, "emb_hnsw");
         SqlEngine::new(&s)
             .unwrap()
             .execute("INSERT INTO emb VALUES ('x', '[1,0,0,0]')")
             .unwrap();
-        assert_eq!(s.find_vector_index("emb", "v"), None);
-        assert!(s.has_vector_index("emb_hnsw"), "still listed until dropped");
+        assert!(!s.has_vector_index("emb_hnsw"));
     }
 
     #[test]

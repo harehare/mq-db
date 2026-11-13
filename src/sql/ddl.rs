@@ -228,6 +228,7 @@ impl<'a> SqlEngine<'a> {
             }
             let result = self.exec_query(query)?;
             let n = result.rows.len();
+            self.store.drop_vector_indexes_for_table(&table_name);
             let previous = self.store.custom_tables.write().unwrap().insert(
                 table_name.clone(),
                 CustomTableState {
@@ -561,6 +562,9 @@ impl<'a> SqlEngine<'a> {
             new_rows
         }; // write lock released before flush
         let inserted = new_rows.len();
+        if inserted > 0 {
+            self.store.drop_vector_indexes_for_table(&table_name);
+        }
         // Append only the new rows to the on-disk chain instead of rewriting
         // the whole table, so INSERT cost stays proportional to the rows
         // being added rather than the table's total size.
@@ -622,6 +626,9 @@ impl<'a> SqlEngine<'a> {
             }
             dropped
         }; // write lock released before flush
+        for (name, _) in &removed {
+            self.store.drop_vector_indexes_for_table(name);
+        }
         if let Err(err) = self.store.flush_catalog_to_storage() {
             let mut guard = self.store.custom_tables.write().unwrap();
             for (name, state) in removed {

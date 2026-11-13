@@ -386,8 +386,10 @@ impl DocumentStore {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
     ) {
+        let name = name.into();
+        self.drop_vector_indexes_for_table(&name);
         self.custom_tables.write().unwrap().insert(
-            name.into(),
+            name,
             CustomTableState {
                 columns,
                 rows,
@@ -401,6 +403,7 @@ impl DocumentStore {
 
     /// Remove a previously registered custom table. Returns `true` if it existed.
     pub fn unregister_table(&mut self, name: &str) -> bool {
+        self.drop_vector_indexes_for_table(name);
         self.custom_tables.write().unwrap().remove(name).is_some()
     }
 

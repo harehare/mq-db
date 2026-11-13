@@ -101,9 +101,81 @@ fn bench(c: &mut Criterion) {
     }
 }
 
+/// 10k clustered 128-d vectors (like real text embeddings, unlike uniform
+/// noise), as a table of JSON arrays.
+fn vector_store(indexed: bool) -> (DocumentStore, String) {
+    const N: usize = 10_000;
+    const D: usize = 128;
+    const CENTERS: usize = 100;
+    let mut seed = 42u64;
+    let mut gauss = move || {
+        // Sum of uniforms: close enough to a bell curve for a benchmark.
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        (0..6).map(|_| next()).sum::<f32>()
+    };
+    let centers: Vec<Vec<f32>> = (0..CENTERS)
+        .map(|_| (0..D).map(|_| gauss()).collect())
+        .collect();
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE TABLE emb (id TEXT, v TEXT)")
+        .unwrap();
+    let mut query = String::new();
+    for chunk in (0..N).collect::<Vec<_>>().chunks(1000) {
+        let rows: Vec<String> = chunk
+            .iter()
+            .map(|&i| {
+                let c = &centers[i % CENTERS];
+                let v: Vec<String> = c
+                    .iter()
+                    .map(|x| format!("{:.4}", x + 0.1 * gauss()))
+                    .collect();
+                if i == 5000 {
+                    query = format!("[{}]", v.join(","));
+                }
+                format!("('{i}', '[{}]')", v.join(","))
+            })
+            .collect();
+        engine
+            .execute(&format!("INSERT INTO emb VALUES {}", rows.join(",")))
+            .unwrap();
+    }
+    if indexed {
+        engine
+            .execute("CREATE INDEX emb_hnsw ON emb USING hnsw (v)")
+            .unwrap();
+    }
+    drop(engine);
+    (store, query)
+}
+
+fn bench_vectors(c: &mut Criterion) {
+    let (exact_store, query) = vector_store(false);
+    let (indexed_store, _) = vector_store(true);
+    let sql = format!("SELECT id FROM vector_search('emb', 'v', '{query}', 10)");
+    let exact = SqlEngine::new(&exact_store).unwrap();
+    let indexed = SqlEngine::new(&indexed_store).unwrap();
+    assert_eq!(
+        exact.execute(&sql).unwrap().rows[0],
+        indexed.execute(&sql).unwrap().rows[0]
+    );
+    c.bench_function("vector_search_exact_10k", |b| {
+        b.iter(|| black_box(exact.execute(&sql).unwrap()))
+    });
+    c.bench_function("vector_search_hnsw_10k", |b| {
+        b.iter(|| black_box(indexed.execute(&sql).unwrap()))
+    });
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(20);
-    targets = bench
+    targets = bench, bench_vectors
 }
 criterion_main!(benches);

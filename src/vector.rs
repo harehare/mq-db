@@ -81,8 +81,20 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+/// Dot product. Eight independent accumulators let the compiler use SIMD;
+/// a single running sum cannot be vectorised because float addition is not
+/// associative.
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let (chunks_a, rest_a) = a.as_chunks::<8>();
+    let (chunks_b, rest_b) = b.as_chunks::<8>();
+    let mut acc = [0.0f32; 8];
+    for (x, y) in chunks_a.iter().zip(chunks_b) {
+        for i in 0..8 {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let tail: f32 = rest_a.iter().zip(rest_b).map(|(x, y)| x * y).sum();
+    acc.iter().sum::<f32>() + tail
 }
 
 /// Parses a JSON array of numbers such as `[0.1, 0.2]`.

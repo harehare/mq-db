@@ -93,6 +93,9 @@ impl<'a> SqlEngine<'a> {
         if upper == "SHOW TABLES" {
             return self.exec_show_tables();
         }
+        if upper == "SHOW INDEXES" || upper == "SHOW INDEX" {
+            return self.exec_show_indexes();
+        }
         if upper.starts_with("DETACH") {
             return self.exec_detach(trimmed);
         }
@@ -146,6 +149,13 @@ impl<'a> SqlEngine<'a> {
                 if_exists,
                 ..
             } => self.exec_drop_views(&names, if_exists),
+            Statement::Drop {
+                object_type: ObjectType::Index,
+                names,
+                if_exists,
+                ..
+            } => self.exec_drop_indexes(&names, if_exists),
+            Statement::CreateIndex(ci) => self.exec_create_index(&ci),
             Statement::CreateView(cv) => self.exec_create_view(&cv),
             Statement::Explain {
                 analyze, statement, ..
@@ -180,7 +190,7 @@ impl<'a> SqlEngine<'a> {
                 Ok(ok_result())
             }
             _ => Err(MqdbError::SqlExec(
-                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, UPDATE, DELETE, DROP TABLE, CREATE VIEW, DROP VIEW, ATTACH DATABASE, DETACH, DESC, SHOW TABLES, EXPLAIN, BEGIN, COMMIT, ROLLBACK".into(),
+                "unsupported statement; supported: SELECT, CREATE TABLE, INSERT INTO, UPDATE, DELETE, DROP TABLE, CREATE VIEW, DROP VIEW, CREATE INDEX ... USING hnsw, DROP INDEX, ATTACH DATABASE, DETACH, DESC, SHOW TABLES, SHOW INDEXES, EXPLAIN, BEGIN, COMMIT, ROLLBACK".into(),
             )),
         }
     }

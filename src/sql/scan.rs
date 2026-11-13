@@ -120,6 +120,9 @@ impl<'a> SqlEngine<'a> {
 
         if let Some(func_args) = &func_args {
             let prefix = alias.as_deref().unwrap_or(&table_name).to_string();
+            if table_name == "vector_search" {
+                return self.vector_search_rows(func_args, &prefix);
+            }
             return resolve_table_function(&table_name, func_args, &prefix);
         }
 

@@ -78,6 +78,7 @@ mod scan;
 #[cfg(test)]
 mod tests;
 mod value;
+mod vector_index;
 mod write_back;
 
 pub use engine::SqlEngine;

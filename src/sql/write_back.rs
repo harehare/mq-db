@@ -635,7 +635,12 @@ impl DocumentStore {
     pub fn execute_sql_mut(&mut self, sql: &str) -> Result<QueryOutput, MqdbError> {
         let trimmed = sql.trim().trim_end_matches(';');
         let upper = trimmed.to_ascii_uppercase();
-        if upper.starts_with("DESC ") || upper.starts_with("DESCRIBE ") || upper == "SHOW TABLES" {
+        if upper.starts_with("DESC ")
+            || upper.starts_with("DESCRIBE ")
+            || upper == "SHOW TABLES"
+            || upper == "SHOW INDEXES"
+            || upper == "SHOW INDEX"
+        {
             return SqlEngine::with_session(self, self.write_session)?.execute(sql);
         }
 
