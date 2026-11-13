@@ -158,6 +158,15 @@ impl DocumentStore {
         let pages_after = reopened.num_pages();
         *self.storage.lock().unwrap() = Some(reopened);
 
+        // The replacement file wrote each table's rows to new pages, but the
+        // in-memory page numbers still describe the old file. Forget them so
+        // the next catalog flush rewrites the rows instead of publishing
+        // pointers into pages that no longer hold them.
+        for state in self.custom_tables.write().unwrap().values_mut() {
+            state.first_row_page = 0;
+            state.last_row_page = 0;
+        }
+
         Ok(VacuumReport {
             pages_before,
             pages_after,

@@ -1040,3 +1040,60 @@ mod containing_dir_tests {
         assert_eq!(containing_dir(Path::new(path)), Path::new(expected));
     }
 }
+
+#[cfg(test)]
+mod vacuum_then_write_tests {
+    use super::*;
+    use crate::SqlEngine;
+
+    /// A store with table `t` (2 rows) opened from a file, then vacuumed in
+    /// the same process.
+    fn vacuumed() -> (tempfile::TempDir, std::path::PathBuf, DocumentStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.mq-db");
+        let mut s = DocumentStore::new();
+        s.add_str("# T\n\nbody\n").unwrap();
+        s.save(&path).unwrap();
+        let mut s = DocumentStore::open(&path).unwrap();
+        s.load_all_blocks().unwrap();
+        s.load_all_indexes().unwrap();
+        let e = SqlEngine::new(&s).unwrap();
+        e.execute("CREATE TABLE t (a TEXT)").unwrap();
+        e.execute("INSERT INTO t VALUES ('one'), ('two')").unwrap();
+        drop(e);
+        s.vacuum(&path).unwrap();
+        (dir, path, s)
+    }
+
+    fn count_after_reopen(path: &std::path::Path) -> String {
+        let r = DocumentStore::open(path).unwrap();
+        SqlEngine::new(&r)
+            .unwrap()
+            .execute("SELECT count(*) FROM t")
+            .unwrap()
+            .rows[0][0]
+            .clone()
+    }
+
+    #[test]
+    fn catalog_only_write_after_vacuum_keeps_table_rows() {
+        let (_dir, path, s) = vacuumed();
+        SqlEngine::new(&s)
+            .unwrap()
+            .execute("CREATE VIEW v AS SELECT 1")
+            .unwrap();
+        drop(s);
+        assert_eq!(count_after_reopen(&path), "2");
+    }
+
+    #[test]
+    fn insert_after_vacuum_keeps_table_rows() {
+        let (_dir, path, s) = vacuumed();
+        SqlEngine::new(&s)
+            .unwrap()
+            .execute("INSERT INTO t VALUES ('three')")
+            .unwrap();
+        drop(s);
+        assert_eq!(count_after_reopen(&path), "3");
+    }
+}
