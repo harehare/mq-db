@@ -18,7 +18,7 @@ export OPENAI_API_KEY=...
 mq-db embed --db store.mq-db --model text-embedding-3-small
 ```
 
-It embeds the blocks that have no row in the table yet, in batches, and deletes rows whose block no longer exists, so re-running after `mq-db index` only pays for what changed. Afterwards it builds an HNSW index named `<table>_hnsw` if the table has none that is current, so `vector_search()` stays fast; the index is rebuilt in full when anything changed. Front matter and empty blocks are skipped, and blocks with identical type and content share one embedding.
+It embeds the blocks that have no row in the table yet, in batches, and deletes rows whose block no longer exists, so re-running after `mq-db index` only pays for what changed. Afterwards it makes sure the table has a current HNSW index named `<table>_hnsw`, so `vector_search()` stays fast: new embeddings are added to the existing index, and it is rebuilt in full only when rows were removed. Rows are written in a few large batches rather than one per API request, and a run that fails partway keeps what it already embedded, so running it again resumes. Front matter and empty blocks are skipped, and blocks with identical type and content share one embedding.
 
 | Option | Default | |
 |--------|---------|---|
@@ -101,7 +101,7 @@ ORDER BY v.score DESC;
 - **`ef`** is the number of candidates examined per search (default `max(8 * k, 64)`). Raise it for better recall at the cost of speed.
 - **Build options**: `CREATE INDEX … USING hnsw (col) WITH (m = 16, ef_construction = 200)`. Larger values give better recall and a bigger, slower build. Leaving the name out names the index `<table>_<column>_hnsw`; `IF NOT EXISTS` and `DROP INDEX [IF EXISTS] name` work as usual, and `SHOW INDEXES` lists them.
 - **Cosine similarity only.** Vectors are normalised when indexed, so the index ignores their length. Rows whose value is not a JSON array of numbers, or whose length differs from the first vector's, are left out of the index (the `CREATE INDEX` result says how many).
-- **Writes drop the index.** Any `INSERT`, `UPDATE`, `DELETE`, `DROP TABLE` or `CREATE OR REPLACE TABLE` on the table drops its indexes, because the index no longer describes the rows. `mq-db embed` rebuilds it for you; with your own vectors, re-run `CREATE INDEX` after loading.
+- **`INSERT` extends the index; other writes drop it.** Rows appended to the table are added to its index in place. An `UPDATE`, `DELETE`, `DROP TABLE` or `CREATE OR REPLACE TABLE` cannot be applied that way, so it drops the table's indexes; re-run `CREATE INDEX` afterwards (`mq-db embed` does this for you).
 - The index is saved in the `.mq-db` file and read the first time it is needed. Older versions of `mq-db` open such a file normally; they just don't see the index.
 
 ### Accuracy and speed

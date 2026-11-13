@@ -188,6 +188,65 @@ impl DocumentStore {
         );
     }
 
+    /// Brings every index on `table` up to date after rows were appended at
+    /// `first_new_row`, by inserting just the new rows' vectors. An index that
+    /// was already stale, or that cannot be loaded, is dropped instead: losing
+    /// an index only costs speed, but a wrong one would cost correctness.
+    ///
+    /// The blob in the file is rewritten by the next catalog flush.
+    pub(crate) fn extend_vector_indexes(
+        &self,
+        table: &str,
+        first_new_row: usize,
+        new_rows: &[Vec<String>],
+    ) {
+        let targets: Vec<(String, String, u32)> = self
+            .vector_indexes
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.table == table)
+            .map(|(n, s)| (n.clone(), s.column.clone(), s.table_rows))
+            .collect();
+        for (name, column, built_rows) in targets {
+            let col = self.custom_tables.read().unwrap().get(table).and_then(|t| {
+                t.columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(&column))
+            });
+            let loaded = match (built_rows as usize == first_new_row, col) {
+                (true, Some(_)) => self.get_vector_index(&name).ok().flatten(),
+                _ => None,
+            };
+            let (Some(col), Some(loaded)) = (col, loaded) else {
+                self.drop_vector_index(&name);
+                continue;
+            };
+            drop(loaded);
+
+            let mut guard = self.vector_indexes.write().unwrap();
+            let Some(state) = guard.get_mut(&name) else {
+                continue;
+            };
+            let Some(mut index) = state.index.take() else {
+                guard.remove(&name);
+                continue;
+            };
+            // Cheap unless a search is holding the index right now.
+            let idx = Arc::make_mut(&mut index);
+            for (offset, row) in new_rows.iter().enumerate() {
+                if let Some(vec) = row.get(col).and_then(|v| parse_vector_text(v)) {
+                    // A vector of the wrong length or with no direction is
+                    // skipped, as when the index was built.
+                    idx.insert((first_new_row + offset) as u32, &vec);
+                }
+            }
+            state.index = Some(index);
+            state.table_rows = (first_new_row + new_rows.len()) as u32;
+            state.first_page = 0;
+        }
+    }
+
     /// Removes the index `name`. Returns whether it existed.
     pub(crate) fn drop_vector_index(&self, name: &str) -> bool {
         self.vector_indexes.write().unwrap().remove(name).is_some()
@@ -320,14 +379,31 @@ mod tests {
     }
 
     #[test]
-    fn sql_writes_drop_the_index_outright() {
-        let (_dir, _path, s) = store_with_table(20);
+    fn updates_and_deletes_drop_the_index_outright() {
+        for sql in [
+            "UPDATE emb SET v = '[0,0,0,1]' WHERE id = '3'",
+            "DELETE FROM emb WHERE id = '3'",
+        ] {
+            let (_dir, _path, s) = store_with_table(20);
+            index_it(&s, "emb_hnsw");
+            SqlEngine::new(&s).unwrap().execute(sql).unwrap();
+            assert!(!s.has_vector_index("emb_hnsw"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn extending_an_unloaded_index_reads_it_first() {
+        let (_dir, path, s) = store_with_table(30);
         index_it(&s, "emb_hnsw");
-        SqlEngine::new(&s)
+        drop(s);
+        let r = DocumentStore::open(&path).unwrap();
+        assert!(r.vector_indexes.read().unwrap()["emb_hnsw"].index.is_none());
+        SqlEngine::new(&r)
             .unwrap()
-            .execute("INSERT INTO emb VALUES ('x', '[1,0,0,0]')")
+            .execute("INSERT INTO emb VALUES ('x', '[0.2, 0.9, 0.5, 0.25]')")
             .unwrap();
-        assert!(!s.has_vector_index("emb_hnsw"));
+        assert_eq!(r.get_vector_index("emb_hnsw").unwrap().unwrap().len(), 31);
+        assert!(r.find_vector_index("emb", "v").is_some());
     }
 
     #[test]

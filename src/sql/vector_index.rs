@@ -394,7 +394,6 @@ mod tests {
     #[test]
     fn writes_to_the_table_drop_its_indexes() {
         for (label, sql) in [
-            ("insert", "INSERT INTO emb VALUES ('new', '[1,0,0]')"),
             ("update", "UPDATE emb SET v = '[0,0,1]' WHERE id = '1'"),
             ("delete", "DELETE FROM emb WHERE id = '1'"),
             ("drop table", "DROP TABLE emb"),
@@ -568,7 +567,79 @@ mod tests {
     }
 
     #[test]
-    fn index_is_used_after_reopen_and_stays_valid_until_a_write() {
+    fn insert_extends_the_index_instead_of_dropping_it() {
+        let store = store_with_vectors(60);
+        let e = SqlEngine::new(&store).unwrap();
+        e.execute("CREATE INDEX emb_hnsw ON emb USING hnsw (v)")
+            .unwrap();
+        e.execute("INSERT INTO emb VALUES ('new', '[0.9, 0.1, 0.9]'), ('bad', 'oops'), ('short', '[1,2]')")
+            .unwrap();
+        assert_eq!(indexes(&e)[0][4], "ready", "still current after an INSERT");
+        let idx = store.get_vector_index("emb_hnsw").unwrap().unwrap();
+        assert_eq!(idx.len(), 61, "only the valid vector was added");
+
+        // The new row is found through the index.
+        let hit = e
+            .execute("SELECT id FROM vector_search('emb', 'v', '[0.9, 0.1, 0.9]', 1)")
+            .unwrap();
+        assert_eq!(hit.rows[0][0], "new");
+
+        // And a later INSERT keeps extending it.
+        e.execute("INSERT INTO emb VALUES ('newer', '[-0.5, 0.7, 0.2]')")
+            .unwrap();
+        assert_eq!(
+            store.get_vector_index("emb_hnsw").unwrap().unwrap().len(),
+            62
+        );
+        let hit = e
+            .execute("SELECT id FROM vector_search('emb', 'v', '[-0.5, 0.7, 0.2]', 1)")
+            .unwrap();
+        assert_eq!(hit.rows[0][0], "newer");
+    }
+
+    #[test]
+    fn extended_index_agrees_with_exact_search() {
+        let store = store_with_vectors(150);
+        let e = SqlEngine::new(&store).unwrap();
+        e.execute("CREATE INDEX emb_hnsw ON emb USING hnsw (v)")
+            .unwrap();
+        // Grow the table by half again, a few rows per INSERT.
+        for start in (150..225).step_by(5) {
+            let values: Vec<String> = (start..start + 5)
+                .map(|i| format!("('{i}', '{}')", vec_text(i)))
+                .collect();
+            e.execute(&format!("INSERT INTO emb VALUES {}", values.join(", ")))
+                .unwrap();
+        }
+        assert_eq!(indexes(&e)[0][4], "ready");
+        let indexed: Vec<Vec<String>> = (0..225).step_by(17).map(|i| search(&e, i, 5)).collect();
+        e.execute("DROP INDEX emb_hnsw").unwrap();
+        let exact: Vec<Vec<String>> = (0..225).step_by(17).map(|i| search(&e, i, 5)).collect();
+        assert_eq!(indexed, exact);
+    }
+
+    #[test]
+    fn a_stale_index_is_dropped_by_the_next_insert_not_extended() {
+        let store = store_with_vectors(20);
+        let e = SqlEngine::new(&store).unwrap();
+        e.execute("CREATE INDEX emb_hnsw ON emb USING hnsw (v)")
+            .unwrap();
+        // Changed behind the index's back, so its row numbers are off.
+        store
+            .custom_tables
+            .write()
+            .unwrap()
+            .get_mut("emb")
+            .unwrap()
+            .rows
+            .push(vec!["sneaky".into(), "[1,1,1]".into()]);
+        e.execute("INSERT INTO emb VALUES ('x', '[0,1,0]')")
+            .unwrap();
+        assert!(indexes(&e).is_empty());
+    }
+
+    #[test]
+    fn index_is_used_after_reopen_and_stays_valid_across_writes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.mq-db");
         let mut base = DocumentStore::new();
@@ -596,7 +667,23 @@ mod tests {
             "the persisted index was loaded and used"
         );
 
-        e.execute("INSERT INTO emb VALUES ('z', '[1,1,1]')")
+        // An INSERT extends it, and the extended index is what gets saved.
+        e.execute("INSERT INTO emb VALUES ('z', '[1, 1, 1]')")
+            .unwrap();
+        drop(e);
+        drop(s);
+        let s = DocumentStore::open(&path).unwrap();
+        let e = SqlEngine::new(&s).unwrap();
+        assert_eq!(indexes(&e)[0][4], "ready", "the extension was persisted");
+        assert_eq!(s.get_vector_index("emb_hnsw").unwrap().unwrap().len(), 81);
+        let hit = e
+            .execute("SELECT id FROM vector_search('emb', 'v', '[1, 1, 1]', 1)")
+            .unwrap();
+        assert_eq!(hit.rows[0][0], "z");
+
+        // An UPDATE cannot be applied in place, so it drops the index, and
+        // that drop is persisted too.
+        e.execute("UPDATE emb SET v = '[0, 0, 1]' WHERE id = 'z'")
             .unwrap();
         drop(e);
         drop(s);

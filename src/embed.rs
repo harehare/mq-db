@@ -591,11 +591,29 @@ mod tests {
         let idle = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
         assert!(!idle.index_built);
 
-        // New content writes to the table, which drops the index; sync
-        // brings it back.
+        // New content only appends rows, so the index is extended in place
+        // rather than rebuilt.
         store.add_str("# U\n\nmore text\n").unwrap();
-        let again = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
-        assert!(again.embedded > 0 && again.index_built);
+        let more = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert!(more.embedded > 0 && !more.index_built);
+        let name = store.find_vector_index("emb", "embedding").unwrap();
+        let total: usize = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SELECT count(*) FROM emb")
+            .unwrap()
+            .rows[0][0]
+            .parse()
+            .unwrap();
+        assert_eq!(store.get_vector_index(&name).unwrap().unwrap().len(), total);
+
+        // Removing a row cannot be done in place, so the index is rebuilt.
+        SqlEngine::new(&store)
+            .unwrap()
+            .execute("INSERT INTO emb VALUES ('stale', '[1,0,0]', 'test-model')")
+            .unwrap();
+        let removed = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert_eq!(removed.removed, 1);
+        assert!(removed.index_built);
         assert!(store.find_vector_index("emb", "embedding").is_some());
     }
 

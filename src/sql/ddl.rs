@@ -497,7 +497,7 @@ impl<'a> SqlEngine<'a> {
             Some(indices?)
         };
 
-        let new_rows = {
+        let (new_rows, first_new_row) = {
             let mut guard = self.store.custom_tables.write().unwrap();
             let state = guard
                 .get_mut(&table_name)
@@ -558,12 +558,15 @@ impl<'a> SqlEngine<'a> {
                 }
             }
 
+            let first_new_row = state.rows.len();
             state.rows.extend(new_rows.iter().cloned());
-            new_rows
+            (new_rows, first_new_row)
         }; // write lock released before flush
         let inserted = new_rows.len();
         if inserted > 0 {
-            self.store.drop_vector_indexes_for_table(&table_name);
+            // Appended rows only add to what an index describes.
+            self.store
+                .extend_vector_indexes(&table_name, first_new_row, &new_rows);
         }
         // Append only the new rows to the on-disk chain instead of rewriting
         // the whole table, so INSERT cost stays proportional to the rows
@@ -573,6 +576,8 @@ impl<'a> SqlEngine<'a> {
             .append_table_rows_to_storage(&table_name, &new_rows)
         {
             self.store.rollback_appended_rows(&table_name, inserted);
+            // The index already includes the rows that were just rolled back.
+            self.store.drop_vector_indexes_for_table(&table_name);
             return Err(err);
         }
         if inserted > 0 {
