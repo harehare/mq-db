@@ -3,7 +3,7 @@
 use super::fts::{BM25_CACHE, QUERY_HAS_BM25, QUERY_TOKENIZER};
 use super::output::QueryOutput;
 use super::plan::expr_str_val;
-use super::rows::{QUERY_NEEDS_CONTENT_HASH, ok_result, sql_needs_content_hash};
+use super::rows::{ColumnNeeds, QUERY_NEEDS, ok_result};
 use crate::document::Document;
 use crate::indexes::DocumentIndex;
 use crate::store::DatabaseAlias;
@@ -118,15 +118,15 @@ impl<'a> SqlEngine<'a> {
         QUERY_HAS_BM25.with(|c| c.set(trimmed.to_ascii_lowercase().contains("bm25(")));
         let _bm25_guard = Bm25QueryScope(prev_has_bm25);
 
-        struct ContentHashScope(bool);
-        impl Drop for ContentHashScope {
+        struct ColumnNeedsScope(ColumnNeeds);
+        impl Drop for ColumnNeedsScope {
             fn drop(&mut self) {
-                QUERY_NEEDS_CONTENT_HASH.with(|c| c.set(self.0));
+                QUERY_NEEDS.with(|c| c.set(self.0));
             }
         }
-        let prev_needs_hash = QUERY_NEEDS_CONTENT_HASH.with(std::cell::Cell::get);
-        QUERY_NEEDS_CONTENT_HASH.with(|c| c.set(sql_needs_content_hash(trimmed)));
-        let _hash_guard = ContentHashScope(prev_needs_hash);
+        let prev_needs = QUERY_NEEDS.with(std::cell::Cell::get);
+        QUERY_NEEDS.with(|c| c.set(ColumnNeeds::of_sql(trimmed)));
+        let _needs_guard = ColumnNeedsScope(prev_needs);
 
         match stmt {
             Statement::Query(q) => self.exec_query(&q),

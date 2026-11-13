@@ -3407,7 +3407,38 @@ fn test_sql_content_hash_depends_on_type_and_content_only() {
 #[case("SELECT * FROM blocks", true)]
 #[case("SELECT b.* FROM blocks b", true)]
 fn test_sql_needs_content_hash(#[case] sql: &str, #[case] expected: bool) {
-    assert_eq!(super::rows::sql_needs_content_hash(sql), expected);
+    assert_eq!(super::rows::ColumnNeeds::of_sql(sql).content_hash, expected);
+}
+
+#[rstest]
+#[case("SELECT content FROM blocks", false, false)]
+#[case("SELECT properties FROM blocks", true, false)]
+#[case("SELECT b.anchor FROM blocks b", false, true)]
+#[case("SELECT * FROM blocks", true, true)]
+fn test_sql_needs_properties_and_anchor(
+    #[case] sql: &str,
+    #[case] properties: bool,
+    #[case] anchor: bool,
+) {
+    let needs = super::rows::ColumnNeeds::of_sql(sql);
+    assert_eq!((needs.properties, needs.anchor), (properties, anchor));
+}
+
+#[test]
+fn unreferenced_expensive_columns_are_null_and_referenced_ones_are_real() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("SELECT properties, anchor FROM blocks WHERE block_type = 'heading' LIMIT 1")
+        .unwrap();
+    assert!(out.rows[0][0].starts_with('{'));
+    assert!(!out.rows[0][1].is_empty() && out.rows[0][1] != "NULL");
+    // A view over blocks must still see the columns its own text references.
+    engine
+        .execute("CREATE VIEW heads AS SELECT anchor, properties FROM blocks WHERE block_type = 'heading'")
+        .unwrap();
+    let out = engine.execute("SELECT anchor FROM heads LIMIT 1").unwrap();
+    assert!(!out.rows[0][0].is_empty() && out.rows[0][0] != "NULL");
 }
 
 #[test]

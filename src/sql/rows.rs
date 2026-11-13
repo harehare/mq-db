@@ -37,23 +37,55 @@ fn pairs_to_json<'a>(pairs: impl Iterator<Item = (&'a String, &'a PropertyValue)
     format!("{{{}}}", pairs.join(","))
 }
 
-thread_local! {
-    /// Whether the running query may read `blocks.content_hash`. Defaults to
-    /// true so a query run outside `SqlEngine::execute` is never given a
-    /// placeholder.
-    pub(super) static QUERY_NEEDS_CONTENT_HASH: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(true) };
+/// Which expensive `blocks` columns the running query may read. A column the
+/// query never mentions is filled with `NULL` instead of being computed for
+/// every block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct ColumnNeeds {
+    pub(super) content_hash: bool,
+    pub(super) properties: bool,
+    pub(super) anchor: bool,
 }
 
-/// Cheap text scan, conservative: any `*` other than in `count(*)` may expand
-/// to `content_hash`.
-pub(super) fn sql_needs_content_hash(sql: &str) -> bool {
-    let sql: String = sql
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    sql.contains("content_hash") || sql.replace("count(*)", "").contains('*')
+impl ColumnNeeds {
+    pub(super) const ALL: ColumnNeeds = ColumnNeeds {
+        content_hash: true,
+        properties: true,
+        anchor: true,
+    };
+
+    /// Cheap text scan, conservative: any `*` other than in `count(*)` may
+    /// expand to every column, and a column name anywhere in the text counts.
+    pub(super) fn of_sql(sql: &str) -> ColumnNeeds {
+        let sql: String = sql
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if sql.replace("count(*)", "").contains('*') {
+            return ColumnNeeds::ALL;
+        }
+        ColumnNeeds {
+            content_hash: sql.contains("content_hash"),
+            properties: sql.contains("properties"),
+            anchor: sql.contains("anchor"),
+        }
+    }
+
+    pub(super) fn merge(self, other: ColumnNeeds) -> ColumnNeeds {
+        ColumnNeeds {
+            content_hash: self.content_hash || other.content_hash,
+            properties: self.properties || other.properties,
+            anchor: self.anchor || other.anchor,
+        }
+    }
+}
+
+thread_local! {
+    /// Defaults to everything so a query run outside `SqlEngine::execute`
+    /// is never given a placeholder.
+    pub(super) static QUERY_NEEDS: std::cell::Cell<ColumnNeeds> =
+        const { std::cell::Cell::new(ColumnNeeds::ALL) };
 }
 
 /// SHA-256 over `block_type`, a NUL and `content`, as 64 hex digits.
@@ -153,8 +185,14 @@ pub(super) fn block_to_row(
     block_idx: u32,
     anchor: &str,
 ) -> Row {
-    let hash = if QUERY_NEEDS_CONTENT_HASH.with(std::cell::Cell::get) {
+    let needs = QUERY_NEEDS.with(std::cell::Cell::get);
+    let hash = if needs.content_hash {
         Value::Str(content_hash(block))
+    } else {
+        Value::Null
+    };
+    let properties = if needs.properties {
+        Value::Str(properties_to_json(&block.properties))
     } else {
         Value::Null
     };
@@ -169,9 +207,13 @@ pub(super) fn block_to_row(
             Value::Int(block.post as i64),
             Value::Int(block.heading_depth().unwrap_or(0) as i64),
             Value::Str(block.code_lang().unwrap_or("").to_string()),
-            Value::Str(properties_to_json(&block.properties)),
+            properties,
             hash,
-            Value::Str(anchor.to_string()),
+            if needs.anchor {
+                Value::Str(anchor.to_string())
+            } else {
+                Value::Null
+            },
         ],
     }
 }
