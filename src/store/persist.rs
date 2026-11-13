@@ -1,3 +1,4 @@
+use super::vector_indexes::states_from_entries;
 use super::*;
 
 impl DocumentStore {
@@ -94,12 +95,37 @@ impl DocumentStore {
             }
             drop(ct_guard);
 
+            // Same reasoning for vector indexes: load each (it may still be
+            // in the old file) and write it into this one.
+            let mut vector_entries = Vec::new();
+            let states: Vec<(String, VectorIndexState)> = self
+                .vector_indexes
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(n, s)| (n.clone(), s.clone()))
+                .collect();
+            for (name, state) in states {
+                let Some(index) = self.get_vector_index(&name)? else {
+                    continue;
+                };
+                vector_entries.push(crate::storage::catalog::VectorIndexEntry {
+                    name,
+                    table: state.table,
+                    column: state.column,
+                    first_page: storage.write_index(&index.to_bytes())?,
+                    table_rows: state.table_rows,
+                });
+            }
+            vector_entries.sort_by(|a, b| a.name.cmp(&b.name));
+
             storage.flush_catalog(
                 &entries,
                 &custom,
                 &self.content_hash_pairs(),
                 &self.views_entries(),
                 self.tokenizer,
+                &vector_entries,
             )?;
             Ok(storage)
         })();
@@ -166,6 +192,10 @@ impl DocumentStore {
             state.first_row_page = 0;
             state.last_row_page = 0;
         }
+        // Same for vector indexes; `save_inner` loaded them all into memory.
+        for state in self.vector_indexes.write().unwrap().values_mut() {
+            state.first_page = 0;
+        }
 
         Ok(VacuumReport {
             pages_before,
@@ -192,8 +222,14 @@ impl DocumentStore {
                 storage.file_version()
             )));
         }
-        let (entries, custom_table_entries, content_hashes, view_entries, tokenizer) =
-            storage.load_catalog()?;
+        let (
+            entries,
+            custom_table_entries,
+            content_hashes,
+            view_entries,
+            tokenizer,
+            vector_index_entries,
+        ) = storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
@@ -241,6 +277,7 @@ impl DocumentStore {
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(custom_tables),
             views: RwLock::new(views),
+            vector_indexes: RwLock::new(states_from_entries(vector_index_entries)),
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
             tx_snapshot: Mutex::new(None),
@@ -255,8 +292,14 @@ impl DocumentStore {
     /// here: [`crate::SqlEngine`] builds them lazily on construction.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open_read_only(path.as_ref())?;
-        let (entries, custom_table_entries, content_hashes, view_entries, tokenizer) =
-            storage.load_catalog()?;
+        let (
+            entries,
+            custom_table_entries,
+            content_hashes,
+            view_entries,
+            tokenizer,
+            vector_index_entries,
+        ) = storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
@@ -290,6 +333,13 @@ impl DocumentStore {
         }
         let views: FxHashMap<String, String> =
             view_entries.into_iter().map(|v| (v.name, v.sql)).collect();
+        // A read-only load drops the file handle, so read the indexes now.
+        let mut vector_states = states_from_entries(vector_index_entries);
+        for state in vector_states.values_mut() {
+            state.index = Some(std::sync::Arc::new(crate::vector::HnswIndex::from_bytes(
+                &storage.read_index_bytes(state.first_page)?,
+            )?));
+        }
 
         Ok(Self {
             documents,
@@ -300,6 +350,7 @@ impl DocumentStore {
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(custom_tables),
             views: RwLock::new(views),
+            vector_indexes: RwLock::new(vector_states),
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
             tx_snapshot: Mutex::new(None),
@@ -315,8 +366,14 @@ impl DocumentStore {
     /// `list`), avoiding the cost of deserialising all block data.
     pub fn load_catalog_only(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
         let mut storage = Storage::open_read_only(path.as_ref())?;
-        let (entries, _custom_table_entries, content_hashes, _view_entries, tokenizer) =
-            storage.load_catalog()?;
+        let (
+            entries,
+            _custom_table_entries,
+            content_hashes,
+            _view_entries,
+            tokenizer,
+            _vector_indexes,
+        ) = storage.load_catalog()?;
         let cap = entries.len();
         let mut documents = Vec::with_capacity(cap);
         let mut max_doc_id = None;
@@ -344,6 +401,7 @@ impl DocumentStore {
             doc_indexes: vec![None; cap],
             custom_tables: RwLock::new(FxHashMap::default()),
             views: RwLock::new(FxHashMap::default()),
+            vector_indexes: RwLock::new(FxHashMap::default()),
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: content_hashes.into_iter().collect(),
             tx_snapshot: Mutex::new(None),

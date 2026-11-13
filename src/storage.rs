@@ -17,8 +17,8 @@ use crate::{
     indexes::TokenizerKind,
     storage::{
         catalog::{
-            CatalogData, CatalogEntry, CustomTableEntry, ViewEntry, append_catalog, read_catalog,
-            read_catalog_at, write_catalog,
+            CatalogData, CatalogEntry, CustomTableEntry, VectorIndexEntry, ViewEntry,
+            append_catalog, read_catalog, read_catalog_at, write_catalog,
         },
         codec::{decode_block, decode_table_rows, encode_block, encode_table_rows},
         page::{
@@ -286,7 +286,8 @@ impl Storage {
                 return Err(invalid_data("superblock page allocation failed"));
             }
         }
-        let catalog_root = append_catalog(&mut page_file, &[], &[], &[], &[], TokenizerKind::Word)?;
+        let catalog_root =
+            append_catalog(&mut page_file, &[], &[], &[], &[], TokenizerKind::Word, &[])?;
         page_file.sync_all()?;
         let committed_pages = page_file.num_pages;
         let commit = superblock_page(SUPERBLOCK_A, 1, catalog_root, committed_pages);
@@ -456,6 +457,7 @@ impl Storage {
         content_hashes: &[(u32, u64)],
         views: &[ViewEntry],
         tokenizer: TokenizerKind,
+        vector_indexes: &[VectorIndexEntry],
     ) -> Result<(), MqdbError> {
         if self.page_file.version != FILE_VERSION {
             write_catalog(
@@ -465,6 +467,7 @@ impl Storage {
                 content_hashes,
                 views,
                 tokenizer,
+                vector_indexes,
             )?;
             return self.page_file.sync_header();
         }
@@ -476,6 +479,7 @@ impl Storage {
             content_hashes,
             views,
             tokenizer,
+            vector_indexes,
         )?;
         // Ordering is the transaction protocol: an on-disk commit record
         // never points at catalog pages which have not reached stable media.
@@ -903,12 +907,12 @@ pub(crate) mod tests {
             index_start_page: 0,
         };
         storage
-            .flush_catalog(&[catalog_entry], &[], &[], &[], TokenizerKind::Word)
+            .flush_catalog(&[catalog_entry], &[], &[], &[], TokenizerKind::Word, &[])
             .unwrap();
         drop(storage);
 
         let mut reopened = Storage::open(&path).unwrap();
-        let (catalog, _, _, _, _) = reopened.load_catalog().unwrap();
+        let (catalog, _, _, _, _, _) = reopened.load_catalog().unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(
             decode_zone_map(&catalog[0].zone_map_bytes).unwrap(),
@@ -1240,7 +1244,7 @@ pub(crate) mod tests {
 
         let mut storage = Storage::create(&path).unwrap();
         storage
-            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word, &[])
             .unwrap();
 
         let batch1 = vec![
@@ -1285,7 +1289,7 @@ pub(crate) mod tests {
         let mut storage = Storage::create(&path).unwrap();
         // Generation 2 lives in superblock B and is our known-good state.
         storage
-            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word, &[])
             .unwrap();
         let entry = CatalogEntry {
             document_id: 42,
@@ -1303,6 +1307,7 @@ pub(crate) mod tests {
                 &[],
                 &[],
                 TokenizerKind::Word,
+                &[],
             )
             .unwrap();
         drop(storage);
@@ -1331,7 +1336,7 @@ pub(crate) mod tests {
         drop(file);
 
         let mut recovered = Storage::open(&path).unwrap();
-        let (entries, _, _, _, _) = recovered.load_catalog().unwrap();
+        let (entries, _, _, _, _, _) = recovered.load_catalog().unwrap();
         assert!(
             entries.is_empty(),
             "must retain the previous committed root"
@@ -1350,7 +1355,7 @@ pub(crate) mod tests {
 
         let mut storage = Storage::create(&path).unwrap();
         storage
-            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word, &[])
             .unwrap();
         drop(storage);
 
@@ -1376,7 +1381,7 @@ pub(crate) mod tests {
 
         let mut storage = Storage::create(&path).unwrap();
         storage
-            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word)
+            .flush_catalog(&[], &[], &[], &[], TokenizerKind::Word, &[])
             .unwrap();
         drop(storage);
 
@@ -1403,12 +1408,13 @@ pub(crate) mod tests {
                 &[],
                 &[],
                 TokenizerKind::Word,
+                &[],
             )
             .unwrap();
         drop(storage);
 
         let mut reopened = Storage::open_read_only(&path).unwrap();
-        let (entries, _, _, _, _) = reopened.load_catalog().unwrap();
+        let (entries, _, _, _, _, _) = reopened.load_catalog().unwrap();
         assert_eq!(
             entries.len(),
             1,

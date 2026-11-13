@@ -1,3 +1,4 @@
+use super::vector_indexes::persist_unsaved_vector_indexes;
 use super::*;
 
 impl DocumentStore {
@@ -23,6 +24,7 @@ impl DocumentStore {
             documents: self.documents.clone(),
             custom_tables: self.custom_tables.read().unwrap().clone(),
             views: self.views.read().unwrap().clone(),
+            vector_indexes: self.vector_indexes.read().unwrap().clone(),
             content_hashes: self.content_hashes.clone(),
             owner: session,
             external_write: false,
@@ -70,6 +72,7 @@ impl DocumentStore {
         }
         *self.custom_tables.write().unwrap() = snapshot.custom_tables;
         *self.views.write().unwrap() = snapshot.views;
+        *self.vector_indexes.write().unwrap() = snapshot.vector_indexes;
         self.flush_catalog_to_storage()?;
         Ok(())
     }
@@ -97,6 +100,7 @@ impl DocumentStore {
         self.content_hashes = snapshot.content_hashes;
         *self.custom_tables.write().unwrap() = snapshot.custom_tables;
         *self.views.write().unwrap() = snapshot.views;
+        *self.vector_indexes.write().unwrap() = snapshot.vector_indexes;
         self.flush_catalog_to_storage()?;
         Ok(unrevertable_paths)
     }
@@ -109,12 +113,14 @@ impl DocumentStore {
         if let Some(storage) = guard.as_mut() {
             let entries = self.catalog_entries();
             let custom = persist_unsaved_table_rows(storage, &self.custom_tables)?;
+            let vector = persist_unsaved_vector_indexes(storage, &self.vector_indexes)?;
             storage.flush_catalog(
                 &entries,
                 &custom,
                 &self.content_hash_pairs(),
                 &self.views_entries(),
                 self.tokenizer,
+                &vector,
             )?;
         }
         Ok(())
@@ -163,12 +169,14 @@ impl DocumentStore {
             })
             .collect();
         drop(ct_guard);
+        let vector = persist_unsaved_vector_indexes(storage, &self.vector_indexes)?;
         storage.flush_catalog(
             &entries,
             &custom,
             &self.content_hash_pairs(),
             &self.views_entries(),
             self.tokenizer,
+            &vector,
         )?;
         Ok(())
     }

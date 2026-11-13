@@ -27,6 +27,7 @@ pub(crate) struct TxSnapshot {
     pub documents: Vec<Document>,
     pub custom_tables: FxHashMap<String, CustomTableState>,
     pub views: FxHashMap<String, String>,
+    pub vector_indexes: FxHashMap<String, VectorIndexState>,
     pub content_hashes: FxHashMap<DocumentId, u64>,
     /// Session (`SqlEngine`) that ran `BEGIN`. Catalog mutations from any
     /// other session while this transaction is open are external commits.
@@ -43,6 +44,8 @@ use mq_markdown::Markdown;
 mod ingest;
 mod persist;
 mod transaction;
+mod vector_indexes;
+pub(crate) use vector_indexes::VectorIndexState;
 
 /// A validated alias for a store mounted via `ATTACH DATABASE ... AS
 /// <alias>` (or the CLI's `--attach PATH:ALIAS`).
@@ -226,6 +229,8 @@ pub struct DocumentStore {
     /// `CREATE VIEW` definitions: name → `SELECT` SQL text, re-executed live
     /// on every reference rather than materialized.
     pub(crate) views: RwLock<FxHashMap<String, String>>,
+    /// Vector (HNSW) indexes over custom-table columns, keyed by index name.
+    pub(crate) vector_indexes: RwLock<FxHashMap<String, VectorIndexState>>,
     /// Stores attached via `ATTACH DATABASE`, keyed by alias. Session-scoped
     /// only: never persisted.
     pub(crate) attached: RwLock<FxHashMap<DatabaseAlias, DocumentStore>>,
@@ -259,6 +264,7 @@ impl Default for DocumentStore {
             doc_indexes: Vec::new(),
             custom_tables: RwLock::new(FxHashMap::default()),
             views: RwLock::new(FxHashMap::default()),
+            vector_indexes: RwLock::new(FxHashMap::default()),
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: FxHashMap::default(),
             tx_snapshot: Mutex::new(None),
