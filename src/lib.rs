@@ -46,6 +46,7 @@ pub mod sql;
 pub mod storage;
 pub mod store;
 pub mod tui;
+pub mod vector;
 
 pub use document::Document;
 pub use error::MqdbError;
