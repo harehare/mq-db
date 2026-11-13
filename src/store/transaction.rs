@@ -2,15 +2,10 @@ use super::vector_indexes::persist_unsaved_vector_indexes;
 use super::*;
 
 impl DocumentStore {
-    /// Flush the catalog (including custom tables) to the backing storage file,
-    /// if one is open. Called automatically after DDL operations such as
-    /// `CREATE TABLE` and `DROP TABLE`. No-op for in-memory stores.
-    ///
-    /// Any table whose rows have never been persisted is written out in full
-    /// here (a one-time cost). Tables already backed by a row-page chain keep
-    /// their existing pages untouched; see
-    /// [`append_table_rows_to_storage`](DocumentStore::append_table_rows_to_storage)
-    /// for the incremental `INSERT` path.
+    /// Starts a transaction owned by `session`: snapshots the documents,
+    /// custom tables, views and vector indexes so
+    /// [`rollback_transaction`](DocumentStore::rollback_transaction) can
+    /// restore them. Errors if one is already open.
     pub(crate) fn begin_transaction(&self, session: u64) -> Result<(), MqdbError> {
         // Snapshot must not observe a writer's half-applied mutation.
         let _catalog_guard = self.catalog_commit.lock().unwrap();
@@ -105,9 +100,18 @@ impl DocumentStore {
         Ok(unrevertable_paths)
     }
 
-    /// Publish the complete in-memory metadata as a durable COW catalog.
-    /// Errors are deliberately propagated: reporting success after a failed
-    /// commit is worse than leaving the caller to retry.
+    /// Publish the complete in-memory metadata (including custom tables, views
+    /// and vector indexes) as a durable COW catalog, if a backing storage file
+    /// is open. Called after DDL such as `CREATE TABLE` and `DROP TABLE`.
+    /// No-op for in-memory stores. Errors are deliberately propagated:
+    /// reporting success after a failed commit is worse than leaving the
+    /// caller to retry.
+    ///
+    /// Any table whose rows, or index whose blob, has never been persisted is
+    /// written out in full here (a one-time cost). Tables already backed by a
+    /// row-page chain keep their existing pages untouched; see
+    /// [`append_table_rows_to_storage`](DocumentStore::append_table_rows_to_storage)
+    /// for the incremental `INSERT` path.
     pub(crate) fn flush_catalog_to_storage(&self) -> Result<(), MqdbError> {
         let mut guard = self.storage.lock().unwrap();
         if let Some(storage) = guard.as_mut() {
