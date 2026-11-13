@@ -361,8 +361,7 @@ impl<'a> SqlEngine<'a> {
     }
 
     /// Whether `expr` must be resolved per row: some subquery references the
-    /// outer row's columns, or is an `IN (SELECT ...)`, whose left-hand side
-    /// is evaluated against the row while resolving. Substitution depends only on column names, which are identical for
+    /// outer row's columns. Substitution depends only on column names, which are identical for
     /// every row, so one sample row decides it for all of them. No rows
     /// means nothing is evaluated per row, so "uncorrelated" is safe.
     fn where_is_correlated(&self, expr: &Expr, sample: Option<&Row>) -> bool {
@@ -373,7 +372,7 @@ impl<'a> SqlEngine<'a> {
         collect_subqueries(expr, &mut subqueries);
         subqueries
             .into_iter()
-            .any(|(q, is_in)| is_in || substitute_outer_refs_query(q, sample) != *q)
+            .any(|q| substitute_outer_refs_query(q, sample) != *q)
     }
 
     /// Resolves scalar subqueries, `[NOT] IN (SELECT ...)`, and
@@ -450,11 +449,31 @@ impl<'a> SqlEngine<'a> {
                 let q = self.correlate_subquery(subquery, outer_row);
                 let out = self.exec_query(&q)?;
                 let needle_expr = self.resolve_subqueries(e, outer_row)?;
-                let empty = Row {
-                    columns: vec![].into(),
-                    values: vec![],
+                let Some(row) = outer_row else {
+                    // No row to evaluate the left-hand side against yet (the
+                    // subquery is uncorrelated and resolved once), so expand
+                    // into a literal list evaluated per row later.
+                    let list = out
+                        .rows
+                        .iter()
+                        .filter_map(|r| r.first())
+                        .map(|s| {
+                            if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                                Expr::Value(SqlValue::Number(s.clone(), false).with_empty_span())
+                            } else {
+                                Expr::Value(
+                                    SqlValue::SingleQuotedString(s.clone()).with_empty_span(),
+                                )
+                            }
+                        })
+                        .collect();
+                    return Ok(Expr::InList {
+                        expr: Box::new(needle_expr),
+                        list,
+                        negated: *negated,
+                    });
                 };
-                let needle_val = eval_expr(&needle_expr, outer_row.unwrap_or(&empty));
+                let needle_val = eval_expr(&needle_expr, row);
                 let found = out.rows.iter().any(|r| {
                     r.first()
                         .is_some_and(|s| parse_display_value(s) == needle_val)

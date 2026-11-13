@@ -3867,3 +3867,56 @@ fn uncorrelated_exists_in_where_is_resolved_once() {
     assert_eq!(all.rows[0][0], "3");
     assert_eq!(none.rows[0][0], "0");
 }
+
+#[test]
+fn uncorrelated_in_subquery_matches_strings_numbers_and_negation() {
+    let store = make_multi_doc_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let by_string = engine
+        .execute(
+            "SELECT count(*) FROM blocks \
+             WHERE block_type IN (SELECT block_type FROM blocks WHERE lang = 'rust')",
+        )
+        .unwrap();
+    let direct = engine
+        .execute("SELECT count(*) FROM blocks WHERE block_type = 'code'")
+        .unwrap();
+    assert_eq!(by_string.rows, direct.rows);
+
+    let negated = engine
+        .execute(
+            "SELECT count(*) FROM blocks \
+             WHERE block_type NOT IN (SELECT block_type FROM blocks WHERE lang = 'rust')",
+        )
+        .unwrap();
+    let total = engine.execute("SELECT count(*) FROM blocks").unwrap();
+    let sum: i64 =
+        direct.rows[0][0].parse::<i64>().unwrap() + negated.rows[0][0].parse::<i64>().unwrap();
+    assert_eq!(sum.to_string(), total.rows[0][0]);
+
+    // Empty subquery result: IN is never true, NOT IN always is.
+    let none_in = engine
+        .execute("SELECT count(*) FROM blocks WHERE id IN (SELECT id FROM blocks WHERE 1 = 0)")
+        .unwrap();
+    assert_eq!(none_in.rows[0][0], "0");
+    let none_not_in = engine
+        .execute("SELECT count(*) FROM blocks WHERE id NOT IN (SELECT id FROM blocks WHERE 1 = 0)")
+        .unwrap();
+    assert_eq!(none_not_in.rows[0][0], total.rows[0][0]);
+}
+
+#[test]
+fn write_back_where_in_subquery_uses_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# Title\n\nKeep\n\nDrop me\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+    let out = store
+        .execute_sql_mut(
+            "DELETE FROM blocks WHERE content IN \
+             (SELECT content FROM blocks WHERE content = 'Drop me')",
+        )
+        .unwrap();
+    assert_eq!(out.rows[0][0], "1");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Title\n\nKeep\n");
+}

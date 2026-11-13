@@ -86,6 +86,11 @@ fn bench(c: &mut Criterion) {
                (SELECT post FROM blocks WHERE block_type = 'heading' AND content = 'Document 1000'))",
         ),
         (
+            "sql_in_subquery",
+            "SELECT count(*) FROM blocks \
+             WHERE document_id IN (SELECT document_id FROM blocks WHERE content = 'Section 3 parser')",
+        ),
+        (
             "sql_join_documents",
             "SELECT d.path, count(*) FROM blocks b JOIN documents d ON d.id = b.document_id \
              GROUP BY d.path LIMIT 3",

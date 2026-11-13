@@ -196,17 +196,16 @@ pub(super) fn expr_has_subquery(expr: &Expr) -> bool {
     }
 }
 
-/// Pushes every subquery found in `expr` onto `out` as `(query, is_in)`,
-/// where `is_in` marks `IN (SELECT ...)`. Mirrors [`expr_has_subquery`]'s
-/// traversal.
-pub(super) fn collect_subqueries<'e>(expr: &'e Expr, out: &mut Vec<(&'e Query, bool)>) {
+/// Pushes every subquery (scalar, `IN (SELECT ...)`, `EXISTS`) found in
+/// `expr` onto `out`. Mirrors [`expr_has_subquery`]'s traversal.
+pub(super) fn collect_subqueries<'e>(expr: &'e Expr, out: &mut Vec<&'e Query>) {
     match expr {
-        Expr::Subquery(q) => out.push((q, false)),
+        Expr::Subquery(q) => out.push(q),
         Expr::InSubquery { expr, subquery, .. } => {
             collect_subqueries(expr, out);
-            out.push((subquery, true));
+            out.push(subquery);
         }
-        Expr::Exists { subquery, .. } => out.push((subquery, false)),
+        Expr::Exists { subquery, .. } => out.push(subquery),
         Expr::BinaryOp { left, right, .. } => {
             collect_subqueries(left, out);
             collect_subqueries(right, out);
