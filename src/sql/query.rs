@@ -453,20 +453,19 @@ impl<'a> SqlEngine<'a> {
                     // No row to evaluate the left-hand side against yet (the
                     // subquery is uncorrelated and resolved once), so expand
                     // into a literal list evaluated per row later.
-                    let list = out
-                        .rows
-                        .iter()
-                        .filter_map(|r| r.first())
-                        .map(|s| {
-                            if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
-                                Expr::Value(SqlValue::Number(s.clone(), false).with_empty_span())
-                            } else {
-                                Expr::Value(
-                                    SqlValue::SingleQuotedString(s.clone()).with_empty_span(),
-                                )
-                            }
-                        })
-                        .collect();
+                    // Cells are rendered text, so offer each numeric-looking
+                    // one as both a string and a number rather than guess.
+                    let mut list = Vec::new();
+                    for s in out.rows.iter().filter_map(|r| r.first()) {
+                        list.push(Expr::Value(
+                            SqlValue::SingleQuotedString(s.clone()).with_empty_span(),
+                        ));
+                        if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                            list.push(Expr::Value(
+                                SqlValue::Number(s.clone(), false).with_empty_span(),
+                            ));
+                        }
+                    }
                     return Ok(Expr::InList {
                         expr: Box::new(needle_expr),
                         list,
@@ -475,8 +474,11 @@ impl<'a> SqlEngine<'a> {
                 };
                 let needle_val = eval_expr(&needle_expr, row);
                 let found = out.rows.iter().any(|r| {
-                    r.first()
-                        .is_some_and(|s| parse_display_value(s) == needle_val)
+                    r.first().is_some_and(|s| {
+                        !matches!(needle_val, super::value::Value::Null)
+                            && (needle_val.as_str() == Some(s.as_str())
+                                || parse_display_value(s) == needle_val)
+                    })
                 });
                 let result = if *negated { !found } else { found };
                 Ok(Expr::Value(SqlValue::Boolean(result).with_empty_span()))

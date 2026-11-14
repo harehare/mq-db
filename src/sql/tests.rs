@@ -3920,3 +3920,43 @@ fn write_back_where_in_subquery_uses_the_row() {
     assert_eq!(out.rows[0][0], "1");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Title\n\nKeep\n");
 }
+
+#[test]
+fn in_subquery_keeps_numeric_looking_text() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine.execute("CREATE TABLE t (v TEXT)").unwrap();
+    engine
+        .execute("INSERT INTO t VALUES ('01'), ('NULL'), ('x')")
+        .unwrap();
+    let out = engine
+        .execute("SELECT v FROM t WHERE v IN (SELECT v FROM t) ORDER BY v")
+        .unwrap();
+    assert_eq!(out.rows.len(), 3, "{:?}", out.rows);
+    assert_eq!(out.rows[0][0], "01");
+}
+
+#[test]
+fn empty_wildcard_query_keeps_schema_columns_for_aliases() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let n = engine
+        .execute("SELECT * FROM blocks LIMIT 1")
+        .unwrap()
+        .columns
+        .len();
+    let names: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+    let out = engine
+        .execute(&format!(
+            "WITH t({}) AS (SELECT * FROM blocks WHERE 1 = 0) SELECT c0 FROM t",
+            names.join(", ")
+        ))
+        .unwrap();
+    assert!(out.rows.is_empty());
+    engine
+        .execute(&format!(
+            "CREATE VIEW v ({}) AS SELECT * FROM blocks WHERE 1 = 0",
+            names.join(", ")
+        ))
+        .unwrap();
+}
