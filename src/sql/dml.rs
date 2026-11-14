@@ -42,7 +42,7 @@ fn target(twj: &TableWithJoins) -> Result<(String, String), MqdbError> {
 fn row_of(columns: &[String], cells: &[String], prefix: &str) -> Row {
     qualify_row(
         Row {
-            columns: columns.to_vec(),
+            columns: columns.to_vec().into(),
             values: cells.iter().map(|c| Value::Str(c.clone())).collect(),
         },
         prefix,
@@ -164,6 +164,9 @@ impl SqlEngine<'_> {
                 state.last_row_page,
             );
             state.rows = new_rows;
+            // Dropped under the write lock so a search never pairs a
+            // surviving index with the changed rows.
+            self.store.drop_vector_indexes_for_table(table);
             previous
         }; // write lock released before flush
         if let Err(err) = self.store.append_table_rows_to_storage(table, &[]) {

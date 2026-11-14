@@ -28,3 +28,15 @@ docs/API.md  #   0.71  Error Handling
 
 2 matches
 ```
+
+## Tokenizers
+
+The tokenizer is fixed when a store is created.
+
+| `--tokenizer` | Behaviour |
+|---------------|-----------|
+| `word` | Split on non-alphanumeric characters |
+| `bigram` | CJK runs become overlapping 2-character n-grams; other text as `word` |
+| `trigram` | Same as `bigram` with 3-character n-grams |
+
+When `mq-db index` creates a new store without `--tokenizer`, it samples the input files and picks `bigram` if they contain CJK text, otherwise `word`. Pass `--tokenizer word` to opt out. An existing store keeps its tokenizer.

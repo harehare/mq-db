@@ -1,6 +1,8 @@
 //! `SELECT` execution: CTEs, set expressions and subqueries.
 
-use super::analysis::{expr_has_subquery, validate_expr_columns, validate_projection_columns};
+use super::analysis::{
+    collect_subqueries, expr_has_subquery, validate_expr_columns, validate_projection_columns,
+};
 use super::engine::SqlEngine;
 use super::expr::eval_expr;
 use super::external::table_factor_ident;
@@ -35,6 +37,26 @@ fn select_references_table(select: &Select, name: &str) -> bool {
     })
 }
 
+/// Renames `out`'s columns to `aliases` (`WITH name(a, b) AS ...`); no-op if empty.
+fn apply_column_aliases(
+    name: &str,
+    out: &mut QueryOutput,
+    aliases: &[String],
+) -> Result<(), MqdbError> {
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    if aliases.len() != out.columns.len() {
+        return Err(MqdbError::SqlExec(format!(
+            "CTE '{name}' has {} column aliases but its query returns {} columns",
+            aliases.len(),
+            out.columns.len()
+        )));
+    }
+    out.columns = aliases.to_vec();
+    Ok(())
+}
+
 impl<'a> SqlEngine<'a> {
     /// Materialises any `WITH` clause's CTEs into a new scope frame, then
     /// delegates to [`Self::exec_query_body`].
@@ -46,15 +68,17 @@ impl<'a> SqlEngine<'a> {
         self.cte_scopes.borrow_mut().push(FxHashMap::default());
         let result = (|| {
             for cte in &with.cte_tables {
-                if !cte.alias.columns.is_empty() {
-                    return Err(MqdbError::SqlExec(
-                        "CTE column aliases (WITH x(a, b) AS ...) are not supported".into(),
-                    ));
-                }
                 let name = cte.alias.name.value.to_lowercase();
+                let aliases: Vec<String> = cte
+                    .alias
+                    .columns
+                    .iter()
+                    .map(|c| c.name.value.clone())
+                    .collect();
                 // `name` isn't in scope yet, so no self-reference outside
                 // `exec_cte_body`'s own recursive-CTE handling.
-                let out = self.exec_cte_body(&name, &cte.query, with.recursive)?;
+                let mut out = self.exec_cte_body(&name, &cte.query, with.recursive, &aliases)?;
+                apply_column_aliases(&name, &mut out, &aliases)?;
                 self.cte_scopes
                     .borrow_mut()
                     .last_mut()
@@ -78,6 +102,7 @@ impl<'a> SqlEngine<'a> {
         name: &str,
         query: &Query,
         recursive: bool,
+        aliases: &[String],
     ) -> Result<QueryOutput, MqdbError> {
         if recursive
             && let SetExpr::SetOperation {
@@ -96,7 +121,7 @@ impl<'a> SqlEngine<'a> {
                 )));
             }
             let all = matches!(set_quantifier, SetQuantifier::All);
-            return self.exec_recursive_cte(name, anchor, term, all);
+            return self.exec_recursive_cte(name, anchor, term, all, aliases);
         }
         self.exec_query(query)
     }
@@ -114,8 +139,10 @@ impl<'a> SqlEngine<'a> {
         anchor: &Select,
         recursive: &Select,
         all: bool,
+        aliases: &[String],
     ) -> Result<QueryOutput, MqdbError> {
-        let anchor_out = self.exec_select(anchor, &None, None, None)?;
+        let mut anchor_out = self.exec_select(anchor, &None, None, None)?;
+        apply_column_aliases(name, &mut anchor_out, aliases)?;
         let columns = anchor_out.columns.clone();
         let mut result_rows = anchor_out.rows.clone();
         let mut working = anchor_out.rows;
@@ -196,7 +223,7 @@ impl<'a> SqlEngine<'a> {
             SetExpr::Select(select) => self.exec_select(select, &None, None, None),
             SetExpr::Values(Values { rows, .. }) => {
                 let empty = Row {
-                    columns: vec![],
+                    columns: vec![].into(),
                     values: vec![],
                 };
                 let out: Vec<Vec<String>> = rows
@@ -281,7 +308,7 @@ impl<'a> SqlEngine<'a> {
         // than false-reject; the tradeoff is a real typo against an empty
         // table still silently passing, same as before this check existed.
         let known_columns: Vec<String> =
-            rows.first().map(|r| r.columns.clone()).unwrap_or_default();
+            rows.first().map(|r| r.columns.to_vec()).unwrap_or_default();
         if !known_columns.is_empty() {
             if let Some(where_expr) = &select.selection {
                 validate_expr_columns(where_expr, &known_columns)?;
@@ -303,7 +330,7 @@ impl<'a> SqlEngine<'a> {
             && matches!(where_expr.map(unwrap_nested), Some(Expr::Function(_)))
             && from_names_unshadowed_blocks(&select.from[0], &self.cte_scopes.borrow());
         if !where_fully_indexed && let Some(where_expr) = &select.selection {
-            if expr_has_subquery(where_expr) {
+            if expr_has_subquery(where_expr) && self.where_is_correlated(where_expr, rows.first()) {
                 // A subquery may be correlated (reference this row's
                 // columns), so it must be re-resolved per row rather than
                 // once up front.
@@ -331,6 +358,21 @@ impl<'a> SqlEngine<'a> {
 
         // 3. PROJECT / GROUP / ORDER / LIMIT
         self.project_and_aggregate(select, rows, order_by, limit, offset, &known_columns)
+    }
+
+    /// Whether `expr` must be resolved per row: some subquery references the
+    /// outer row's columns. Substitution depends only on column names, which are identical for
+    /// every row, so one sample row decides it for all of them. No rows
+    /// means nothing is evaluated per row, so "uncorrelated" is safe.
+    fn where_is_correlated(&self, expr: &Expr, sample: Option<&Row>) -> bool {
+        let Some(sample) = sample else {
+            return false;
+        };
+        let mut subqueries = Vec::new();
+        collect_subqueries(expr, &mut subqueries);
+        subqueries
+            .into_iter()
+            .any(|q| substitute_outer_refs_query(q, sample) != *q)
     }
 
     /// Resolves scalar subqueries, `[NOT] IN (SELECT ...)`, and
@@ -407,14 +449,36 @@ impl<'a> SqlEngine<'a> {
                 let q = self.correlate_subquery(subquery, outer_row);
                 let out = self.exec_query(&q)?;
                 let needle_expr = self.resolve_subqueries(e, outer_row)?;
-                let empty = Row {
-                    columns: vec![],
-                    values: vec![],
+                let Some(row) = outer_row else {
+                    // No row to evaluate the left-hand side against yet (the
+                    // subquery is uncorrelated and resolved once), so expand
+                    // into a literal list evaluated per row later.
+                    // Cells are rendered text, so offer each numeric-looking
+                    // one as both a string and a number rather than guess.
+                    let mut list = Vec::new();
+                    for s in out.rows.iter().filter_map(|r| r.first()) {
+                        list.push(Expr::Value(
+                            SqlValue::SingleQuotedString(s.clone()).with_empty_span(),
+                        ));
+                        if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+                            list.push(Expr::Value(
+                                SqlValue::Number(s.clone(), false).with_empty_span(),
+                            ));
+                        }
+                    }
+                    return Ok(Expr::InList {
+                        expr: Box::new(needle_expr),
+                        list,
+                        negated: *negated,
+                    });
                 };
-                let needle_val = eval_expr(&needle_expr, outer_row.unwrap_or(&empty));
+                let needle_val = eval_expr(&needle_expr, row);
                 let found = out.rows.iter().any(|r| {
-                    r.first()
-                        .is_some_and(|s| parse_display_value(s) == needle_val)
+                    r.first().is_some_and(|s| {
+                        !matches!(needle_val, super::value::Value::Null)
+                            && (needle_val.as_str() == Some(s.as_str())
+                                || parse_display_value(s) == needle_val)
+                    })
                 });
                 let result = if *negated { !found } else { found };
                 Ok(Expr::Value(SqlValue::Boolean(result).with_empty_span()))

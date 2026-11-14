@@ -35,6 +35,8 @@
 pub mod block;
 pub mod discover;
 pub mod document;
+#[cfg(feature = "embed")]
+pub mod embed;
 pub mod error;
 pub mod index;
 pub mod indexes;
@@ -44,6 +46,7 @@ pub mod sql;
 pub mod storage;
 pub mod store;
 pub mod tui;
+pub mod vector;
 
 pub use document::Document;
 pub use error::MqdbError;

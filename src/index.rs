@@ -1,4 +1,5 @@
 use mq_markdown::Node;
+use saphyr::{LoadableYamlNode, ScalarOwned, YamlOwned};
 
 use crate::block::{Block, BlockId, BlockType, DocumentId, Properties, PropertyValue, Span};
 
@@ -23,27 +24,23 @@ fn heading_depth(node: &Node) -> Option<u8> {
     }
 }
 
-// Helper: convert a serde_yaml Value to a PropertyValue
-
-fn yaml_value_to_property(v: serde_yaml::Value) -> PropertyValue {
+// Helper: convert a saphyr YamlOwned value to a PropertyValue
+fn yaml_value_to_property(v: YamlOwned) -> PropertyValue {
     match v {
-        serde_yaml::Value::Null => PropertyValue::Null,
-        serde_yaml::Value::Bool(b) => PropertyValue::Bool(b),
-        serde_yaml::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                PropertyValue::Int(i)
-            } else if let Some(f) = n.as_f64() {
-                PropertyValue::Float(f)
-            } else {
-                PropertyValue::String(n.to_string())
-            }
+        YamlOwned::Value(ScalarOwned::Null) => PropertyValue::Null,
+        YamlOwned::Value(ScalarOwned::Boolean(b)) => PropertyValue::Bool(b),
+        YamlOwned::Value(ScalarOwned::Integer(i)) => PropertyValue::Int(i),
+        YamlOwned::Value(ScalarOwned::FloatingPoint(f)) => PropertyValue::Float(f.into_inner()),
+        YamlOwned::Value(ScalarOwned::String(s)) | YamlOwned::Representation(s, _, _) => {
+            PropertyValue::String(s)
         }
-        serde_yaml::Value::String(s) => PropertyValue::String(s),
-        serde_yaml::Value::Sequence(seq) => {
+        YamlOwned::Sequence(seq) => {
             PropertyValue::Array(seq.into_iter().map(yaml_value_to_property).collect())
         }
-        serde_yaml::Value::Mapping(_) => PropertyValue::String(format!("{v:?}")),
-        serde_yaml::Value::Tagged(t) => yaml_value_to_property(t.value),
+        YamlOwned::Tagged(_, inner) => yaml_value_to_property(*inner),
+        YamlOwned::Mapping(_) | YamlOwned::Alias(_) | YamlOwned::BadValue => {
+            PropertyValue::String(format!("{v:?}"))
+        }
     }
 }
 
@@ -150,11 +147,12 @@ fn node_to_parts(node: &Node) -> Option<(BlockType, String, Properties)> {
 
         Node::Yaml(y) => {
             // Parse YAML frontmatter and promote key-value pairs as properties
-            if let Ok(serde_yaml::Value::Mapping(map)) =
-                serde_yaml::from_str::<serde_yaml::Value>(&y.value)
+            if let Some(YamlOwned::Mapping(map)) = YamlOwned::load_from_str(&y.value)
+                .ok()
+                .and_then(|docs| docs.into_iter().next())
             {
                 for (k, v) in map {
-                    if let serde_yaml::Value::String(key) = k {
+                    if let YamlOwned::Value(ScalarOwned::String(key)) = k {
                         props.set(key, yaml_value_to_property(v));
                     }
                 }

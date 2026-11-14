@@ -8,8 +8,8 @@ use super::output::QueryOutput;
 use super::plan::{find_equi_join_exprs, zone_map_skip};
 use super::rewrite::fold_constants;
 use super::rows::{
-    QUERY_NEEDS_CONTENT_HASH, block_anchors, block_to_row, doc_to_row, ident_value, link_rows,
-    qualify_row, sql_needs_content_hash,
+    ColumnNeeds, QUERY_NEEDS, block_anchors, block_to_row, doc_to_row, ident_value, link_rows,
+    qualified_block_columns, qualify_row,
 };
 use super::value::{Row, Value};
 use crate::MqdbError;
@@ -27,7 +27,7 @@ impl<'a> SqlEngine<'a> {
     ) -> Result<Vec<Row>, MqdbError> {
         if from.is_empty() {
             return Ok(vec![Row {
-                columns: vec![],
+                columns: vec![].into(),
                 values: vec![],
             }]);
         }
@@ -120,6 +120,9 @@ impl<'a> SqlEngine<'a> {
 
         if let Some(func_args) = &func_args {
             let prefix = alias.as_deref().unwrap_or(&table_name).to_string();
+            if table_name == "vector_search" {
+                return self.vector_search_rows(func_args, &prefix);
+            }
             return resolve_table_function(&table_name, func_args, &prefix);
         }
 
@@ -161,6 +164,7 @@ impl<'a> SqlEngine<'a> {
         match table_name {
             "blocks" => {
                 let prefix = alias.unwrap_or("blocks");
+                let columns = qualified_block_columns(prefix);
                 let mut rows = Vec::new();
                 let mut global_idx: u32 = 0;
 
@@ -173,30 +177,36 @@ impl<'a> SqlEngine<'a> {
                         global_idx += doc.blocks.len() as u32;
                         continue;
                     }
-                    let anchors = block_anchors(doc);
+                    let anchors = if QUERY_NEEDS.with(std::cell::Cell::get).anchor {
+                        block_anchors(doc)
+                    } else {
+                        Vec::new()
+                    };
+                    let anchor_at = |i: usize| anchors.get(i).map_or("", String::as_str);
                     // Try index-based access first
                     if let Some(local_indices) = hint.resolve(doc_idx) {
                         // Only materialise the pre-filtered blocks
                         for local_i in local_indices {
                             if let Some(block) = doc.blocks.get(local_i as usize) {
                                 let block_global_idx = global_idx + local_i;
-                                rows.push(qualify_row(
-                                    block_to_row(
-                                        doc.id,
-                                        block,
-                                        block_global_idx,
-                                        &anchors[local_i as usize],
-                                    ),
-                                    prefix,
+                                rows.push(block_to_row(
+                                    &columns,
+                                    doc.id,
+                                    block,
+                                    block_global_idx,
+                                    anchor_at(local_i as usize),
                                 ));
                             }
                         }
                     } else {
                         // FullScan
                         for (i, block) in doc.blocks.iter().enumerate() {
-                            rows.push(qualify_row(
-                                block_to_row(doc.id, block, global_idx + i as u32, &anchors[i]),
-                                prefix,
+                            rows.push(block_to_row(
+                                &columns,
+                                doc.id,
+                                block,
+                                global_idx + i as u32,
+                                anchor_at(i),
                             ));
                         }
                     }
@@ -241,7 +251,7 @@ impl<'a> SqlEngine<'a> {
                         .map(|row_vals| {
                             qualify_row(
                                 Row {
-                                    columns: state.columns.clone(),
+                                    columns: state.columns.clone().into(),
                                     values: row_vals
                                         .iter()
                                         .map(|v| Value::Str(v.clone()))
@@ -273,10 +283,8 @@ impl<'a> SqlEngine<'a> {
             )));
         }
         self.view_stack.borrow_mut().push(name.to_string());
-        let outer_needs_hash = QUERY_NEEDS_CONTENT_HASH.with(std::cell::Cell::get);
-        if sql_needs_content_hash(sql_text) {
-            QUERY_NEEDS_CONTENT_HASH.with(|c| c.set(true));
-        }
+        let outer_needs = QUERY_NEEDS.with(std::cell::Cell::get);
+        QUERY_NEEDS.with(|c| c.set(outer_needs.merge(ColumnNeeds::of_sql(sql_text))));
         let result = (|| {
             let stmts = Parser::parse_sql(&GenericDialect {}, sql_text)
                 .map_err(|e| MqdbError::SqlParse(e.to_string()))?;
@@ -289,7 +297,7 @@ impl<'a> SqlEngine<'a> {
             };
             self.exec_query(&query)
         })();
-        QUERY_NEEDS_CONTENT_HASH.with(|c| c.set(outer_needs_hash));
+        QUERY_NEEDS.with(|c| c.set(outer_needs));
         self.view_stack.borrow_mut().pop();
         result
     }

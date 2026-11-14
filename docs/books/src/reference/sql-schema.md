@@ -64,4 +64,4 @@ SELECT url, COUNT(*) AS n FROM links WHERE kind = 'link' GROUP BY url ORDER BY n
 
 `id` is the block's position across the whole store, so it shifts when an earlier document gains or loses blocks. Key long-lived data on `(documents.path, anchor)` or on `content_hash` instead.
 
-`pre`/`post` are the Nested-Set interval-index boundaries described in [Index Layers](index-layers.md); they encode heading hierarchy as a pure integer range, which is what the [`under()`](sql-functions.md) function operates on.
+`pre`/`post` are the Nested-Set interval-index boundaries described in [Index Layers](index-layers.md); they encode heading hierarchy as a pure integer range, which is what the [`under()`](sql-functions.md) function operates on. They are numbered **per document**, so always pair `under()` with a `document_id` condition; otherwise the same `pre`/`post` range matches blocks in every other document.

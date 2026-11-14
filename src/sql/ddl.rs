@@ -228,6 +228,7 @@ impl<'a> SqlEngine<'a> {
             }
             let result = self.exec_query(query)?;
             let n = result.rows.len();
+            self.store.drop_vector_indexes_for_table(&table_name);
             let previous = self.store.custom_tables.write().unwrap().insert(
                 table_name.clone(),
                 CustomTableState {
@@ -316,12 +317,6 @@ impl<'a> SqlEngine<'a> {
                 "cannot override built-in table '{view_name}'"
             )));
         }
-        if !cv.columns.is_empty() {
-            return Err(MqdbError::SqlExec(
-                "explicit view columns (CREATE VIEW v (a, b) AS ...) are not supported".into(),
-            ));
-        }
-
         // Guard the cross-kind check too, or a concurrent CREATE TABLE can slip in.
         let _catalog_guard = self.store.catalog_commit.lock().unwrap();
         if self
@@ -351,8 +346,29 @@ impl<'a> SqlEngine<'a> {
 
         // Validate the query now so a bad CREATE VIEW fails immediately
         // rather than on first use.
-        self.exec_query(&cv.query)?;
-        let sql_text = cv.query.to_string();
+        let probe = self.exec_query(&cv.query)?;
+        if !cv.columns.is_empty() && cv.columns.len() != probe.columns.len() {
+            return Err(MqdbError::SqlExec(format!(
+                "view '{view_name}' has {} column names but its query returns {} columns",
+                cv.columns.len(),
+                probe.columns.len()
+            )));
+        }
+        // Stored as text, so a column list is persisted as a wrapping CTE.
+        let sql_text = if cv.columns.is_empty() {
+            cv.query.to_string()
+        } else {
+            let cols: Vec<String> = cv
+                .columns
+                .iter()
+                .map(|c| format!("\"{}\"", c.name.value.replace('"', "\"\"")))
+                .collect();
+            format!(
+                "WITH __view({}) AS ({}) SELECT * FROM __view",
+                cols.join(", "),
+                cv.query
+            )
+        };
         if sql_text.len() > u16::MAX as usize {
             return Err(MqdbError::SqlExec(
                 "view query is too long to persist (max 65535 bytes)".into(),
@@ -481,7 +497,7 @@ impl<'a> SqlEngine<'a> {
             Some(indices?)
         };
 
-        let new_rows = {
+        let (new_rows, first_new_row) = {
             let mut guard = self.store.custom_tables.write().unwrap();
             let state = guard
                 .get_mut(&table_name)
@@ -542,10 +558,16 @@ impl<'a> SqlEngine<'a> {
                 }
             }
 
+            let first_new_row = state.rows.len();
             state.rows.extend(new_rows.iter().cloned());
-            new_rows
+            (new_rows, first_new_row)
         }; // write lock released before flush
         let inserted = new_rows.len();
+        if inserted > 0 {
+            // Appended rows only add to what an index describes.
+            self.store
+                .extend_vector_indexes(&table_name, first_new_row, &new_rows);
+        }
         // Append only the new rows to the on-disk chain instead of rewriting
         // the whole table, so INSERT cost stays proportional to the rows
         // being added rather than the table's total size.
@@ -554,6 +576,8 @@ impl<'a> SqlEngine<'a> {
             .append_table_rows_to_storage(&table_name, &new_rows)
         {
             self.store.rollback_appended_rows(&table_name, inserted);
+            // The index already includes the rows that were just rolled back.
+            self.store.drop_vector_indexes_for_table(&table_name);
             return Err(err);
         }
         if inserted > 0 {
@@ -607,6 +631,9 @@ impl<'a> SqlEngine<'a> {
             }
             dropped
         }; // write lock released before flush
+        for (name, _) in &removed {
+            self.store.drop_vector_indexes_for_table(name);
+        }
         if let Err(err) = self.store.flush_catalog_to_storage() {
             let mut guard = self.store.custom_tables.write().unwrap();
             for (name, state) in removed {

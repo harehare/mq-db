@@ -1626,19 +1626,6 @@ fn cte_name_collision_with_custom_table_prefers_cte() {
 }
 
 #[test]
-fn cte_column_alias_list_rejected() {
-    let store = make_store();
-    let engine = SqlEngine::new(&store).unwrap();
-    let err = engine
-        .execute(
-            "WITH h(a) AS (SELECT content FROM blocks WHERE block_type = 'heading')
-             SELECT a FROM h",
-        )
-        .unwrap_err();
-    assert!(err.to_string().contains("column aliases"));
-}
-
-#[test]
 fn cte_shadowing_across_nested_subquery_with_same_name() {
     let store = make_store();
     let engine = SqlEngine::new(&store).unwrap();
@@ -1926,20 +1913,6 @@ fn write_back_delete_removes_matched_block_and_blank_line() {
 }
 
 #[test]
-fn write_back_update_rejects_non_heading_paragraph_block_type() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_md(&dir, "doc.md", "# Title\n\n```rust\nfn main() {}\n```\n");
-
-    let mut store = DocumentStore::new();
-    store.add_file(&path).unwrap();
-
-    let err = store
-        .execute_sql_mut("UPDATE blocks SET content = 'fn other() {}' WHERE block_type = 'code'")
-        .unwrap_err();
-    assert!(err.to_string().contains("heading/paragraph"));
-}
-
-#[test]
 fn write_back_rejects_document_with_no_source_path() {
     let mut store = DocumentStore::new();
     store.add_str("# Title\n\nBody\n").unwrap();
@@ -2144,10 +2117,10 @@ fn write_back_insert_rejects_unsupported_block_type() {
 
     let err = store
         .execute_sql_mut(
-            "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'code', 'fn f(){}')",
+            "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'table_cell', 'x')",
         )
         .unwrap_err();
-    assert!(err.to_string().contains("heading/paragraph"));
+    assert!(err.to_string().contains("only supported for"));
 }
 
 #[test]
@@ -3416,7 +3389,38 @@ fn test_sql_content_hash_depends_on_type_and_content_only() {
 #[case("SELECT * FROM blocks", true)]
 #[case("SELECT b.* FROM blocks b", true)]
 fn test_sql_needs_content_hash(#[case] sql: &str, #[case] expected: bool) {
-    assert_eq!(super::rows::sql_needs_content_hash(sql), expected);
+    assert_eq!(super::rows::ColumnNeeds::of_sql(sql).content_hash, expected);
+}
+
+#[rstest]
+#[case("SELECT content FROM blocks", false, false)]
+#[case("SELECT properties FROM blocks", true, false)]
+#[case("SELECT b.anchor FROM blocks b", false, true)]
+#[case("SELECT * FROM blocks", true, true)]
+fn test_sql_needs_properties_and_anchor(
+    #[case] sql: &str,
+    #[case] properties: bool,
+    #[case] anchor: bool,
+) {
+    let needs = super::rows::ColumnNeeds::of_sql(sql);
+    assert_eq!((needs.properties, needs.anchor), (properties, anchor));
+}
+
+#[test]
+fn unreferenced_expensive_columns_are_null_and_referenced_ones_are_real() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("SELECT properties, anchor FROM blocks WHERE block_type = 'heading' LIMIT 1")
+        .unwrap();
+    assert!(out.rows[0][0].starts_with('{'));
+    assert!(!out.rows[0][1].is_empty() && out.rows[0][1] != "NULL");
+    // A view over blocks must still see the columns its own text references.
+    engine
+        .execute("CREATE VIEW heads AS SELECT anchor, properties FROM blocks WHERE block_type = 'heading'")
+        .unwrap();
+    let out = engine.execute("SELECT anchor FROM heads LIMIT 1").unwrap();
+    assert!(!out.rows[0][0].is_empty() && out.rows[0][0] != "NULL");
 }
 
 #[test]
@@ -3663,4 +3667,1118 @@ fn test_sql_arithmetic_on_numeric_text(#[case] sql: &str, #[case] expected: &str
     let store = DocumentStore::new();
     let engine = SqlEngine::new(&store).unwrap();
     assert_eq!(engine.execute(sql).unwrap().rows[0][0], expected, "{sql}");
+}
+
+#[test]
+fn cte_column_aliases_rename_columns() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("WITH t(a, b) AS (SELECT 1, 2) SELECT b, a FROM t")
+        .unwrap();
+    assert_eq!(out.rows, vec![vec!["2".to_string(), "1".to_string()]]);
+}
+
+#[test]
+fn cte_column_alias_count_mismatch_errors() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let err = engine
+        .execute("WITH t(a) AS (SELECT 1, 2) SELECT a FROM t")
+        .unwrap_err();
+    assert!(err.to_string().contains("column aliases"));
+}
+
+#[test]
+fn recursive_cte_with_column_aliases() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute(
+            "WITH RECURSIVE seq(i) AS (
+               SELECT 1
+               UNION ALL
+               SELECT i + 1 FROM seq WHERE i < 3
+             )
+             SELECT i FROM seq ORDER BY i",
+        )
+        .unwrap();
+    assert_eq!(out.rows.len(), 3);
+}
+
+#[test]
+fn create_view_with_column_list() {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine
+        .execute("CREATE VIEW v (x, y) AS SELECT 1, 2")
+        .unwrap();
+    let out = engine.execute("SELECT y, x FROM v").unwrap();
+    assert_eq!(out.rows, vec![vec!["2".to_string(), "1".to_string()]]);
+    let err = engine
+        .execute("CREATE VIEW w (x) AS SELECT 1, 2")
+        .unwrap_err();
+    assert!(err.to_string().contains("column names"));
+}
+
+#[test]
+fn write_back_update_code_block_keeps_lang_and_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(
+        &dir,
+        "doc.md",
+        "# Title\n\n```rust\nfn main() {}\n```\n\nTail\n",
+    );
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    store
+        .execute_sql_mut("UPDATE blocks SET content = 'fn other() {}' WHERE block_type = 'code'")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# Title\n\n```rust\nfn other() {}\n```\n\nTail\n"
+    );
+}
+
+#[test]
+fn write_back_update_code_block_with_backticks_uses_longer_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# T\n\n```md\nx\n```\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    store
+        .execute_sql_mut("UPDATE blocks SET content = '```inner```' WHERE block_type = 'code'")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# T\n\n````md\n```inner```\n````\n"
+    );
+    let code = store.documents()[0]
+        .blocks
+        .iter()
+        .find(|b| b.block_type == crate::block::BlockType::Code)
+        .unwrap();
+    assert_eq!(code.content, "```inner```");
+}
+
+#[test]
+fn write_back_update_blockquote() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# T\n\n> old\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    store
+        .execute_sql_mut("UPDATE blocks SET content = 'new' WHERE block_type = 'blockquote'")
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# T\n\n> new\n");
+}
+
+#[test]
+fn write_back_insert_code_block_with_lang() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# Title\n\nBody\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    store
+        .execute_sql_mut(
+            "INSERT INTO blocks (document_id, block_type, content, lang) \
+             VALUES (0, 'code', 'let x = 1;', 'rust')",
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# Title\n\nBody\n\n```rust\nlet x = 1;\n```\n"
+    );
+}
+
+#[test]
+fn write_back_insert_lang_only_valid_for_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# Title\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    let err = store
+        .execute_sql_mut(
+            "INSERT INTO blocks (document_id, block_type, content, lang) \
+             VALUES (0, 'paragraph', 'x', 'rust')",
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("lang is only valid"));
+}
+
+#[test]
+fn uncorrelated_scalar_subquery_in_where_matches_per_row_result() {
+    let store = make_multi_doc_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let uncorrelated = engine
+        .execute(
+            "SELECT id FROM documents \
+             WHERE id > (SELECT min(document_id) FROM blocks) ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        uncorrelated.rows,
+        vec![vec!["1".to_string()], vec!["2".to_string()]]
+    );
+    // Correlated: still evaluated per row.
+    let correlated = engine
+        .execute(
+            "SELECT d.id FROM documents d \
+             WHERE d.id = (SELECT max(b.document_id) FROM blocks b WHERE b.document_id = d.id) \
+             ORDER BY d.id",
+        )
+        .unwrap();
+    assert_eq!(correlated.rows.len(), 3);
+}
+
+#[test]
+fn uncorrelated_exists_in_where_is_resolved_once() {
+    let store = make_multi_doc_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let all = engine
+        .execute("SELECT count(*) FROM documents WHERE EXISTS (SELECT 1 FROM blocks)")
+        .unwrap();
+    let none = engine
+        .execute("SELECT count(*) FROM documents WHERE EXISTS (SELECT 1 FROM blocks WHERE 1 = 0)")
+        .unwrap();
+    assert_eq!(all.rows[0][0], "3");
+    assert_eq!(none.rows[0][0], "0");
+}
+
+#[test]
+fn uncorrelated_in_subquery_matches_strings_numbers_and_negation() {
+    let store = make_multi_doc_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let by_string = engine
+        .execute(
+            "SELECT count(*) FROM blocks \
+             WHERE block_type IN (SELECT block_type FROM blocks WHERE lang = 'rust')",
+        )
+        .unwrap();
+    let direct = engine
+        .execute("SELECT count(*) FROM blocks WHERE block_type = 'code'")
+        .unwrap();
+    assert_eq!(by_string.rows, direct.rows);
+
+    let negated = engine
+        .execute(
+            "SELECT count(*) FROM blocks \
+             WHERE block_type NOT IN (SELECT block_type FROM blocks WHERE lang = 'rust')",
+        )
+        .unwrap();
+    let total = engine.execute("SELECT count(*) FROM blocks").unwrap();
+    let sum: i64 =
+        direct.rows[0][0].parse::<i64>().unwrap() + negated.rows[0][0].parse::<i64>().unwrap();
+    assert_eq!(sum.to_string(), total.rows[0][0]);
+
+    // Empty subquery result: IN is never true, NOT IN always is.
+    let none_in = engine
+        .execute("SELECT count(*) FROM blocks WHERE id IN (SELECT id FROM blocks WHERE 1 = 0)")
+        .unwrap();
+    assert_eq!(none_in.rows[0][0], "0");
+    let none_not_in = engine
+        .execute("SELECT count(*) FROM blocks WHERE id NOT IN (SELECT id FROM blocks WHERE 1 = 0)")
+        .unwrap();
+    assert_eq!(none_not_in.rows[0][0], total.rows[0][0]);
+}
+
+#[test]
+fn write_back_where_in_subquery_uses_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# Title\n\nKeep\n\nDrop me\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+    let out = store
+        .execute_sql_mut(
+            "DELETE FROM blocks WHERE content IN \
+             (SELECT content FROM blocks WHERE content = 'Drop me')",
+        )
+        .unwrap();
+    assert_eq!(out.rows[0][0], "1");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Title\n\nKeep\n");
+}
+
+#[test]
+fn in_subquery_keeps_numeric_looking_text() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    engine.execute("CREATE TABLE t (v TEXT)").unwrap();
+    engine
+        .execute("INSERT INTO t VALUES ('01'), ('NULL'), ('x')")
+        .unwrap();
+    let out = engine
+        .execute("SELECT v FROM t WHERE v IN (SELECT v FROM t) ORDER BY v")
+        .unwrap();
+    assert_eq!(out.rows.len(), 3, "{:?}", out.rows);
+    assert_eq!(out.rows[0][0], "01");
+}
+
+#[test]
+fn empty_wildcard_query_keeps_schema_columns_for_aliases() {
+    let store = make_store();
+    let engine = SqlEngine::new(&store).unwrap();
+    let n = engine
+        .execute("SELECT * FROM blocks LIMIT 1")
+        .unwrap()
+        .columns
+        .len();
+    let names: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+    let out = engine
+        .execute(&format!(
+            "WITH t({}) AS (SELECT * FROM blocks WHERE 1 = 0) SELECT c0 FROM t",
+            names.join(", ")
+        ))
+        .unwrap();
+    assert!(out.rows.is_empty());
+    engine
+        .execute(&format!(
+            "CREATE VIEW v ({}) AS SELECT * FROM blocks WHERE 1 = 0",
+            names.join(", ")
+        ))
+        .unwrap();
+}
+
+/// Runs `sql` with write-back against a file holding `md`; returns the file
+/// afterwards, and the store.
+fn write_back(md: &str, sql: &str) -> (String, DocumentStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", md);
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+    store.execute_sql_mut(sql).unwrap();
+    let out = std::fs::read_to_string(&path).unwrap();
+    (out, store)
+}
+
+fn write_back_err(md: &str, sql: &str) -> (String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", md);
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+    let err = store.execute_sql_mut(sql).unwrap_err().to_string();
+    (err, std::fs::read_to_string(&path).unwrap())
+}
+
+fn contents(store: &DocumentStore, block_type: &str) -> Vec<String> {
+    store.documents()[0]
+        .blocks
+        .iter()
+        .filter(|b| b.block_type.as_str() == block_type)
+        .map(|b| b.content.clone())
+        .collect()
+}
+
+#[test]
+fn write_back_update_list_item_keeps_marker_checkbox_and_indent() {
+    let md = "# T\n\n- one\n- two\n\n1. first\n2. [x] done\n   - nested\n";
+    let (out, store) = write_back(
+        md,
+        "UPDATE blocks SET content = '2' WHERE block_type = 'list' AND content = 'two'",
+    );
+    assert_eq!(
+        out,
+        "# T\n\n- one\n- 2\n\n1. first\n2. [x] done\n   - nested\n"
+    );
+    assert_eq!(
+        contents(&store, "list"),
+        ["one", "2", "first", "done", "nested"]
+    );
+
+    let (out, _) = write_back(
+        md,
+        "UPDATE blocks SET content = 'finished' WHERE block_type = 'list' AND content = 'done'",
+    );
+    assert!(out.contains("\n2. [x] finished\n"), "{out}");
+    let (out, _) = write_back(
+        md,
+        "UPDATE blocks SET content = 'inner' WHERE block_type = 'list' AND content = 'nested'",
+    );
+    assert!(out.contains("\n   - inner\n"), "{out}");
+}
+
+#[test]
+fn write_back_update_list_item_with_continuation_lines_and_unicode() {
+    let (out, store) = write_back(
+        "- two with `code`\n  continued\n- next\n",
+        "UPDATE blocks SET content = 'short' WHERE content LIKE 'two%'",
+    );
+    assert_eq!(out, "- short\n- next\n");
+    assert_eq!(contents(&store, "list"), ["short", "next"]);
+
+    // Japanese and an emoji before the end of the item's text.
+    let (out, _) = write_back(
+        "- a😀b\n- 日本語です\n",
+        "UPDATE blocks SET content = 'X' WHERE block_type = 'list'",
+    );
+    assert_eq!(out, "- X\n- X\n");
+}
+
+#[test]
+fn write_back_list_rejects_multi_line_content() {
+    let (err, file) = write_back_err(
+        "- a\n",
+        "UPDATE blocks SET content = 'x\ny' WHERE block_type = 'list'",
+    );
+    assert!(err.contains("single line"), "{err}");
+    assert_eq!(file, "- a\n");
+    let (err, _) = write_back_err(
+        "# T\n",
+        "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'list', 'x\ny')",
+    );
+    assert!(err.contains("single line"), "{err}");
+}
+
+#[test]
+fn write_back_delete_list_items_without_disturbing_the_rest() {
+    let md = "para\n\n- a\n- b\n- c\n\nafter\n";
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content = 'b'");
+    assert_eq!(out, "para\n\n- a\n- c\n\nafter\n");
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content = 'a'");
+    assert_eq!(out, "para\n\n- b\n- c\n\nafter\n");
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content = 'c'");
+    assert_eq!(out, "para\n\n- a\n- b\n\nafter\n");
+    let (out, store) = write_back(md, "DELETE FROM blocks WHERE block_type = 'list'");
+    assert_eq!(out, "para\n\nafter\n");
+    assert!(contents(&store, "list").is_empty());
+}
+
+#[test]
+fn write_back_delete_list_item_with_nested_items_needs_them_too() {
+    let md = "- a\n  - a1\n  - a2\n- b\n";
+    let (err, file) = write_back_err(md, "DELETE FROM blocks WHERE content = 'a'");
+    assert!(err.contains("nested items"), "{err}");
+    assert_eq!(
+        file, md,
+        "nothing is written when the statement is rejected"
+    );
+
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content IN ('a', 'a1', 'a2')");
+    assert_eq!(out, "- b\n");
+    // A nested item alone is fine.
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content = 'a1'");
+    assert_eq!(out, "- a\n  - a2\n- b\n");
+}
+
+#[test]
+fn write_back_delete_block_followed_directly_by_text_keeps_paragraphs_apart() {
+    let (out, _) = write_back(
+        "para\n\n# H\ntext\n",
+        "DELETE FROM blocks WHERE block_type = 'heading'",
+    );
+    assert_eq!(out, "para\n\ntext\n");
+}
+
+#[test]
+fn write_back_insert_list_item_after_an_item() {
+    let md = "# T\n\n- one\n- two\n\nTail\n";
+    // after_pre of "one"
+    let pre: u32 = {
+        let mut s = DocumentStore::new();
+        s.add_str(md).unwrap();
+        s.documents()[0]
+            .blocks
+            .iter()
+            .find(|b| b.content == "one")
+            .unwrap()
+            .pre
+    };
+    let (out, store) = write_back(
+        md,
+        &format!(
+            "INSERT INTO blocks (document_id, block_type, content, after_pre) \
+             VALUES (0, 'list', 'new', {pre})"
+        ),
+    );
+    assert_eq!(out, "# T\n\n- one\n- new\n- two\n\nTail\n");
+    assert_eq!(contents(&store, "list"), ["one", "new", "two"]);
+}
+
+#[test]
+fn write_back_insert_list_item_goes_after_nested_items_and_copies_the_marker() {
+    let md = "1. [x] first\n   - child\n2. second\n";
+    let pre = |text: &str| -> u32 {
+        let mut s = DocumentStore::new();
+        s.add_str(md).unwrap();
+        s.documents()[0]
+            .blocks
+            .iter()
+            .find(|b| b.content == text)
+            .unwrap()
+            .pre
+    };
+    // After the checked, ordered parent: past its child, unchecked, same marker.
+    let (out, _) = write_back(
+        md,
+        &format!(
+            "INSERT INTO blocks (document_id, block_type, content, after_pre) \
+             VALUES (0, 'list', 'mid', {})",
+            pre("first")
+        ),
+    );
+    assert_eq!(out, "1. [x] first\n   - child\n1. mid\n2. second\n");
+    // After the nested child: keeps the child's indent.
+    let (out, _) = write_back(
+        md,
+        &format!(
+            "INSERT INTO blocks (document_id, block_type, content, after_pre) \
+             VALUES (0, 'list', 'sibling', {})",
+            pre("child")
+        ),
+    );
+    assert_eq!(out, "1. [x] first\n   - child\n   - sibling\n2. second\n");
+}
+
+#[test]
+fn write_back_insert_list_item_in_order_and_as_a_new_list() {
+    let md = "# T\n\n- a\n- b\n";
+    let pre_a: u32 = {
+        let mut s = DocumentStore::new();
+        s.add_str(md).unwrap();
+        s.documents()[0]
+            .blocks
+            .iter()
+            .find(|b| b.content == "a")
+            .unwrap()
+            .pre
+    };
+    // Several rows after the same item keep their VALUES order.
+    let (out, _) = write_back(
+        md,
+        &format!(
+            "INSERT INTO blocks (document_id, block_type, content, after_pre) \
+             VALUES (0, 'list', 'x', {pre_a}), (0, 'list', 'y', {pre_a})"
+        ),
+    );
+    assert_eq!(out, "# T\n\n- a\n- x\n- y\n- b\n");
+    // No list item to follow: a new bullet list, set off by a blank line.
+    let (out, _) = write_back(
+        "# T\n\ntext\n",
+        "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'list', 'first')",
+    );
+    assert_eq!(out, "# T\n\ntext\n\n- first\n");
+}
+
+const TABLE_MD: &str = "# T\n\n| a | b |\n|---|:-:|\n| 1 \\| x |   2|\n| 3 | 4 |\n\nTail\n";
+
+#[test]
+fn write_back_update_table_cell_changes_only_that_cell() {
+    let (out, store) = write_back(
+        TABLE_MD,
+        "UPDATE blocks SET content = 'B' WHERE block_type = 'table_cell' AND content = 'b'",
+    );
+    assert_eq!(
+        out,
+        "# T\n\n| a | B |\n|---|:-:|\n| 1 \\| x |   2|\n| 3 | 4 |\n\nTail\n"
+    );
+    assert_eq!(
+        contents(&store, "table_cell"),
+        ["a", "B", "1 | x", "2", "3", "4"]
+    );
+
+    // A body cell whose neighbour has an escaped pipe and odd spacing.
+    let (out, _) = write_back(
+        TABLE_MD,
+        "UPDATE blocks SET content = 'two' WHERE block_type = 'table_cell' AND content = '2'",
+    );
+    assert!(out.contains("| 1 \\| x | two |\n"), "{out}");
+}
+
+#[test]
+fn write_back_update_several_cells_of_one_row() {
+    let (out, store) = write_back(
+        TABLE_MD,
+        "UPDATE blocks SET content = 'z' WHERE block_type = 'table_cell' AND content IN ('3', '4')",
+    );
+    assert!(out.contains("\n| z | z |\n"), "{out}");
+    assert_eq!(
+        contents(&store, "table_cell"),
+        ["a", "b", "1 | x", "2", "z", "z"]
+    );
+}
+
+#[test]
+fn write_back_update_table_cell_escapes_pipes_and_rejects_line_breaks() {
+    let (out, store) = write_back(
+        TABLE_MD,
+        "UPDATE blocks SET content = 'p|q' WHERE block_type = 'table_cell' AND content = '3'",
+    );
+    assert!(out.contains("| p\\|q | 4 |"), "{out}");
+    assert_eq!(
+        contents(&store, "table_cell")[4],
+        "p|q",
+        "the escaped pipe reads back as the text that was written"
+    );
+
+    let (err, file) = write_back_err(
+        TABLE_MD,
+        "UPDATE blocks SET content = 'a\nb' WHERE block_type = 'table_cell' AND content = '3'",
+    );
+    assert!(err.contains("line break"), "{err}");
+    assert_eq!(file, TABLE_MD);
+}
+
+#[test]
+fn write_back_cannot_delete_or_insert_table_cells() {
+    let (err, file) = write_back_err(
+        TABLE_MD,
+        "DELETE FROM blocks WHERE block_type = 'table_cell' AND content = '3'",
+    );
+    assert!(err.contains("table cell"), "{err}");
+    assert_eq!(file, TABLE_MD);
+    let (err, _) = write_back_err(
+        TABLE_MD,
+        "DELETE FROM blocks WHERE block_type = 'table_align'",
+    );
+    assert!(err.contains("table cell"), "{err}");
+    let (err, _) = write_back_err(
+        TABLE_MD,
+        "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'table_cell', 'x')",
+    );
+    assert!(err.contains("only supported for"), "{err}");
+}
+
+/// Updating any one list item or table cell changes that block's content to
+/// the new text and nothing else: the block count and every other block's
+/// content stay as they were. Covers nesting, ordered/checked items, wrapped
+/// items, Japanese and emoji text, escaped pipes and uneven table spacing.
+#[test]
+fn write_back_update_of_any_single_list_item_or_cell_is_isolated() {
+    let md = "# Title\n\nintro 😀 text\n\n- one\n- two with `code`\n  wrapped line\n  - nested 日本語\n    - deeper 😀x\n- [ ] todo\n- [x] done\n\n1. first\n2. second\n   - child\n10. tenth\n\n| a | b | c |\n|---|:-:|--:|\n| 1 \\| x |   2| `p` |\n|  日本 | 😀 | z |\n| 3 | 4 | 5 |\n\n- other list\n\nTail paragraph\n";
+    let mut baseline = DocumentStore::new();
+    baseline.add_str(md).unwrap();
+    let blocks: Vec<(u32, String, String)> = baseline.documents()[0]
+        .blocks
+        .iter()
+        .map(|b| (b.pre, b.block_type.as_str().to_string(), b.content.clone()))
+        .collect();
+    let targets: Vec<&(u32, String, String)> = blocks
+        .iter()
+        .filter(|(_, t, _)| t == "list" || t == "table_cell")
+        .collect();
+    assert!(
+        targets.len() >= 20,
+        "the document should have plenty to edit"
+    );
+
+    for (pre, block_type, original) in targets {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", md);
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+        store
+            .execute_sql_mut(&format!(
+                "UPDATE blocks SET content = 'NEW' WHERE pre = {pre}"
+            ))
+            .unwrap_or_else(|e| panic!("{block_type} {original:?}: {e}"));
+
+        let after: Vec<(String, String)> = store.documents()[0]
+            .blocks
+            .iter()
+            .map(|b| (b.block_type.as_str().to_string(), b.content.clone()))
+            .collect();
+        assert_eq!(
+            after.len(),
+            blocks.len(),
+            "{block_type} {original:?}: block count changed\n{}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        for (i, ((_, t, before), (t_after, c_after))) in blocks.iter().zip(&after).enumerate() {
+            assert_eq!(
+                t, t_after,
+                "{block_type} {original:?}: block {i} changed type"
+            );
+            let expected = if blocks[i].0 == *pre {
+                "NEW"
+            } else {
+                before.as_str()
+            };
+            assert_eq!(
+                c_after,
+                expected,
+                "{block_type} {original:?}: block {i} is wrong\n{}",
+                std::fs::read_to_string(&path).unwrap()
+            );
+        }
+    }
+}
+
+/// Deleting any one block (that can be deleted on its own) removes exactly
+/// that block: every other block keeps its type and content, so removing
+/// lines never glues a paragraph to a list or two lists together.
+#[test]
+fn write_back_delete_of_any_single_block_removes_only_that_block() {
+    let md = "---\ntitle: x\n---\n\n# Title\ntext right under the heading\n\nintro\n\n- one\n- two\n  - nested\n- three\n\n1. first\n2. second\n\n```rust\nfn f() {}\n```\n\n> quoted\n\nplain paragraph\n## Sub\n\n- last list\n\nTail\n";
+    let mut baseline = DocumentStore::new();
+    baseline.add_str(md).unwrap();
+    let blocks: Vec<(u32, String, String)> = baseline.documents()[0]
+        .blocks
+        .iter()
+        .map(|b| (b.pre, b.block_type.as_str().to_string(), b.content.clone()))
+        .collect();
+
+    let mut deleted = 0;
+    for (i, (pre, block_type, content)) in blocks.iter().enumerate() {
+        // A nested parent is only deletable together with its children.
+        let has_children = baseline.documents()[0]
+            .blocks
+            .get(i + 1)
+            .zip(baseline.documents()[0].blocks.get(i))
+            .is_some_and(|(next, this)| {
+                this.block_type.as_str() == "list"
+                    && next.block_type.as_str() == "list"
+                    && next.properties.get("level").and_then(|v| v.as_int())
+                        > this.properties.get("level").and_then(|v| v.as_int())
+            });
+        if has_children {
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", md);
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+        store
+            .execute_sql_mut(&format!("DELETE FROM blocks WHERE pre = {pre}"))
+            .unwrap_or_else(|e| panic!("{block_type} {content:?}: {e}"));
+        deleted += 1;
+
+        let after: Vec<(String, String)> = store.documents()[0]
+            .blocks
+            .iter()
+            .map(|b| (b.block_type.as_str().to_string(), b.content.clone()))
+            .collect();
+        let expected: Vec<(String, String)> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| j != &i)
+            .map(|(_, (_, t, c))| (t.clone(), c.clone()))
+            .collect();
+        assert_eq!(
+            after,
+            expected,
+            "deleting {block_type} {content:?} changed something else\n{}",
+            std::fs::read_to_string(&path).unwrap()
+        );
+    }
+    assert!(deleted >= 12, "only {deleted} blocks were exercised");
+}
+
+#[test]
+fn write_back_refuses_a_file_edited_since_it_was_indexed() {
+    let md = "# Title\n\nfirst\n\nsecond\n\n- item\n";
+    for sql in [
+        "UPDATE blocks SET content = 'x' WHERE content = 'first'",
+        "DELETE FROM blocks WHERE content = 'first'",
+        "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'new')",
+        "UPDATE blocks SET content = 'x' WHERE content = 'item'",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_md(&dir, "doc.md", md);
+        let mut store = DocumentStore::new();
+        store.add_file(&path).unwrap();
+        // The file gains a line above everything after it was indexed.
+        let edited = format!("added above\n\n{md}");
+        std::fs::write(&path, &edited).unwrap();
+        let err = store.execute_sql_mut(sql).unwrap_err().to_string();
+        assert!(err.contains("changed since it was indexed"), "{sql}: {err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "{sql}");
+    }
+}
+
+#[test]
+fn write_back_works_on_a_store_read_back_from_its_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let md_path = write_md(
+        &dir,
+        "doc.md",
+        "# T\n\nfirst\n\n- a\n\n| x | y |\n|---|---|\n| 1 | 2 |\n",
+    );
+    let db = dir.path().join("s.mq-db");
+    let mut base = DocumentStore::new();
+    base.add_file(&md_path).unwrap();
+    base.save(&db).unwrap();
+
+    // Like the CLI: open lazily, load everything, then write back. The blocks
+    // decoded from the file must compare equal to a fresh parse.
+    let mut store = DocumentStore::open(&db).unwrap();
+    store.load_all_blocks().unwrap();
+    store.load_all_indexes().unwrap();
+    for sql in [
+        "UPDATE blocks SET content = 'one' WHERE content = 'first'",
+        "UPDATE blocks SET content = 'b' WHERE content = 'a'",
+        "UPDATE blocks SET content = '9' WHERE content = '2'",
+    ] {
+        store.execute_sql_mut(sql).unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(&md_path).unwrap(),
+        "# T\n\none\n\n- b\n\n| x | y |\n|---|---|\n| 1 | 9 |\n"
+    );
+}
+
+#[test]
+fn write_back_keeps_crlf_line_endings() {
+    let md =
+        "# Title\r\n\r\nfirst\r\n\r\n- a\r\n- b\r\n\r\n| x | y |\r\n|---|---|\r\n| 1 | 2 |\r\n";
+    let (out, _) = write_back(
+        md,
+        "UPDATE blocks SET content = 'edited' WHERE content = 'first'",
+    );
+    assert_eq!(out, md.replace("first", "edited"));
+    let (out, _) = write_back(md, "DELETE FROM blocks WHERE content = 'a'");
+    assert_eq!(out, md.replace("- a\r\n", ""));
+    let (out, _) = write_back(md, "UPDATE blocks SET content = '9' WHERE content = '2'");
+    assert_eq!(out, md.replace("| 2 |", "| 9 |"));
+    // A multi-line replacement (a code block) uses CRLF too.
+    let (out, _) = write_back(
+        md,
+        "INSERT INTO blocks (document_id, block_type, content, lang) VALUES (0, 'code', 'let x = 1;\nlet y = 2;', 'rust')",
+    );
+    assert!(
+        out.ends_with("```rust\r\nlet x = 1;\r\nlet y = 2;\r\n```\r\n"),
+        "{out:?}"
+    );
+    assert!(
+        !out.replace("\r\n", "").contains('\n'),
+        "no bare line feeds: {out:?}"
+    );
+}
+
+#[test]
+fn write_back_refuses_mixed_line_endings_and_leaves_the_file_alone() {
+    let md = "# Title\r\n\r\nfirst\n\nsecond\r\n";
+    let (err, file) = write_back_err(
+        md,
+        "UPDATE blocks SET content = 'x' WHERE content = 'first'",
+    );
+    assert!(err.contains("mixes"), "{err}");
+    assert_eq!(file, md);
+}
+
+#[test]
+fn write_back_preserves_a_missing_final_newline_and_a_lone_blank_line() {
+    let (out, _) = write_back(
+        "# T\n\nbody",
+        "UPDATE blocks SET content = 'x' WHERE content = 'body'",
+    );
+    assert_eq!(out, "# T\n\nx");
+    let (out, _) = write_back(
+        "# T\n\nbody\n\n\n",
+        "UPDATE blocks SET content = 'x' WHERE content = 'body'",
+    );
+    assert_eq!(out, "# T\n\nx\n\n\n");
+}
+
+#[test]
+fn write_back_statements_can_follow_one_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "doc.md", "# T\n\none\n\ntwo\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+    store
+        .execute_sql_mut("UPDATE blocks SET content = '1' WHERE content = 'one'")
+        .unwrap();
+    store
+        .execute_sql_mut("DELETE FROM blocks WHERE content = 'two'")
+        .unwrap();
+    store
+        .execute_sql_mut(
+            "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'three')",
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "# T\n\n1\n\nthree\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_back_over_several_files_is_all_or_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = write_md(&dir_a, "a.md", "# A\n\nshared\n");
+    let b = write_md(&dir_b, "b.md", "# B\n\nshared\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&a).unwrap();
+    store.add_file(&b).unwrap();
+
+    // The second file's directory refuses new files, so replacing it fails.
+    std::fs::set_permissions(dir_b.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result =
+        store.execute_sql_mut("UPDATE blocks SET content = 'changed' WHERE content = 'shared'");
+    std::fs::set_permissions(dir_b.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    if result.is_ok() {
+        return; // running as root: directory permissions do not apply
+    }
+    assert_eq!(
+        std::fs::read_to_string(&a).unwrap(),
+        "# A\n\nshared\n",
+        "rolled back"
+    );
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "# B\n\nshared\n");
+    // The store still agrees with the files.
+    let still = store
+        .execute_sql_mut("SELECT count(*) FROM blocks WHERE content = 'shared'")
+        .unwrap();
+    assert_eq!(still.rows[0][0], "2");
+}
+
+#[rstest]
+#[case::same_path_twice(false)]
+#[cfg_attr(unix, case::symlink_alias(true))]
+fn write_back_refuses_two_documents_sharing_one_file(#[case] via_symlink: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "a.md", "# A\n\nBody\n");
+    let second = if via_symlink {
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.md");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            link
+        }
+        #[cfg(not(unix))]
+        unreachable!()
+    } else {
+        path.clone()
+    };
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+    store.add_file(&second).unwrap();
+
+    let err = store
+        .execute_sql_mut(
+            "INSERT INTO blocks (document_id, block_type, content) VALUES \
+             (0, 'paragraph', 'A'), (1, 'paragraph', 'B')",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("share the source file"), "{err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# A\n\nBody\n");
+}
+
+#[test]
+fn write_back_failure_on_second_file_restores_first_file_and_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = write_md(&dir, "a.md", "# A\n\nBodyA\n");
+    let path_b = write_md(&dir, "b.md", "# B\n\nBodyB\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path_a).unwrap();
+    store.add_file(&path_b).unwrap();
+    // The second document's file disappears after indexing.
+    std::fs::remove_file(&path_b).unwrap();
+
+    let res = store.execute_sql_mut(
+        "INSERT INTO blocks (document_id, block_type, content) VALUES \
+         (0, 'paragraph', 'ExtraA'), (1, 'paragraph', 'ExtraB')",
+    );
+    assert!(res.is_err());
+    assert_eq!(std::fs::read_to_string(&path_a).unwrap(), "# A\n\nBodyA\n");
+    let out = store
+        .execute_sql_mut("SELECT count(*) FROM blocks WHERE content = 'ExtraA'")
+        .unwrap();
+    assert_eq!(out.rows[0][0], "0");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_back_in_an_unreadable_directory_fails_without_changing_the_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let path = sub.join("a.md");
+    std::fs::write(&path, "# A\n\nBody\n").unwrap();
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let res = store.execute_sql_mut("UPDATE blocks SET content = 'New' WHERE content = 'Body'");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if res.is_ok() {
+        return; // root ignores directory modes
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# A\n\nBody\n");
+}
+
+mod write_back_props {
+    use crate::DocumentStore;
+    use proptest::prelude::*;
+
+    /// A document of distinct paragraphs, headings and list items.
+    fn arb_doc() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(0u8..3, 1..8).prop_map(|kinds| {
+            kinds
+                .iter()
+                .enumerate()
+                .map(|(i, k)| match k {
+                    0 => format!("para{i}x"),
+                    1 => format!("# head{i}x"),
+                    _ => format!("- item{i}x"),
+                })
+                .collect()
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// Updating one block rewrites exactly that block's text in the file,
+        /// whatever the line endings or trailing newline, and the file stays
+        /// in sync with the store (a second edit still works).
+        #[test]
+        fn update_touches_only_the_matched_block(
+            blocks in arb_doc(),
+            pick in any::<prop::sample::Index>(),
+            crlf in any::<bool>(),
+            trailing in any::<bool>(),
+        ) {
+            let eol = if crlf { "\r\n" } else { "\n" };
+            let sep = format!("{eol}{eol}");
+            let mut text = blocks.join(&sep);
+            if trailing { text.push_str(eol); }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            std::fs::write(&path, &text).unwrap();
+            let mut store = DocumentStore::new();
+            store.add_file(&path).unwrap();
+
+            let i = pick.index(blocks.len());
+            let target = &blocks[i];
+            let visible = target.trim_start_matches(['#', '-', ' ']);
+            let (prefix, _) = target.split_at(target.len() - visible.len());
+            let sql = format!("UPDATE blocks SET content = 'NEW' WHERE content = '{visible}'");
+            let out = store.execute_sql_mut(&sql).unwrap();
+            prop_assert_eq!(&out.rows[0][0], "1");
+
+            let mut expected = blocks.clone();
+            expected[i] = format!("{prefix}NEW");
+            let mut want = expected.join(&sep);
+            if trailing { want.push_str(eol); }
+            prop_assert_eq!(std::fs::read_to_string(&path).unwrap(), want);
+
+            let again = store
+                .execute_sql_mut("UPDATE blocks SET content = 'NEWER' WHERE content = 'NEW'")
+                .unwrap();
+            prop_assert_eq!(&again.rows[0][0], "1");
+        }
+
+        /// Several blocks of one document updated in a single statement.
+        #[test]
+        fn multi_block_update_rewrites_each_matched_block(
+            blocks in arb_doc(),
+            mask in prop::collection::vec(any::<bool>(), 8),
+            crlf in any::<bool>(),
+        ) {
+            let eol = if crlf { "\r\n" } else { "\n" };
+            let sep = format!("{eol}{eol}");
+            let text = blocks.join(&sep) + eol;
+            let chosen: Vec<usize> = (0..blocks.len()).filter(|i| mask[*i]).collect();
+            prop_assume!(!chosen.is_empty());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            std::fs::write(&path, &text).unwrap();
+            let mut store = DocumentStore::new();
+            store.add_file(&path).unwrap();
+
+            let mut expected = blocks.clone();
+            let mut visibles = Vec::new();
+            for &i in &chosen {
+                let visible = blocks[i].trim_start_matches(['#', '-', ' ']).to_string();
+                let prefix = &blocks[i][..blocks[i].len() - visible.len()];
+                expected[i] = format!("{prefix}NEW");
+                visibles.push(format!("'{visible}'"));
+            }
+            let sql = format!(
+                "UPDATE blocks SET content = 'NEW' WHERE content IN ({})",
+                visibles.join(", ")
+            );
+            let out = store.execute_sql_mut(&sql).unwrap();
+            prop_assert_eq!(out.rows[0][0].clone(), chosen.len().to_string());
+            prop_assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                expected.join(&sep) + eol
+            );
+        }
+
+        /// Deleting a paragraph leaves the other blocks as they were.
+        #[test]
+        fn delete_removes_only_the_paragraph(
+            blocks in arb_doc(),
+            pick in any::<prop::sample::Index>(),
+            crlf in any::<bool>(),
+            trailing in any::<bool>(),
+        ) {
+            let i = pick.index(blocks.len());
+            prop_assume!(blocks[i].starts_with("para"));
+            let eol = if crlf { "\r\n" } else { "\n" };
+            let sep = format!("{eol}{eol}");
+            let mut text = blocks.join(&sep);
+            if trailing { text.push_str(eol); }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            std::fs::write(&path, &text).unwrap();
+            let mut store = DocumentStore::new();
+            store.add_file(&path).unwrap();
+
+            let sql = format!("DELETE FROM blocks WHERE content = '{}'", blocks[i]);
+            store.execute_sql_mut(&sql).unwrap();
+
+            let rest: Vec<&String> = blocks.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, b)| b).collect();
+            let mut want = rest.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(&sep);
+            if trailing && !rest.is_empty() { want.push_str(eol); }
+            prop_assert_eq!(std::fs::read_to_string(&path).unwrap(), want);
+        }
+
+        /// A paragraph inserted without an anchor lands at the end.
+        #[test]
+        fn insert_appends_a_paragraph(
+            blocks in arb_doc(),
+            crlf in any::<bool>(),
+            trailing in any::<bool>(),
+        ) {
+            // A one-line file with no line break has no line ending to keep.
+            prop_assume!(!(crlf && !trailing && blocks.len() == 1));
+            let eol = if crlf { "\r\n" } else { "\n" };
+            let sep = format!("{eol}{eol}");
+            let mut text = blocks.join(&sep);
+            if trailing { text.push_str(eol); }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            std::fs::write(&path, &text).unwrap();
+            let mut store = DocumentStore::new();
+            store.add_file(&path).unwrap();
+
+            store
+                .execute_sql_mut(
+                    "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'inserted')",
+                )
+                .unwrap();
+            let mut want = format!("{}{sep}inserted", blocks.join(&sep));
+            if trailing { want.push_str(eol); }
+            prop_assert_eq!(std::fs::read_to_string(&path).unwrap(), want);
+        }
+
+        /// A file edited behind the store's back is never written over.
+        #[test]
+        fn stale_files_are_refused(blocks in arb_doc(), extra in "[a-z]{1,6}") {
+            let text = blocks.join("\n\n") + "\n";
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            std::fs::write(&path, &text).unwrap();
+            let mut store = DocumentStore::new();
+            store.add_file(&path).unwrap();
+            let changed = format!("{extra}zz\n\n{text}");
+            std::fs::write(&path, &changed).unwrap();
+            let visible = blocks[0].trim_start_matches(['#', '-', ' ']).to_string();
+            let sql = format!("UPDATE blocks SET content = 'NEW' WHERE content = '{visible}'");
+            prop_assert!(store.execute_sql_mut(&sql).is_err());
+            prop_assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+        }
+    }
 }

@@ -45,6 +45,8 @@ jobs:
         run: cargo nextest run
         env:
           NEXTEST_RETRIES: 3
+      - name: Build benchmarks
+        run: cargo bench --no-run
 
   format-check:
     runs-on: ubuntu-latest

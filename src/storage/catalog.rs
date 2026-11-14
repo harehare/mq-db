@@ -44,14 +44,33 @@ pub struct ViewEntry {
     pub sql: String,
 }
 
-/// Catalog entries, custom tables, content hashes, views, and the store's
-/// tokenizer kind, read from a page file.
+/// A persisted vector (HNSW) index over one column of a custom table. The
+/// index itself is a blob in its own page chain, see
+/// [`crate::storage::Storage::write_index`].
+///
+/// Stored in a trailing catalog section, so files written without it still
+/// read, and older readers that don't know the section ignore it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorIndexEntry {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+    /// First page of the index blob.
+    pub first_page: u32,
+    /// Rows the table had when the index was built. A different count later
+    /// means the table changed and the index is stale.
+    pub table_rows: u32,
+}
+
+/// Catalog entries, custom tables, content hashes, views, the store's
+/// tokenizer kind, and vector indexes, read from a page file.
 pub type CatalogData = (
     Vec<CatalogEntry>,
     Vec<CustomTableEntry>,
     Vec<(u32, u64)>,
     Vec<ViewEntry>,
     TokenizerKind,
+    Vec<VectorIndexEntry>,
 );
 
 fn invalid_data(message: impl Into<String>) -> MqdbError {
@@ -135,6 +154,7 @@ fn serialize_catalog(
     content_hashes: &[(u32, u64)],
     views: &[ViewEntry],
     tokenizer: TokenizerKind,
+    vector_indexes: &[VectorIndexEntry],
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&as_u32(entries.len(), "catalog entry count").to_le_bytes());
@@ -193,6 +213,22 @@ fn serialize_catalog(
     // Store's tokenizer choice, one tag byte, absent in older blobs.
     out.push(tokenizer.to_u8());
 
+    // Vector indexes; only written when there are some, so a store that never
+    // used them stays byte-identical to what older versions produce.
+    if !vector_indexes.is_empty() {
+        out.extend_from_slice(&as_u32(vector_indexes.len(), "vector index count").to_le_bytes());
+        for vi in vector_indexes {
+            for text in [&vi.name, &vi.table, &vi.column] {
+                out.extend_from_slice(
+                    &as_u16(text.len(), "vector index name length").to_le_bytes(),
+                );
+                out.extend_from_slice(text.as_bytes());
+            }
+            out.extend_from_slice(&vi.first_page.to_le_bytes());
+            out.extend_from_slice(&vi.table_rows.to_le_bytes());
+        }
+    }
+
     out
 }
 
@@ -203,12 +239,20 @@ pub fn write_catalog(
     content_hashes: &[(u32, u64)],
     views: &[ViewEntry],
     tokenizer: TokenizerKind,
+    vector_indexes: &[VectorIndexEntry],
 ) -> Result<(), MqdbError> {
     if pf.num_pages < 2 {
         return Err(invalid_data("catalog start page is missing"));
     }
 
-    let bytes = serialize_catalog(entries, custom_tables, content_hashes, views, tokenizer);
+    let bytes = serialize_catalog(
+        entries,
+        custom_tables,
+        content_hashes,
+        views,
+        tokenizer,
+        vector_indexes,
+    );
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
         vec![&[]]
     } else {
@@ -245,8 +289,16 @@ pub fn append_catalog(
     content_hashes: &[(u32, u64)],
     views: &[ViewEntry],
     tokenizer: TokenizerKind,
+    vector_indexes: &[VectorIndexEntry],
 ) -> Result<u32, MqdbError> {
-    let bytes = serialize_catalog(entries, custom_tables, content_hashes, views, tokenizer);
+    let bytes = serialize_catalog(
+        entries,
+        custom_tables,
+        content_hashes,
+        views,
+        tokenizer,
+        vector_indexes,
+    );
     let chunks: Vec<&[u8]> = if bytes.is_empty() {
         vec![&[]]
     } else {
@@ -415,7 +467,34 @@ fn read_catalog_from(pf: &mut PageFile, start_page: u32) -> Result<CatalogData, 
         TokenizerKind::Word
     };
 
-    Ok((entries, custom_tables, content_hashes, views, tokenizer))
+    let mut vector_indexes = Vec::new();
+    if decoder.remaining() >= 4 {
+        let count = usize::try_from(decoder.read_u32()?)
+            .map_err(|_| invalid_data("vector index count exceeds usize range"))?;
+        for _ in 0..count {
+            let name = decoder.read_string_u16()?;
+            let table = decoder.read_string_u16()?;
+            let column = decoder.read_string_u16()?;
+            let first_page = decoder.read_u32()?;
+            let table_rows = decoder.read_u32()?;
+            vector_indexes.push(VectorIndexEntry {
+                name,
+                table,
+                column,
+                first_page,
+                table_rows,
+            });
+        }
+    }
+
+    Ok((
+        entries,
+        custom_tables,
+        content_hashes,
+        views,
+        tokenizer,
+        vector_indexes,
+    ))
 }
 
 #[cfg(test)]
@@ -492,7 +571,7 @@ mod tests {
         drop(pf);
 
         let mut reopened = PageFile::open(&path).unwrap();
-        let (entries, custom_tables, content_hashes, views, tokenizer) =
+        let (entries, custom_tables, content_hashes, views, tokenizer, _) =
             read_catalog(&mut reopened).unwrap();
 
         assert_eq!(entries, vec![entry]);
@@ -530,13 +609,14 @@ mod tests {
             &hashes,
             &[],
             TokenizerKind::Word,
+            &[],
         )
         .unwrap();
         pf.sync_header().unwrap();
         drop(pf);
 
         let mut reopened = PageFile::open(&path).unwrap();
-        let (entries, custom_tables, read_hashes, views, tokenizer) =
+        let (entries, custom_tables, read_hashes, views, tokenizer, _) =
             read_catalog(&mut reopened).unwrap();
 
         assert_eq!(entries, vec![entry]);
@@ -586,13 +666,14 @@ mod tests {
             &[],
             &views,
             TokenizerKind::Word,
+            &[],
         )
         .unwrap();
         pf.sync_header().unwrap();
         drop(pf);
 
         let mut reopened = PageFile::open(&path).unwrap();
-        let (entries, custom_tables, content_hashes, read_views, tokenizer) =
+        let (entries, custom_tables, content_hashes, read_views, tokenizer, _) =
             read_catalog(&mut reopened).unwrap();
 
         assert_eq!(entries, vec![entry]);
@@ -626,12 +707,21 @@ mod tests {
             let mut pf = PageFile::create(&path).unwrap();
             let placeholder = make_page(PAGE_TYPE_CATALOG, 1, 0, &0u32.to_le_bytes());
             pf.append_page(&placeholder).unwrap();
-            write_catalog(&mut pf, std::slice::from_ref(&entry), &[], &[], &[], kind).unwrap();
+            write_catalog(
+                &mut pf,
+                std::slice::from_ref(&entry),
+                &[],
+                &[],
+                &[],
+                kind,
+                &[],
+            )
+            .unwrap();
             pf.sync_header().unwrap();
             drop(pf);
 
             let mut reopened = PageFile::open(&path).unwrap();
-            let (_, _, _, _, read_kind) = read_catalog(&mut reopened).unwrap();
+            let (_, _, _, _, read_kind, _) = read_catalog(&mut reopened).unwrap();
             assert_eq!(read_kind, kind);
 
             let _ = std::fs::remove_file(&path);

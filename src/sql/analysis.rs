@@ -4,7 +4,7 @@ use super::rows::ident_value;
 use super::value::Value;
 use crate::MqdbError;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Select, SelectItem, TableFactor,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem, TableFactor,
     Value as SqlValue,
 };
 
@@ -193,6 +193,49 @@ pub(super) fn expr_has_subquery(expr: &Expr) -> bool {
             .iter()
             .any(|a| matches!(a, FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) if expr_has_subquery(e)))),
         _ => false,
+    }
+}
+
+/// Pushes every subquery (scalar, `IN (SELECT ...)`, `EXISTS`) found in
+/// `expr` onto `out`. Mirrors [`expr_has_subquery`]'s traversal.
+pub(super) fn collect_subqueries<'e>(expr: &'e Expr, out: &mut Vec<&'e Query>) {
+    match expr {
+        Expr::Subquery(q) => out.push(q),
+        Expr::InSubquery { expr, subquery, .. } => {
+            collect_subqueries(expr, out);
+            out.push(subquery);
+        }
+        Expr::Exists { subquery, .. } => out.push(subquery),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_subqueries(left, out);
+            collect_subqueries(right, out);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Nested(expr)
+        | Expr::Cast { expr, .. } => collect_subqueries(expr, out),
+        Expr::InList { expr, list, .. } => {
+            collect_subqueries(expr, out);
+            list.iter().for_each(|e| collect_subqueries(e, out));
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_subqueries(expr, out);
+            collect_subqueries(low, out);
+            collect_subqueries(high, out);
+        }
+        Expr::Function(f) => {
+            if let FunctionArguments::List(al) = &f.args {
+                for a in &al.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
+                        collect_subqueries(e, out);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 

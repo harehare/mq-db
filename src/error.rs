@@ -22,4 +22,7 @@ pub enum MqdbError {
 
     #[error("mq error: {0}")]
     Mq(String),
+
+    #[error("embedding error: {0}")]
+    Embed(String),
 }

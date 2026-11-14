@@ -116,6 +116,17 @@ mq-db stats --db store.mq-db
    •  list         ██████░░░░░░░░░░░░░░░░░░    58   (9%)
 ```
 
+## `embed`
+
+Computes embeddings for new or changed blocks through an OpenAI-compatible API and stores them for [vector search](../reference/vector-search.md):
+
+```bash
+mq-db embed --db store.mq-db --endpoint http://localhost:11434/v1 --model nomic-embed-text
+mq-db find "how do I handle errors?" --semantic --db store.mq-db
+```
+
+`embed` also keeps an HNSW index up to date; `find --semantic` ranks by meaning instead of keywords.
+
 ## `vacuum`
 
 `UPDATE`/`DELETE` write-back, `DROP TABLE`/`DROP VIEW`, and re-indexing a changed file all replace or remove data by writing a fresh page chain and abandoning the old one, so the `.mq-db` file only grows. `vacuum` rewrites the file from scratch (same compaction `save`/`index` already do for a brand-new file) and reclaims that dead space:

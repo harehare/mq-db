@@ -8,6 +8,7 @@ use crate::document::Document;
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use sqlparser::ast::{ObjectName, ObjectNamePart, Value as SqlValue};
+use std::sync::Arc;
 
 fn pv_to_json(pv: &PropertyValue) -> String {
     match pv {
@@ -36,23 +37,55 @@ fn pairs_to_json<'a>(pairs: impl Iterator<Item = (&'a String, &'a PropertyValue)
     format!("{{{}}}", pairs.join(","))
 }
 
-thread_local! {
-    /// Whether the running query may read `blocks.content_hash`. Defaults to
-    /// true so a query run outside `SqlEngine::execute` is never given a
-    /// placeholder.
-    pub(super) static QUERY_NEEDS_CONTENT_HASH: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(true) };
+/// Which expensive `blocks` columns the running query may read. A column the
+/// query never mentions is filled with `NULL` instead of being computed for
+/// every block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct ColumnNeeds {
+    pub(super) content_hash: bool,
+    pub(super) properties: bool,
+    pub(super) anchor: bool,
 }
 
-/// Cheap text scan, conservative: any `*` other than in `count(*)` may expand
-/// to `content_hash`.
-pub(super) fn sql_needs_content_hash(sql: &str) -> bool {
-    let sql: String = sql
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    sql.contains("content_hash") || sql.replace("count(*)", "").contains('*')
+impl ColumnNeeds {
+    pub(super) const ALL: ColumnNeeds = ColumnNeeds {
+        content_hash: true,
+        properties: true,
+        anchor: true,
+    };
+
+    /// Cheap text scan, conservative: any `*` other than in `count(*)` may
+    /// expand to every column, and a column name anywhere in the text counts.
+    pub(super) fn of_sql(sql: &str) -> ColumnNeeds {
+        let sql: String = sql
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if sql.replace("count(*)", "").contains('*') {
+            return ColumnNeeds::ALL;
+        }
+        ColumnNeeds {
+            content_hash: sql.contains("content_hash"),
+            properties: sql.contains("properties"),
+            anchor: sql.contains("anchor"),
+        }
+    }
+
+    pub(super) fn merge(self, other: ColumnNeeds) -> ColumnNeeds {
+        ColumnNeeds {
+            content_hash: self.content_hash || other.content_hash,
+            properties: self.properties || other.properties,
+            anchor: self.anchor || other.anchor,
+        }
+    }
+}
+
+thread_local! {
+    /// Defaults to everything so a query run outside `SqlEngine::execute`
+    /// is never given a placeholder.
+    pub(super) static QUERY_NEEDS: std::cell::Cell<ColumnNeeds> =
+        const { std::cell::Cell::new(ColumnNeeds::ALL) };
 }
 
 /// SHA-256 over `block_type`, a NUL and `content`, as 64 hex digits.
@@ -120,26 +153,51 @@ pub(super) fn block_anchors(doc: &Document) -> Vec<String> {
     anchors
 }
 
-pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32, anchor: &str) -> Row {
-    let hash = if QUERY_NEEDS_CONTENT_HASH.with(std::cell::Cell::get) {
+const BLOCK_COLUMNS: [&str; 11] = [
+    "id",
+    "document_id",
+    "block_type",
+    "content",
+    "pre",
+    "post",
+    "depth",
+    "lang",
+    "properties",
+    "content_hash",
+    "anchor",
+];
+
+/// The `blocks` column names, qualified with `prefix`, built once per scan and
+/// shared by every row of it.
+pub(super) fn qualified_block_columns(prefix: &str) -> Arc<[String]> {
+    BLOCK_COLUMNS
+        .iter()
+        .map(|c| format!("{prefix}.{c}"))
+        .collect()
+}
+
+/// A `blocks` row whose column names are `columns` (see
+/// [`qualified_block_columns`]).
+pub(super) fn block_to_row(
+    columns: &Arc<[String]>,
+    doc_id: u32,
+    block: &Block,
+    block_idx: u32,
+    anchor: &str,
+) -> Row {
+    let needs = QUERY_NEEDS.with(std::cell::Cell::get);
+    let hash = if needs.content_hash {
         Value::Str(content_hash(block))
     } else {
         Value::Null
     };
+    let properties = if needs.properties {
+        Value::Str(properties_to_json(&block.properties))
+    } else {
+        Value::Null
+    };
     Row {
-        columns: vec![
-            "id".into(),
-            "document_id".into(),
-            "block_type".into(),
-            "content".into(),
-            "pre".into(),
-            "post".into(),
-            "depth".into(),
-            "lang".into(),
-            "properties".into(),
-            "content_hash".into(),
-            "anchor".into(),
-        ],
+        columns: Arc::clone(columns),
         values: vec![
             Value::Int(block_idx as i64),
             Value::Int(doc_id as i64),
@@ -149,9 +207,13 @@ pub(super) fn block_to_row(doc_id: u32, block: &Block, block_idx: u32, anchor: &
             Value::Int(block.post as i64),
             Value::Int(block.heading_depth().unwrap_or(0) as i64),
             Value::Str(block.code_lang().unwrap_or("").to_string()),
-            Value::Str(properties_to_json(&block.properties)),
+            properties,
             hash,
-            Value::Str(anchor.to_string()),
+            if needs.anchor {
+                Value::Str(anchor.to_string())
+            } else {
+                Value::Null
+            },
         ],
     }
 }
@@ -179,7 +241,8 @@ pub(super) fn link_rows(doc_id: u32, block: &Block, block_idx: u32) -> Vec<Row> 
                     "url".into(),
                     "text".into(),
                     "title".into(),
-                ],
+                ]
+                .into(),
                 values: vec![
                     Value::Int(doc_id as i64),
                     Value::Int(block_idx as i64),
@@ -216,7 +279,8 @@ pub(super) fn doc_to_row(doc: &Document) -> Row {
             "code_languages".into(),
             "frontmatter_keys".into(),
             "properties".into(),
-        ],
+        ]
+        .into(),
         values: vec![
             Value::Int(doc.id as i64),
             Value::Str(

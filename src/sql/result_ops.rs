@@ -156,7 +156,7 @@ pub(super) fn apply_limit_offset(
     offset: Option<&Expr>,
 ) -> Vec<Vec<String>> {
     let dummy = Row {
-        columns: vec![],
+        columns: vec![].into(),
         values: vec![],
     };
     if let Some(off) = offset

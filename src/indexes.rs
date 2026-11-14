@@ -273,22 +273,53 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// Picks [`TokenizerKind::Bigram`] if any of `paths` contains CJK text in its
+/// first 64 KiB (at most 256 files sampled), else [`TokenizerKind::Word`].
+pub fn detect_tokenizer(paths: &[std::path::PathBuf]) -> TokenizerKind {
+    use std::io::Read;
+    const SAMPLE_BYTES: u64 = 64 * 1024;
+    const MAX_FILES: usize = 256;
+    for path in paths.iter().take(MAX_FILES) {
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        if file.take(SAMPLE_BYTES).read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        // A truncated trailing multi-byte char becomes U+FFFD, which is not CJK.
+        if String::from_utf8_lossy(&buf).chars().any(is_cjk) {
+            return TokenizerKind::Bigram;
+        }
+    }
+    TokenizerKind::Word
+}
+
 /// Tokenizes `text` per `kind`. Used at both index build time and query time
 /// (`src/sql/`); the two **must** pass the same `kind`, or the index
 /// silently drops true matches instead of just mis-ranking them.
 pub fn tokenize(text: &str, kind: TokenizerKind) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for_each_token(text, kind, |t| tokens.push(t.to_string()));
+    tokens
+}
+
+/// Calls `f` with every token [`tokenize`] would return, in the same order,
+/// without allocating a `String` per token (every token is a slice of the
+/// lowercased text).
+pub fn for_each_token(text: &str, kind: TokenizerKind, mut f: impl FnMut(&str)) {
     let lower = text.to_lowercase();
     let Some(n) = kind.ngram_size() else {
-        return lower
+        lower
             .split(|c: char| !c.is_alphanumeric())
             .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
+            .for_each(f);
+        return;
     };
 
     // A script transition (CJK <-> non-CJK) is also a run boundary, so
     // "abc日本語" splits into "abc" + a CJK run instead of staying one token.
-    #[derive(PartialEq)]
+    #[derive(PartialEq, Clone, Copy)]
     enum Class {
         Other,
         Cjk,
@@ -304,33 +335,38 @@ pub fn tokenize(text: &str, kind: TokenizerKind) -> Vec<String> {
         }
     }
 
-    let mut tokens = Vec::new();
-    let chars: Vec<char> = lower.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        let class = classify(chars[i]);
-        let start = i;
-        while i < chars.len() && classify(chars[i]) == class {
-            i += 1;
+    // Byte offset of each char of the current CJK run, plus its end.
+    let mut offsets: Vec<usize> = Vec::new();
+    let mut chars = lower.char_indices().peekable();
+    while let Some(&(start, first)) = chars.peek() {
+        let class = classify(first);
+        offsets.clear();
+        let mut end = start;
+        while let Some(&(i, c)) = chars.peek() {
+            if classify(c) != class {
+                break;
+            }
+            offsets.push(i);
+            end = i + c.len_utf8();
+            chars.next();
         }
-        if class == Class::Skip {
-            continue;
-        }
-        let run = &chars[start..i];
-        if class == Class::Other {
-            tokens.push(run.iter().collect());
-        } else {
-            // All window sizes up to n, not just n, so a query shorter than
-            // n (e.g. one character against Bigram) can still match inside
-            // a longer indexed run.
-            for w in 1..=n.min(run.len()) {
-                for win in run.windows(w) {
-                    tokens.push(win.iter().collect());
+        match class {
+            Class::Skip => {}
+            Class::Other => f(&lower[start..end]),
+            Class::Cjk => {
+                offsets.push(end);
+                let len = offsets.len() - 1;
+                // All window sizes up to n, not just n, so a query shorter than
+                // n (e.g. one character against Bigram) can still match inside
+                // a longer indexed run.
+                for w in 1..=n.min(len) {
+                    for i in 0..=len - w {
+                        f(&lower[offsets[i]..offsets[i + w]]);
+                    }
                 }
             }
         }
     }
-    tokens
 }
 
 /// Inverted index on tokenized `content`: term → sorted, deduped block
@@ -1131,5 +1167,68 @@ mod tests {
 
         assert!(!original.is_empty());
         assert_eq!(original, round_tripped);
+    }
+}
+
+#[cfg(test)]
+mod detect_tokenizer_tests {
+    use super::*;
+
+    #[test]
+    fn detects_cjk_and_defaults_to_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let en = dir.path().join("en.md");
+        let ja = dir.path().join("ja.md");
+        std::fs::write(&en, "# Hello\n\nplain text").unwrap();
+        std::fs::write(&ja, "# こんにちは\n\n日本語の文書").unwrap();
+        assert_eq!(
+            detect_tokenizer(std::slice::from_ref(&en)),
+            TokenizerKind::Word
+        );
+        assert_eq!(detect_tokenizer(&[en, ja]), TokenizerKind::Bigram);
+        assert_eq!(detect_tokenizer(&[]), TokenizerKind::Word);
+    }
+}
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use mq_markdown::Markdown;
+    use proptest::prelude::*;
+
+    fn kind() -> impl Strategy<Value = TokenizerKind> {
+        prop::sample::select(vec![
+            TokenizerKind::Word,
+            TokenizerKind::Bigram,
+            TokenizerKind::Trigram,
+        ])
+    }
+
+    proptest! {
+        /// Serialising a built index and reading it back is lossless.
+        #[test]
+        fn index_bytes_round_trip(
+            parts in prop::collection::vec(
+                prop_oneof!["# [a-z日本 ]{1,8}", "[a-z日本語 ]{1,12}", "- [a-z ]{1,8}", "```rust\n[a-z ]{0,6}\n```"],
+                0..8,
+            ),
+            kind in kind(),
+        ) {
+            let md = Markdown::from_markdown_str(&parts.join("\n\n")).unwrap();
+            let blocks = crate::index::build_blocks(0, &md.nodes);
+            let bytes = DocumentIndex::build(&blocks, kind).to_bytes();
+            let again = DocumentIndex::from_bytes(&bytes).unwrap().to_bytes();
+            prop_assert_eq!(bytes, again);
+        }
+
+        #[test]
+        fn from_bytes_never_panics(data in prop::collection::vec(any::<u8>(), 0..256)) {
+            let _ = DocumentIndex::from_bytes(&data);
+        }
+
+        #[test]
+        fn tokens_are_never_empty_and_tokenize_never_panics(text in "\\PC{0,40}", kind in kind()) {
+            prop_assert!(tokenize(&text, kind).iter().all(|t| !t.is_empty()));
+        }
     }
 }

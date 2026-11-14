@@ -27,6 +27,7 @@ pub(crate) struct TxSnapshot {
     pub documents: Vec<Document>,
     pub custom_tables: FxHashMap<String, CustomTableState>,
     pub views: FxHashMap<String, String>,
+    pub vector_indexes: FxHashMap<String, VectorIndexState>,
     pub content_hashes: FxHashMap<DocumentId, u64>,
     /// Session (`SqlEngine`) that ran `BEGIN`. Catalog mutations from any
     /// other session while this transaction is open are external commits.
@@ -39,6 +40,12 @@ pub(crate) struct TxSnapshot {
 }
 
 use mq_markdown::Markdown;
+
+mod ingest;
+mod persist;
+mod transaction;
+mod vector_indexes;
+pub(crate) use vector_indexes::VectorIndexState;
 
 /// A validated alias for a store mounted via `ATTACH DATABASE ... AS
 /// <alias>` (or the CLI's `--attach PATH:ALIAS`).
@@ -222,6 +229,8 @@ pub struct DocumentStore {
     /// `CREATE VIEW` definitions: name → `SELECT` SQL text, re-executed live
     /// on every reference rather than materialized.
     pub(crate) views: RwLock<FxHashMap<String, String>>,
+    /// Vector (HNSW) indexes over custom-table columns, keyed by index name.
+    pub(crate) vector_indexes: RwLock<FxHashMap<String, VectorIndexState>>,
     /// Stores attached via `ATTACH DATABASE`, keyed by alias. Session-scoped
     /// only: never persisted.
     pub(crate) attached: RwLock<FxHashMap<DatabaseAlias, DocumentStore>>,
@@ -255,6 +264,7 @@ impl Default for DocumentStore {
             doc_indexes: Vec::new(),
             custom_tables: RwLock::new(FxHashMap::default()),
             views: RwLock::new(FxHashMap::default()),
+            vector_indexes: RwLock::new(FxHashMap::default()),
             attached: RwLock::new(FxHashMap::default()),
             content_hashes: FxHashMap::default(),
             tx_snapshot: Mutex::new(None),
@@ -376,8 +386,10 @@ impl DocumentStore {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
     ) {
+        let name = name.into();
+        self.drop_vector_indexes_for_table(&name);
         self.custom_tables.write().unwrap().insert(
-            name.into(),
+            name,
             CustomTableState {
                 columns,
                 rows,
@@ -391,6 +403,7 @@ impl DocumentStore {
 
     /// Remove a previously registered custom table. Returns `true` if it existed.
     pub fn unregister_table(&mut self, name: &str) -> bool {
+        self.drop_vector_indexes_for_table(name);
         self.custom_tables.write().unwrap().remove(name).is_some()
     }
 
@@ -416,305 +429,6 @@ impl DocumentStore {
             .unwrap()
             .remove(alias.to_ascii_lowercase().as_str())
             .is_some()
-    }
-
-    /// Parses and adds a Markdown file from disk.
-    ///
-    /// Returns the assigned `DocumentId` on success.
-    pub fn add_file(&mut self, path: impl AsRef<Path>) -> Result<DocumentId, MqdbError> {
-        let path = path.as_ref();
-        let content = std::fs::read_to_string(path)?;
-        self.add_str_with_path(&content, Some(path.to_path_buf()))
-    }
-
-    /// Parses and adds Markdown content from a string.
-    ///
-    /// Returns the assigned `DocumentId` on success.
-    pub fn add_str(&mut self, content: &str) -> Result<DocumentId, MqdbError> {
-        self.add_str_with_path(content, None)
-    }
-
-    /// Parses and adds already-read Markdown content, attributing it to
-    /// `path`. For callers that read files concurrently and want to skip
-    /// [`add_file`](Self::add_file)'s own read.
-    pub fn add_str_with_path(
-        &mut self,
-        content: &str,
-        path: Option<std::path::PathBuf>,
-    ) -> Result<DocumentId, MqdbError> {
-        let md =
-            Markdown::from_markdown_str(content).map_err(|e| MqdbError::Parse(e.to_string()))?;
-
-        let doc_id = self.next_doc_id;
-        self.next_doc_id += 1;
-
-        let mut blocks = index::build_blocks(doc_id, &md.nodes);
-        if !self.store_spans {
-            for block in &mut blocks {
-                block.span = None;
-            }
-        }
-        let doc = Document::new(doc_id, path, blocks);
-        self.documents.push(doc);
-        self.doc_indexes.push(None);
-
-        Ok(doc_id)
-    }
-
-    /// Append a Markdown string to the existing `.mq-db` file (in-place).
-    ///
-    /// Works only when the store was opened via [`DocumentStore::open`] (i.e.
-    /// `self.storage` is `Some`).  New block pages and an index page chain are
-    /// appended to the file and the catalog is rewritten to include the new
-    /// entry.
-    ///
-    /// When called on an in-memory store (no backing file) this behaves
-    /// identically to [`add_str`](DocumentStore::add_str).
-    pub fn append_str(&mut self, content: &str) -> Result<DocumentId, MqdbError> {
-        self.do_append(content, None, true)
-    }
-
-    /// Append a Markdown file to the existing `.mq-db` file (in-place).
-    ///
-    /// See [`append_str`](DocumentStore::append_str) for full semantics.
-    pub fn append_file(&mut self, path: impl AsRef<Path>) -> Result<DocumentId, MqdbError> {
-        let path = path.as_ref();
-        let content = std::fs::read_to_string(path)?;
-        self.do_append(&content, Some(path.to_path_buf()), true)
-    }
-
-    /// Core of [`append_str`](Self::append_str)/[`append_file`](Self::append_file).
-    ///
-    /// `flush` rewrites the on-disk catalog immediately if `true`. Bulk
-    /// callers like [`reindex_paths`](Self::reindex_paths) pass `false` and
-    /// flush once after the whole batch instead.
-    fn do_append(
-        &mut self,
-        content: &str,
-        md_path: Option<PathBuf>,
-        flush: bool,
-    ) -> Result<DocumentId, MqdbError> {
-        let md =
-            Markdown::from_markdown_str(content).map_err(|e| MqdbError::Parse(e.to_string()))?;
-        let doc_id = self.next_doc_id;
-        self.next_doc_id += 1;
-
-        let mut blocks = index::build_blocks(doc_id, &md.nodes);
-        if !self.store_spans {
-            for block in &mut blocks {
-                block.span = None;
-            }
-        }
-        let mut doc = Document::new(doc_id, md_path, blocks);
-
-        let idx_opt = {
-            let mut storage_guard = self.storage.lock().unwrap();
-            if let Some(storage) = storage_guard.as_mut() {
-                let first_block_page = storage.write_document(&doc)?;
-                doc.first_block_page = first_block_page;
-
-                let idx = DocumentIndex::build(&doc.blocks, self.tokenizer);
-                let index_start_page = storage.write_index(&idx.to_bytes())?;
-                doc.index_start_page = index_start_page;
-
-                Some(idx)
-            } else {
-                None
-            }
-        };
-        self.doc_indexes.push(idx_opt);
-        self.documents.push(doc);
-
-        if flush && let Err(err) = self.flush_catalog_to_storage() {
-            self.documents.pop();
-            self.doc_indexes.pop();
-            self.next_doc_id -= 1;
-            return Err(err);
-        }
-        Ok(doc_id)
-    }
-
-    /// Replace the content of an existing document in place, keeping its
-    /// `DocumentId` stable (so any external references to it, e.g. `mq()`
-    /// join columns, application code holding the id, stay valid).
-    ///
-    /// Re-parses `content`, writes fresh block/index page chains to the
-    /// backing storage file (if one is open) and overwrites that document's
-    /// catalog entry; the old page chains become orphaned dead space (no
-    /// compaction yet; a future `vacuum` command could reclaim them).
-    ///
-    /// For in-memory-only stores (no backing file open), this only updates
-    /// in-memory state; call [`save`](DocumentStore::save) afterward to
-    /// persist.
-    ///
-    /// Returns an error if no document with `doc_id` exists.
-    pub fn replace_document(
-        &mut self,
-        doc_id: DocumentId,
-        content: &str,
-        path: Option<PathBuf>,
-    ) -> Result<(), MqdbError> {
-        self.do_replace(doc_id, content, path, true)
-    }
-
-    /// Core of [`replace_document`](Self::replace_document). See
-    /// [`do_append`](Self::do_append) for what `flush` controls and why.
-    fn do_replace(
-        &mut self,
-        doc_id: DocumentId,
-        content: &str,
-        path: Option<PathBuf>,
-        flush: bool,
-    ) -> Result<(), MqdbError> {
-        let pos = self
-            .documents
-            .iter()
-            .position(|d| d.id == doc_id)
-            .ok_or_else(|| MqdbError::Storage(format!("no such document: {doc_id}")))?;
-        self.do_replace_at(pos, doc_id, content, path, flush)
-    }
-
-    /// Like [`do_replace`](Self::do_replace) but takes the document's index
-    /// in `self.documents` directly instead of scanning for it.
-    fn do_replace_at(
-        &mut self,
-        pos: usize,
-        doc_id: DocumentId,
-        content: &str,
-        path: Option<PathBuf>,
-        flush: bool,
-    ) -> Result<(), MqdbError> {
-        let md =
-            Markdown::from_markdown_str(content).map_err(|e| MqdbError::Parse(e.to_string()))?;
-        let mut blocks = index::build_blocks(doc_id, &md.nodes);
-        if !self.store_spans {
-            for block in &mut blocks {
-                block.span = None;
-            }
-        }
-        let mut doc = Document::new(doc_id, path, blocks);
-
-        let idx_opt = {
-            let mut storage_guard = self.storage.lock().unwrap();
-            if let Some(storage) = storage_guard.as_mut() {
-                let first_block_page = storage.write_document(&doc)?;
-                doc.first_block_page = first_block_page;
-
-                let idx = DocumentIndex::build(&doc.blocks, self.tokenizer);
-                let index_start_page = storage.write_index(&idx.to_bytes())?;
-                doc.index_start_page = index_start_page;
-
-                Some(idx)
-            } else {
-                None
-            }
-        };
-
-        let previous_doc = std::mem::replace(&mut self.documents[pos], doc);
-        let previous_idx = std::mem::replace(&mut self.doc_indexes[pos], idx_opt);
-
-        if flush && let Err(err) = self.flush_catalog_to_storage() {
-            self.documents[pos] = previous_doc;
-            self.doc_indexes[pos] = previous_idx;
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    /// Index `files`, skipping any whose content hash matches what's already
-    /// catalogued (see `content_hashes`), replacing changed ones in place via
-    /// [`replace_document`](DocumentStore::replace_document) (same
-    /// `DocumentId`), and adding new ones exactly like
-    /// [`append_file`](DocumentStore::append_file)/[`add_file`](DocumentStore::add_file)
-    /// depending on whether a backing file is open.
-    ///
-    /// When `prune` is `true`, any catalogued document whose path is not
-    /// present in `files` is dropped from the store.
-    ///
-    /// Documents with no path (added via `add_str`) are left untouched and
-    /// are never counted as "removed" by `prune`.
-    pub fn reindex_paths(
-        &mut self,
-        files: &[PathBuf],
-        prune: bool,
-    ) -> Result<ReindexReport, MqdbError> {
-        let mut report = ReindexReport::default();
-        let mut seen: HashSet<PathBuf> = HashSet::with_capacity(files.len());
-        let contents = read_files_parallel(files);
-        let documents_snapshot = self.documents.clone();
-        let content_hashes_snapshot = self.content_hashes.clone();
-
-        // Path -> (DocumentId, position), for O(1) lookup instead of an
-        // O(N) scan per file below.
-        let mut by_path: FxHashMap<PathBuf, (DocumentId, usize)> = self
-            .documents
-            .iter()
-            .enumerate()
-            .filter_map(|(i, d)| d.path.clone().map(|p| (p, (d.id, i))))
-            .collect();
-
-        for (path, content) in files.iter().zip(contents) {
-            seen.insert(path.clone());
-            let result = (|| -> Result<(), MqdbError> {
-                let content = content?;
-                let hash = hash_bytes(content.as_bytes());
-
-                let existing = by_path.get(path).copied();
-
-                match existing {
-                    Some((doc_id, _)) if self.content_hashes.get(&doc_id) == Some(&hash) => {
-                        report.unchanged += 1;
-                    }
-                    Some((doc_id, pos)) => {
-                        self.do_replace_at(pos, doc_id, &content, Some(path.clone()), false)?;
-                        self.content_hashes.insert(doc_id, hash);
-                        report.updated.push(path.clone());
-                    }
-                    None => {
-                        let doc_id = if self.storage.lock().unwrap().is_some() {
-                            self.do_append(&content, Some(path.clone()), false)?
-                        } else {
-                            self.add_str_with_path(&content, Some(path.clone()))?
-                        };
-                        self.content_hashes.insert(doc_id, hash);
-                        by_path.insert(path.clone(), (doc_id, self.documents.len() - 1));
-                        report.added.push(path.clone());
-                    }
-                }
-                Ok(())
-            })();
-
-            if let Err(e) = result {
-                report.failed.push((path.clone(), e.to_string()));
-            }
-        }
-
-        if prune {
-            let to_remove: Vec<(usize, DocumentId)> = self
-                .documents
-                .iter()
-                .enumerate()
-                .filter(|(_, d)| d.path.as_ref().is_some_and(|p| !seen.contains(p)))
-                .map(|(i, d)| (i, d.id))
-                .collect();
-            // Remove back-to-front so earlier indices stay valid.
-            for (i, doc_id) in to_remove.into_iter().rev() {
-                let removed_doc = self.documents.remove(i);
-                self.doc_indexes.remove(i);
-                self.content_hashes.remove(&doc_id);
-                if let Some(p) = removed_doc.path {
-                    report.removed.push(p);
-                }
-            }
-        }
-
-        if let Err(err) = self.flush_catalog_to_storage() {
-            self.documents = documents_snapshot;
-            self.doc_indexes = vec![None; self.documents.len()];
-            self.content_hashes = content_hashes_snapshot;
-            return Err(err);
-        }
-        Ok(report)
     }
 
     /// Returns a slice of all documents in the store.
@@ -858,565 +572,6 @@ impl DocumentStore {
                 sql: sql.clone(),
             })
             .collect()
-    }
-
-    /// Flush the catalog (including custom tables) to the backing storage file,
-    /// if one is open. Called automatically after DDL operations such as
-    /// `CREATE TABLE` and `DROP TABLE`. No-op for in-memory stores.
-    ///
-    /// Any table whose rows have never been persisted is written out in full
-    /// here (a one-time cost). Tables already backed by a row-page chain keep
-    /// their existing pages untouched; see
-    /// [`append_table_rows_to_storage`](DocumentStore::append_table_rows_to_storage)
-    /// for the incremental `INSERT` path.
-    pub(crate) fn begin_transaction(&self, session: u64) -> Result<(), MqdbError> {
-        // Snapshot must not observe a writer's half-applied mutation.
-        let _catalog_guard = self.catalog_commit.lock().unwrap();
-        let mut guard = self.tx_snapshot.lock().unwrap();
-        if guard.is_some() {
-            return Err(MqdbError::SqlExec(
-                "a transaction is already in progress".into(),
-            ));
-        }
-        *guard = Some(TxSnapshot {
-            documents: self.documents.clone(),
-            custom_tables: self.custom_tables.read().unwrap().clone(),
-            views: self.views.read().unwrap().clone(),
-            content_hashes: self.content_hashes.clone(),
-            owner: session,
-            external_write: false,
-        });
-        Ok(())
-    }
-
-    pub(crate) fn commit_transaction(&self) -> Result<(), MqdbError> {
-        if self.tx_snapshot.lock().unwrap().take().is_none() {
-            return Err(MqdbError::SqlExec("no transaction is in progress".into()));
-        }
-        Ok(())
-    }
-
-    /// Called by a catalog-mutating executor after it has actually changed
-    /// and durably flushed the catalog. Callers must still hold
-    /// `catalog_commit`, so rollback can't slip in between the commit and
-    /// this mark. Flags an open transaction owned by another session so its
-    /// rollback refuses to overwrite this commit. A no-op for the owner's own
-    /// mutations: its rollback is expected to undo those.
-    pub(crate) fn note_catalog_mutation(&self, session: u64) {
-        if let Some(tx) = self.tx_snapshot.lock().unwrap().as_mut()
-            && tx.owner != session
-        {
-            tx.external_write = true;
-        }
-    }
-
-    pub(crate) fn rollback_transaction_tables_only(&self) -> Result<(), MqdbError> {
-        // Guard the whole snapshot-take-and-restore, or a concurrent commit
-        // in the gap gets silently overwritten by this restore.
-        let _catalog_guard = self.catalog_commit.lock().unwrap();
-        let snapshot = self
-            .tx_snapshot
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| MqdbError::SqlExec("no transaction is in progress".into()))?;
-        if snapshot.external_write {
-            return Err(MqdbError::SqlExec(
-                "rollback aborted: another session committed catalog changes during this transaction; \
-                 the transaction has been closed without reverting the catalog to avoid discarding them"
-                    .into(),
-            ));
-        }
-        *self.custom_tables.write().unwrap() = snapshot.custom_tables;
-        *self.views.write().unwrap() = snapshot.views;
-        self.flush_catalog_to_storage()?;
-        Ok(())
-    }
-
-    pub(crate) fn rollback_transaction(&mut self) -> Result<Vec<String>, MqdbError> {
-        // See `rollback_transaction_tables_only` for why the guard covers
-        // the whole snapshot-take-and-restore.
-        let _catalog_guard = self.catalog_commit.lock().unwrap();
-        let snapshot = self
-            .tx_snapshot
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| MqdbError::SqlExec("no transaction is in progress".into()))?;
-        if snapshot.external_write {
-            return Err(MqdbError::SqlExec(
-                "rollback aborted: another session committed catalog changes during this transaction; \
-                 the transaction has been closed without reverting to avoid discarding them"
-                    .into(),
-            ));
-        }
-        let unrevertable_paths = diff_written_paths(&snapshot.documents, &self.documents);
-        self.documents = snapshot.documents;
-        self.doc_indexes = vec![None; self.documents.len()];
-        self.content_hashes = snapshot.content_hashes;
-        *self.custom_tables.write().unwrap() = snapshot.custom_tables;
-        *self.views.write().unwrap() = snapshot.views;
-        self.flush_catalog_to_storage()?;
-        Ok(unrevertable_paths)
-    }
-
-    /// Publish the complete in-memory metadata as a durable COW catalog.
-    /// Errors are deliberately propagated: reporting success after a failed
-    /// commit is worse than leaving the caller to retry.
-    pub(crate) fn flush_catalog_to_storage(&self) -> Result<(), MqdbError> {
-        let mut guard = self.storage.lock().unwrap();
-        if let Some(storage) = guard.as_mut() {
-            let entries = self.catalog_entries();
-            let custom = persist_unsaved_table_rows(storage, &self.custom_tables)?;
-            storage.flush_catalog(
-                &entries,
-                &custom,
-                &self.content_hash_pairs(),
-                &self.views_entries(),
-                self.tokenizer,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Append `new_rows` to `table_name`'s on-disk row chain and flush a
-    /// lightweight catalog update, no full row rewrite. No-op for in-memory
-    /// stores or unknown tables.
-    ///
-    /// This is what makes `INSERT INTO <table>` incremental: the cost is
-    /// proportional to the rows being inserted, not to the table's total size.
-    pub(crate) fn append_table_rows_to_storage(
-        &self,
-        table_name: &str,
-        _new_rows: &[Vec<String>],
-    ) -> Result<(), MqdbError> {
-        let mut guard = self.storage.lock().unwrap();
-        let storage = match guard.as_mut() {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-
-        {
-            let mut ct_guard = self.custom_tables.write().unwrap();
-            if let Some(state) = ct_guard.get_mut(table_name) {
-                // A table chain's tail link used to be patched in place here.
-                // That makes an uncommitted append reachable after a crash.
-                // Until table pages gain their own immutable segment map, make
-                // the chain COW as well and publish it only with the catalog.
-                let (first, last) = storage.write_table_rows(&state.rows)?;
-                state.first_row_page = first;
-                state.last_row_page = last;
-            }
-        }
-
-        let entries = self.catalog_entries();
-        let ct_guard = self.custom_tables.read().unwrap();
-        let custom: Vec<CustomTableEntry> = ct_guard
-            .iter()
-            .map(|(name, state)| CustomTableEntry {
-                name: name.clone(),
-                columns: state.columns.clone(),
-                first_row_page: state.first_row_page,
-                last_row_page: state.last_row_page,
-                num_rows: state.rows.len() as u32,
-            })
-            .collect();
-        drop(ct_guard);
-        storage.flush_catalog(
-            &entries,
-            &custom,
-            &self.content_hash_pairs(),
-            &self.views_entries(),
-            self.tokenizer,
-        )?;
-        Ok(())
-    }
-
-    pub(crate) fn rollback_appended_rows(&self, table_name: &str, count: usize) {
-        if count == 0 {
-            return;
-        }
-        let mut guard = self.custom_tables.write().unwrap();
-        if let Some(state) = guard.get_mut(table_name) {
-            let new_len = state.rows.len().saturating_sub(count);
-            state.rows.truncate(new_len);
-        }
-    }
-
-    // Persistence
-
-    /// Persist all in-memory documents to a `.mq-db` file, including secondary
-    /// indexes. Writes atomically: writes to `path.tmp` then renames to `path`.
-    ///
-    /// Errors if `path` is the store's own open backing file (would keep
-    /// writing through the old, unlinked inode); use
-    /// [`vacuum`](Self::vacuum) instead.
-    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), MqdbError> {
-        let path = path.as_ref();
-        if let Some(storage) = self.storage.lock().unwrap().as_ref()
-            && storage.same_backing_file(path)?
-        {
-            return Err(MqdbError::Storage(
-                "save cannot target the store's own open backing file — use vacuum instead".into(),
-            ));
-        }
-        self.save_inner(path, false).map(|_| ())
-    }
-
-    /// `write_lock_held` is used by migration, whose snapshot and replacement
-    /// must be one writer-critical section rather than two separately locked
-    /// operations.
-    ///
-    /// Returns the temp storage the new file was written through, still
-    /// holding its inode lock, so [`vacuum`](Self::vacuum) can carry that
-    /// lock into the reopened storage without a re-acquire gap.
-    fn save_inner(&self, path: &Path, write_lock_held: bool) -> Result<Storage, MqdbError> {
-        // `save` publishes via rename, so lock a stable sidecar for the
-        // whole build-and-publish window.  An already-open store holds that
-        // same lock for its lifetime; do not attempt to lock it twice.
-        let save_lock = {
-            let guard = self.storage.lock().unwrap();
-            let already_locked = write_lock_held
-                || match guard.as_ref() {
-                    Some(storage) => storage.same_backing_file(path)?,
-                    None => false,
-                };
-            if already_locked {
-                None
-            } else {
-                Some(Storage::acquire_write_lock(path)?)
-            }
-        };
-        let tmp_path = PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
-        if tmp_path.exists() {
-            std::fs::remove_file(&tmp_path)?;
-        }
-
-        let write_result = (|| -> Result<Storage, MqdbError> {
-            let mut storage = Storage::create(&tmp_path)?;
-            let mut entries = Vec::with_capacity(self.documents.len());
-
-            // Phase 1: write block data
-            for doc in &self.documents {
-                let first_block_page = storage.write_document(doc)?;
-                entries.push(CatalogEntry {
-                    document_id: doc.id,
-                    path: doc.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                    first_block_page,
-                    num_blocks: doc.block_count,
-                    zone_map_bytes: encode_zone_map(&doc.zone_maps),
-                    index_start_page: 0,
-                });
-            }
-
-            // Phase 2: write secondary indexes
-            for (i, doc) in self.documents.iter().enumerate() {
-                let idx = if let Some(cached) = self.doc_indexes.get(i).and_then(|o| o.as_ref()) {
-                    std::borrow::Cow::Borrowed(cached)
-                } else {
-                    std::borrow::Cow::Owned(DocumentIndex::build(&doc.blocks, self.tokenizer))
-                };
-                let bytes = idx.to_bytes();
-                entries[i].index_start_page = storage.write_index(&bytes)?;
-            }
-
-            // This writes into a brand-new file, so each table's rows are
-            // written fresh here rather than reusing `first_row_page` /
-            // `last_row_page` from `self`, which (if set) point into a
-            // *different*, already-open backing file.
-            let ct_guard = self.custom_tables.read().unwrap();
-            let mut custom = Vec::with_capacity(ct_guard.len());
-            for (name, state) in ct_guard.iter() {
-                let (first_row_page, last_row_page) = storage.write_table_rows(&state.rows)?;
-                custom.push(CustomTableEntry {
-                    name: name.clone(),
-                    columns: state.columns.clone(),
-                    first_row_page,
-                    last_row_page,
-                    num_rows: state.rows.len() as u32,
-                });
-            }
-            drop(ct_guard);
-
-            storage.flush_catalog(
-                &entries,
-                &custom,
-                &self.content_hash_pairs(),
-                &self.views_entries(),
-                self.tokenizer,
-            )?;
-            Ok(storage)
-        })();
-
-        let temp_storage = match write_result {
-            Ok(storage) => storage,
-            Err(err) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(err);
-            }
-        };
-
-        std::fs::rename(&tmp_path, path)?;
-        // A rename is only power-loss durable after the containing directory
-        // is synced as well.
-        std::fs::File::open(containing_dir(path))?.sync_all()?;
-        drop(save_lock);
-        Ok(temp_storage)
-    }
-
-    /// Rewrites the backing `.mq-db` file at `path` from scratch (same
-    /// compaction [`save`](Self::save) already does), reclaiming dead page
-    /// chains left behind by [`replace_document`](Self::replace_document),
-    /// `DROP TABLE`/`DROP VIEW`, and re-indexing changed files. Requires a
-    /// store opened via [`open`](Self::open) (a live backing file).
-    pub fn vacuum(&mut self, path: impl AsRef<Path>) -> Result<VacuumReport, MqdbError> {
-        let path = path.as_ref();
-        let pages_before = {
-            let guard = self.storage.lock().unwrap();
-            let Some(storage) = guard.as_ref() else {
-                return Err(MqdbError::Storage(
-                    "vacuum requires a store opened from a file (DocumentStore::open) — \
-                     this store has no backing file"
-                        .into(),
-                ));
-            };
-            if !storage.same_backing_file(path)? {
-                return Err(MqdbError::Storage(format!(
-                    "vacuum target {} is not the file this store was opened from — \
-                     vacuum only rewrites its own backing file in place",
-                    path.display()
-                )));
-            }
-            storage.num_pages()
-        };
-
-        let replacement = self.save_inner(path, false)?;
-
-        let previous = self
-            .storage
-            .lock()
-            .unwrap()
-            .take()
-            .expect("vacuum checked that storage was open");
-        let reopened = Storage::reopen_after_replace(path, previous, replacement)?;
-        let pages_after = reopened.num_pages();
-        *self.storage.lock().unwrap() = Some(reopened);
-
-        Ok(VacuumReport {
-            pages_before,
-            pages_after,
-        })
-    }
-
-    /// Open a `.mq-db` file in lazy mode: reads only catalog and zone maps.
-    ///
-    /// Block data is not loaded until you call
-    /// [`load_all_blocks`](DocumentStore::load_all_blocks).  Secondary indexes
-    /// are not built until you call
-    /// [`load_all_indexes`](DocumentStore::load_all_indexes).
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
-        let mut storage = Storage::open(path.as_ref())?;
-        // Unlike `load`/`load_catalog_only` (read-only, always rebuild
-        // indexes from blocks), this mode keeps `storage` open for later
-        // in-place writes, which only emit current-format index bytes;
-        // mixed with a legacy file's untouched ones, that would corrupt it.
-        if storage.file_version() != FILE_VERSION {
-            return Err(MqdbError::Storage(format!(
-                "store file is version {} (expected {FILE_VERSION}); run `DocumentStore::migrate` \
-                 (or open it once via an interactive `mq-db` command, which offers to migrate) before opening it for writes",
-                storage.file_version()
-            )));
-        }
-        let (entries, custom_table_entries, content_hashes, view_entries, tokenizer) =
-            storage.load_catalog()?;
-        let cap = entries.len();
-        let mut documents = Vec::with_capacity(cap);
-        let mut max_doc_id = None;
-
-        for entry in entries {
-            let zone_maps = decode_zone_map(&entry.zone_map_bytes)?;
-            let document_id = entry.document_id;
-            let path = entry.path.map(PathBuf::from);
-            documents.push(Document::from_catalog_lazy(
-                document_id,
-                path,
-                entry.num_blocks,
-                zone_maps,
-                entry.first_block_page,
-                entry.index_start_page,
-            ));
-            max_doc_id =
-                Some(max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)));
-        }
-
-        let mut custom_tables = FxHashMap::default();
-        for ct in custom_table_entries {
-            let rows = storage.read_table_rows(ct.first_row_page, ct.num_rows, ct.columns.len())?;
-            custom_tables.insert(
-                ct.name,
-                CustomTableState {
-                    columns: ct.columns,
-                    rows,
-                    first_row_page: ct.first_row_page,
-                    last_row_page: ct.last_row_page,
-                    not_null: vec![],
-                    unique: vec![],
-                },
-            );
-        }
-        let views: FxHashMap<String, String> =
-            view_entries.into_iter().map(|v| (v.name, v.sql)).collect();
-
-        Ok(Self {
-            documents,
-            next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
-            store_spans: true,
-            tokenizer,
-            storage: Mutex::new(Some(storage)),
-            doc_indexes: vec![None; cap],
-            custom_tables: RwLock::new(custom_tables),
-            views: RwLock::new(views),
-            attached: RwLock::new(FxHashMap::default()),
-            content_hashes: content_hashes.into_iter().collect(),
-            tx_snapshot: Mutex::new(None),
-            catalog_commit: Mutex::new(()),
-            write_session: DocumentStore::new_session_id(),
-        })
-    }
-
-    /// Load a `.mq-db` file and reconstruct the in-memory `DocumentStore`.
-    ///
-    /// All block data is read from disk. Secondary indexes are **not** built
-    /// here: [`crate::SqlEngine`] builds them lazily on construction.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
-        let mut storage = Storage::open_read_only(path.as_ref())?;
-        let (entries, custom_table_entries, content_hashes, view_entries, tokenizer) =
-            storage.load_catalog()?;
-        let cap = entries.len();
-        let mut documents = Vec::with_capacity(cap);
-        let mut max_doc_id = None;
-
-        for entry in entries {
-            let blocks = storage.read_blocks(entry.first_block_page, entry.num_blocks)?;
-            let zone_maps = decode_zone_map(&entry.zone_map_bytes)?;
-            let document_id = entry.document_id;
-            let path = entry.path.map(PathBuf::from);
-            let mut doc = Document::from_parts(document_id, path, blocks, zone_maps);
-            doc.index_start_page = entry.index_start_page;
-            documents.push(doc);
-            max_doc_id =
-                Some(max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)));
-        }
-
-        let mut custom_tables = FxHashMap::default();
-        for ct in custom_table_entries {
-            let rows = storage.read_table_rows(ct.first_row_page, ct.num_rows, ct.columns.len())?;
-            custom_tables.insert(
-                ct.name,
-                CustomTableState {
-                    columns: ct.columns,
-                    rows,
-                    first_row_page: ct.first_row_page,
-                    last_row_page: ct.last_row_page,
-                    not_null: vec![],
-                    unique: vec![],
-                },
-            );
-        }
-        let views: FxHashMap<String, String> =
-            view_entries.into_iter().map(|v| (v.name, v.sql)).collect();
-
-        Ok(Self {
-            documents,
-            next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
-            store_spans: true,
-            tokenizer,
-            storage: Mutex::new(None),
-            doc_indexes: vec![None; cap],
-            custom_tables: RwLock::new(custom_tables),
-            views: RwLock::new(views),
-            attached: RwLock::new(FxHashMap::default()),
-            content_hashes: content_hashes.into_iter().collect(),
-            tx_snapshot: Mutex::new(None),
-            catalog_commit: Mutex::new(()),
-            write_session: DocumentStore::new_session_id(),
-        })
-    }
-
-    /// Load only the catalog metadata from a `.mq-db` file, no block data.
-    ///
-    /// Documents have `block_count` populated from the catalog but `blocks`
-    /// is empty. Useful for commands that only need zone-map metadata (e.g.
-    /// `list`), avoiding the cost of deserialising all block data.
-    pub fn load_catalog_only(path: impl AsRef<Path>) -> Result<Self, MqdbError> {
-        let mut storage = Storage::open_read_only(path.as_ref())?;
-        let (entries, _custom_table_entries, content_hashes, _view_entries, tokenizer) =
-            storage.load_catalog()?;
-        let cap = entries.len();
-        let mut documents = Vec::with_capacity(cap);
-        let mut max_doc_id = None;
-
-        for entry in entries {
-            let zone_maps = decode_zone_map(&entry.zone_map_bytes)?;
-            let document_id = entry.document_id;
-            let path = entry.path.map(PathBuf::from);
-            documents.push(Document::from_catalog(
-                document_id,
-                path,
-                entry.num_blocks,
-                zone_maps,
-            ));
-            max_doc_id =
-                Some(max_doc_id.map_or(document_id, |cur: DocumentId| cur.max(document_id)));
-        }
-
-        Ok(Self {
-            documents,
-            next_doc_id: max_doc_id.map_or(0, |id| id.saturating_add(1)),
-            store_spans: true,
-            tokenizer,
-            storage: Mutex::new(None),
-            doc_indexes: vec![None; cap],
-            custom_tables: RwLock::new(FxHashMap::default()),
-            views: RwLock::new(FxHashMap::default()),
-            attached: RwLock::new(FxHashMap::default()),
-            content_hashes: content_hashes.into_iter().collect(),
-            tx_snapshot: Mutex::new(None),
-            catalog_commit: Mutex::new(()),
-            write_session: DocumentStore::new_session_id(),
-        })
-    }
-
-    /// The on-disk file-format version at `path`, without loading the
-    /// catalog. Use this to decide whether [`DocumentStore::migrate`] is
-    /// needed before calling [`DocumentStore::open`].
-    pub fn file_version(path: impl AsRef<Path>) -> Result<u32, MqdbError> {
-        Ok(Storage::open_read_only(path.as_ref())?.file_version())
-    }
-
-    /// Rewrites a store written by an older but still-recognised file
-    /// format (see `storage::page`) in the current format, rebuilding every
-    /// document's secondary index (including any index sections added since
-    /// that version) from its stored blocks. Returns the version the file
-    /// was in before migrating; a no-op if it was already current.
-    ///
-    /// This does not touch the original bytes in place, like [`Self::save`],
-    /// it writes a new file to `<path>.tmp` and renames it over `path`, so a
-    /// failure or interruption midway leaves the original file untouched.
-    /// Callers that want a backup of the pre-migration file should copy it
-    /// before calling this.
-    pub fn migrate(path: impl AsRef<Path>) -> Result<u32, MqdbError> {
-        let path = path.as_ref();
-        // Keep the writer lock from reading the old snapshot through the
-        // final rename, otherwise another writer could be silently replaced.
-        let _migration_lock = Storage::acquire_write_lock(path)?;
-        let old_version = Storage::open_read_only(path)?.file_version();
-        if old_version == FILE_VERSION {
-            return Ok(old_version);
-        }
-        let store = Self::load(path)?;
-        store.save_inner(path, true)?;
-        Ok(old_version)
     }
 }
 
@@ -1892,5 +1047,62 @@ mod containing_dir_tests {
         #[case] expected: &str,
     ) {
         assert_eq!(containing_dir(Path::new(path)), Path::new(expected));
+    }
+}
+
+#[cfg(test)]
+mod vacuum_then_write_tests {
+    use super::*;
+    use crate::SqlEngine;
+
+    /// A store with table `t` (2 rows) opened from a file, then vacuumed in
+    /// the same process.
+    fn vacuumed() -> (tempfile::TempDir, std::path::PathBuf, DocumentStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.mq-db");
+        let mut s = DocumentStore::new();
+        s.add_str("# T\n\nbody\n").unwrap();
+        s.save(&path).unwrap();
+        let mut s = DocumentStore::open(&path).unwrap();
+        s.load_all_blocks().unwrap();
+        s.load_all_indexes().unwrap();
+        let e = SqlEngine::new(&s).unwrap();
+        e.execute("CREATE TABLE t (a TEXT)").unwrap();
+        e.execute("INSERT INTO t VALUES ('one'), ('two')").unwrap();
+        drop(e);
+        s.vacuum(&path).unwrap();
+        (dir, path, s)
+    }
+
+    fn count_after_reopen(path: &std::path::Path) -> String {
+        let r = DocumentStore::open(path).unwrap();
+        SqlEngine::new(&r)
+            .unwrap()
+            .execute("SELECT count(*) FROM t")
+            .unwrap()
+            .rows[0][0]
+            .clone()
+    }
+
+    #[test]
+    fn catalog_only_write_after_vacuum_keeps_table_rows() {
+        let (_dir, path, s) = vacuumed();
+        SqlEngine::new(&s)
+            .unwrap()
+            .execute("CREATE VIEW v AS SELECT 1")
+            .unwrap();
+        drop(s);
+        assert_eq!(count_after_reopen(&path), "2");
+    }
+
+    #[test]
+    fn insert_after_vacuum_keeps_table_rows() {
+        let (_dir, path, s) = vacuumed();
+        SqlEngine::new(&s)
+            .unwrap()
+            .execute("INSERT INTO t VALUES ('three')")
+            .unwrap();
+        drop(s);
+        assert_eq!(count_after_reopen(&path), "3");
     }
 }

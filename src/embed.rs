@@ -1,0 +1,840 @@
+//! Computes embeddings with an OpenAI-compatible `/embeddings` endpoint and
+//! keeps them in a custom table keyed by `blocks.content_hash`.
+//!
+//! Works with anything that speaks that API: OpenAI, Ollama
+//! (`http://localhost:11434/v1`), llama.cpp's server, vLLM, ...
+
+use crate::{DocumentStore, MqdbError, SqlEngine};
+use std::time::Duration;
+
+/// Where and how to compute embeddings.
+#[derive(Debug, Clone)]
+pub struct EmbedConfig {
+    /// Base URL; `/embeddings` is appended.
+    pub endpoint: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    /// Texts sent per request.
+    pub batch_size: usize,
+    /// Forwarded as `dimensions` to models that support shortening.
+    pub dimensions: Option<usize>,
+    /// Drop every stored embedding first instead of refusing a model change.
+    pub rebuild: bool,
+    /// Base delay before a retry, doubled each time (milliseconds).
+    pub retry_backoff_ms: u64,
+    /// Keep an hnsw index on the table's `embedding` column up to date, so
+    /// `vector_search()` stays fast. Writing to the table drops the index,
+    /// so it is rebuilt here whenever it is missing.
+    pub build_index: bool,
+}
+
+impl Default for EmbedConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "https://api.openai.com/v1".into(),
+            model: "text-embedding-3-small".into(),
+            api_key: None,
+            batch_size: 64,
+            dimensions: None,
+            rebuild: false,
+            retry_backoff_ms: 1000,
+            build_index: true,
+        }
+    }
+}
+
+/// What [`sync_embeddings`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EmbedReport {
+    /// Embeddings computed and stored by this run.
+    pub embedded: usize,
+    /// Blocks that already had an embedding.
+    pub up_to_date: usize,
+    /// Stored embeddings dropped because no block has that hash any more.
+    pub removed: usize,
+    /// Whether the hnsw index was (re)built by this run.
+    pub index_built: bool,
+}
+
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Pending rows are written once they reach about this many bytes of SQL.
+const FLUSH_BYTES: usize = 32 * 1024 * 1024;
+
+/// Embeds `inputs` in one request; the result is in `inputs` order.
+pub fn embed_batch(cfg: &EmbedConfig, inputs: &[String]) -> Result<Vec<Vec<f32>>, MqdbError> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = format!("{}/embeddings", cfg.endpoint.trim_end_matches('/'));
+    let mut body = serde_json::json!({ "model": cfg.model, "input": inputs });
+    if let Some(d) = cfg.dimensions {
+        body["dimensions"] = d.into();
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(120)))
+        .build()
+        .into();
+
+    let mut last_err = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(cfg.retry_backoff_ms << (attempt - 1)));
+        }
+        let mut req = agent.post(&url);
+        if let Some(key) = &cfg.api_key {
+            req = req.header("Authorization", &format!("Bearer {key}"));
+        }
+        match req.send_json(&body) {
+            Ok(mut resp) => {
+                let value: serde_json::Value = resp
+                    .body_mut()
+                    .read_json()
+                    .map_err(|e| MqdbError::Embed(format!("invalid response from {url}: {e}")))?;
+                return parse_embeddings(&value, inputs.len());
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(MqdbError::Embed(format!(
+        "request to {url} failed after {MAX_ATTEMPTS} attempts: {last_err}"
+    )))
+}
+
+/// Extracts `data[].embedding`, ordered by `data[].index`.
+fn parse_embeddings(
+    value: &serde_json::Value,
+    expected: usize,
+) -> Result<Vec<Vec<f32>>, MqdbError> {
+    let data = value
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| MqdbError::Embed("response has no `data` array".into()))?;
+    if data.len() != expected {
+        return Err(MqdbError::Embed(format!(
+            "sent {expected} texts but got {} embeddings",
+            data.len()
+        )));
+    }
+    let mut indexed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(data.len());
+    for (pos, item) in data.iter().enumerate() {
+        let index = item
+            .get("index")
+            .and_then(|i| i.as_u64())
+            .map_or(pos, |i| i as usize);
+        let vec = item
+            .get("embedding")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| MqdbError::Embed("embedding item has no `embedding` array".into()))?
+            .iter()
+            .map(|n| {
+                n.as_f64()
+                    .map(|f| f as f32)
+                    .ok_or_else(|| MqdbError::Embed("embedding contains a non-number".into()))
+            })
+            .collect::<Result<Vec<f32>, _>>()?;
+        indexed.push((index, vec));
+    }
+    indexed.sort_by_key(|(i, _)| *i);
+    Ok(indexed.into_iter().map(|(_, v)| v).collect())
+}
+
+fn valid_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn vector_json(v: &[f32]) -> String {
+    let parts: Vec<String> = v.iter().map(f32::to_string).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// Brings `table` (`content_hash`, `embedding`, `model`) in line with the
+/// store's blocks: embeds blocks that have no row yet and drops rows whose
+/// block is gone. `progress` is called with `(done, total)` after each batch.
+///
+/// Blocks with identical type and content share one embedding. Front matter
+/// and empty blocks are skipped.
+pub fn sync_embeddings(
+    store: &DocumentStore,
+    cfg: &EmbedConfig,
+    table: &str,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<EmbedReport, MqdbError> {
+    if !valid_identifier(table) {
+        return Err(MqdbError::Embed(format!("invalid table name '{table}'")));
+    }
+    if cfg.batch_size == 0 {
+        return Err(MqdbError::Embed("batch size must be at least 1".into()));
+    }
+    let engine = SqlEngine::new(store)?;
+    engine.execute(&format!(
+        "CREATE TABLE IF NOT EXISTS {table} (content_hash TEXT, embedding TEXT, model TEXT)"
+    ))?;
+
+    if cfg.rebuild {
+        engine.execute(&format!("DELETE FROM {table}"))?;
+    } else {
+        let models = engine.execute(&format!("SELECT DISTINCT model FROM {table}"))?;
+        if let Some(other) = models.rows.iter().find(|r| r[0] != cfg.model) {
+            return Err(MqdbError::Embed(format!(
+                "table '{table}' holds embeddings from model '{}', not '{}'; \
+                 use --rebuild to replace them or a different --table",
+                other[0], cfg.model
+            )));
+        }
+    }
+
+    let removed = engine
+        .execute(&format!(
+            "DELETE FROM {table} WHERE content_hash NOT IN (SELECT content_hash FROM blocks)"
+        ))?
+        .rows
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let total_blocks = engine
+        .execute(
+            "SELECT count(DISTINCT content_hash) FROM blocks \
+             WHERE block_type NOT IN ('yaml', 'toml') AND content <> ''",
+        )?
+        .rows[0][0]
+        .parse::<usize>()
+        .unwrap_or(0);
+    let pending = engine.execute(&format!(
+        "SELECT DISTINCT content_hash, content FROM blocks \
+         WHERE block_type NOT IN ('yaml', 'toml') AND content <> '' \
+         AND content_hash NOT IN (SELECT content_hash FROM {table})"
+    ))?;
+    let todo = pending.rows;
+    let mut report = EmbedReport {
+        embedded: 0,
+        up_to_date: total_blocks.saturating_sub(todo.len()),
+        removed,
+        index_built: false,
+    };
+
+    // Every INSERT rewrites the table's whole row chain, and the old chain
+    // stays in the file until `vacuum`, so inserting per API batch would grow
+    // the file quadratically. Collect rows and write them in a few large
+    // INSERTs instead: when enough has piled up, at the end, and before
+    // returning an error so a failed run keeps what it already paid for.
+    let mut pending: Vec<String> = Vec::new();
+    let mut pending_bytes = 0usize;
+    let flush = |pending: &mut Vec<String>, pending_bytes: &mut usize| -> Result<(), MqdbError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        engine.execute(&format!(
+            "INSERT INTO {table} (content_hash, embedding, model) VALUES {}",
+            pending.join(", ")
+        ))?;
+        pending.clear();
+        *pending_bytes = 0;
+        Ok(())
+    };
+
+    // Vectors of different lengths cannot share an index or be compared.
+    let mut dims = engine
+        .execute(&format!("SELECT embedding FROM {table} LIMIT 1"))?
+        .rows
+        .first()
+        .and_then(|r| crate::vector::parse_vector_text(&r[0]))
+        .map(|v| v.len());
+
+    let mut failure = None;
+    for chunk in todo.chunks(cfg.batch_size) {
+        let texts: Vec<String> = chunk.iter().map(|r| r[1].clone()).collect();
+        let vectors = match embed_batch(cfg, &texts) {
+            Ok(v) => v,
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        };
+        if dims.is_none() {
+            dims = vectors.first().map(Vec::len);
+        }
+        if let Some(want) = dims
+            && let Some(bad) = vectors.iter().find(|v| v.len() != want)
+        {
+            failure = Some(MqdbError::Embed(format!(
+                "the model returned {} dimensions but table '{table}' holds {want}; \
+                 use --rebuild to replace them or pass --dimensions {want}",
+                bad.len()
+            )));
+            break;
+        }
+        for (row, v) in chunk.iter().zip(&vectors) {
+            let tuple = format!(
+                "({}, {}, {})",
+                sql_quote(&row[0]),
+                sql_quote(&vector_json(v)),
+                sql_quote(&cfg.model)
+            );
+            pending_bytes += tuple.len();
+            pending.push(tuple);
+        }
+        report.embedded += chunk.len();
+        if pending_bytes >= FLUSH_BYTES {
+            flush(&mut pending, &mut pending_bytes)?;
+        }
+        progress(report.embedded, todo.len());
+    }
+    flush(&mut pending, &mut pending_bytes)?;
+    if let Some(e) = failure {
+        return Err(e);
+    }
+
+    if cfg.build_index && store.find_vector_index(table, "embedding").is_none() {
+        let has_rows = engine
+            .execute(&format!("SELECT count(*) FROM {table}"))?
+            .rows[0][0]
+            != "0";
+        if has_rows {
+            let index = format!("{table}_hnsw");
+            engine.execute(&format!("DROP INDEX IF EXISTS {index}"))?;
+            engine.execute(&format!(
+                "CREATE INDEX {index} ON {table} USING hnsw (embedding)"
+            ))?;
+            report.index_built = true;
+        }
+    }
+    Ok(report)
+}
+
+/// Embeds `query` and returns the `limit` blocks whose stored embedding is
+/// closest to it, as search hits (`score` is cosine similarity).
+///
+/// The query is embedded with the model the table was built with, since
+/// vectors from different models cannot be compared; `cfg.model` is only a
+/// fallback and is ignored when the table records one.
+pub fn semantic_hits(
+    store: &DocumentStore,
+    cfg: &EmbedConfig,
+    table: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<crate::search::FindHit>, MqdbError> {
+    if !valid_identifier(table) {
+        return Err(MqdbError::Embed(format!("invalid table name '{table}'")));
+    }
+    let engine = SqlEngine::new(store)?;
+    let models = engine
+        .execute(&format!("SELECT DISTINCT model FROM {table}"))
+        .map_err(|_| {
+            MqdbError::Embed(format!(
+                "table '{table}' does not exist; run `mq-db embed` first"
+            ))
+        })?
+        .rows;
+    let model = match models.as_slice() {
+        [] => {
+            return Err(MqdbError::Embed(format!(
+                "table '{table}' has no embeddings; run `mq-db embed` first"
+            )));
+        }
+        [one] => one[0].clone(),
+        _ => {
+            return Err(MqdbError::Embed(format!(
+                "table '{table}' mixes embeddings from several models; run `mq-db embed --rebuild`"
+            )));
+        }
+    };
+    let stored_dims = engine
+        .execute(&format!("SELECT embedding FROM {table} LIMIT 1"))?
+        .rows
+        .first()
+        .and_then(|r| crate::vector::parse_vector_text(&r[0]))
+        .map(|v| v.len());
+
+    let query_cfg = EmbedConfig {
+        model,
+        ..cfg.clone()
+    };
+    let vector = embed_batch(&query_cfg, &[query.to_string()])?
+        .pop()
+        .ok_or_else(|| MqdbError::Embed("the API returned no embedding for the query".into()))?;
+    if let Some(dims) = stored_dims
+        && dims != vector.len()
+    {
+        return Err(MqdbError::Embed(format!(
+            "the query embedding has {} dimensions but the stored ones have {dims}; \
+             pass --dimensions {dims} if the model supports it",
+            vector.len()
+        )));
+    }
+
+    // One embedding row serves every block with the same content, so `limit`
+    // embeddings can join to fewer than `limit` blocks. Widen the candidate
+    // set until enough blocks come back or every embedding has been tried.
+    let total = engine
+        .execute(&format!("SELECT count(*) FROM {table}"))?
+        .rows[0][0]
+        .parse::<usize>()
+        .unwrap_or(0);
+    let max_k = total.clamp(1, 100_000);
+    let mut k = limit.clamp(1, max_k);
+    let rows = loop {
+        let out = engine.execute(&format!(
+            "SELECT d.path, b.block_type, b.content, v.score \
+             FROM vector_search('{table}', 'embedding', {}, {k}) v \
+             JOIN blocks b ON b.content_hash = v.content_hash \
+             JOIN documents d ON d.id = b.document_id \
+             ORDER BY v.score DESC, d.path ASC LIMIT {limit}",
+            sql_quote(&vector_json(&vector))
+        ))?;
+        if out.rows.len() >= limit || k >= max_k {
+            break out.rows;
+        }
+        k = k.saturating_mul(4).min(max_k);
+    };
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let [path, block_type, content, score] = <[String; 4]>::try_from(row).ok()?;
+            Some(crate::search::FindHit {
+                path,
+                block_type,
+                content,
+                score: score.parse().unwrap_or(0.0),
+            })
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    /// Serves one `/embeddings` response per request: a 3-dim vector whose
+    /// first component is the text's length, so tests can tell inputs apart.
+    fn mock_server() -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        mock_server_failing_after(usize::MAX)
+    }
+
+    /// Like [`mock_server`] but answers 500 to every request after the first
+    /// `ok_requests`.
+    fn mock_server_failing_after(
+        ok_requests: usize,
+    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let n = stream.read(&mut chunk).unwrap_or(0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(split) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= split + 4 + len || n == 0 {
+                            break text[split + 4..].to_string();
+                        }
+                    } else if n == 0 {
+                        break String::new();
+                    }
+                };
+                let req: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let inputs = req["input"].as_array().cloned().unwrap_or_default();
+                // Reply in reverse order, with `index`, to exercise re-ordering.
+                let data: Vec<serde_json::Value> = inputs
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(i, t)| {
+                        serde_json::json!({
+                            "index": i,
+                            "embedding": [t.as_str().unwrap().len() as f64, 0.5, -1.0]
+                        })
+                    })
+                    .collect();
+                let served = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(req);
+                    seen.len()
+                };
+                if served > ok_requests {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    continue;
+                }
+                let payload = serde_json::json!({ "data": data }).to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+            }
+        });
+        (format!("http://{addr}/v1"), requests)
+    }
+
+    fn cfg(endpoint: String) -> EmbedConfig {
+        EmbedConfig {
+            endpoint,
+            model: "test-model".into(),
+            batch_size: 2,
+            retry_backoff_ms: 1,
+            ..EmbedConfig::default()
+        }
+    }
+
+    fn store_with(docs: &[&str]) -> DocumentStore {
+        let mut store = DocumentStore::new();
+        for d in docs {
+            store.add_str(d).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn parse_orders_by_index_and_validates() {
+        let v = serde_json::json!({"data": [
+            {"index": 1, "embedding": [2.0]},
+            {"index": 0, "embedding": [1.0]},
+        ]});
+        assert_eq!(parse_embeddings(&v, 2).unwrap(), vec![vec![1.0], vec![2.0]]);
+        assert!(parse_embeddings(&v, 3).is_err());
+        assert!(parse_embeddings(&serde_json::json!({}), 1).is_err());
+        assert!(parse_embeddings(&serde_json::json!({"data": [{"embedding": ["x"]}]}), 1).is_err());
+    }
+
+    #[test]
+    fn quoting_and_identifiers() {
+        assert_eq!(sql_quote("it's"), "'it''s'");
+        assert!(valid_identifier("emb_2"));
+        assert!(!valid_identifier("emb; DROP"));
+        assert!(!valid_identifier("1emb"));
+        assert!(!valid_identifier(""));
+    }
+
+    #[test]
+    fn embed_batch_sends_model_dimensions_and_auth() {
+        let (endpoint, requests) = mock_server();
+        let mut c = cfg(endpoint);
+        c.dimensions = Some(3);
+        c.api_key = Some("k".into());
+        let out = embed_batch(&c, &["ab".into(), "abcd".into()]).unwrap();
+        assert_eq!(out[0][0], 2.0);
+        assert_eq!(out[1][0], 4.0);
+        let req = requests.lock().unwrap()[0].clone();
+        assert_eq!(req["model"], "test-model");
+        assert_eq!(req["dimensions"], 3);
+    }
+
+    #[test]
+    fn sync_embeds_only_missing_blocks_and_drops_orphans() {
+        let (endpoint, requests) = mock_server();
+        let store = store_with(&["# Title\n\nHello\n\nWorld\n"]);
+        let c = cfg(endpoint);
+
+        let first = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert_eq!(first.embedded, 3); // heading + 2 paragraphs
+        assert_eq!(first.up_to_date, 0);
+        assert!(first.index_built);
+        assert_eq!(requests.lock().unwrap().len(), 2); // batch size 2
+
+        let again = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert_eq!(
+            again,
+            EmbedReport {
+                embedded: 0,
+                up_to_date: 3,
+                removed: 0,
+                index_built: false
+            }
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2, "no new requests");
+
+        // Same content under a different document: shares the embedding.
+        let engine = SqlEngine::new(&store).unwrap();
+        let rows = engine.execute("SELECT count(*) FROM emb").unwrap();
+        assert_eq!(rows.rows[0][0], "3");
+        let sample = engine.execute("SELECT embedding FROM emb LIMIT 1").unwrap();
+        assert!(sample.rows[0][0].starts_with('['));
+
+        // A stale row for a vanished block is removed.
+        engine
+            .execute("INSERT INTO emb VALUES ('deadbeef', '[1]', 'test-model')")
+            .unwrap();
+        let cleaned = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert_eq!(cleaned.removed, 1);
+    }
+
+    #[test]
+    fn sync_refuses_model_change_unless_rebuild() {
+        let (endpoint, _) = mock_server();
+        let store = store_with(&["# T\n\nbody\n"]);
+        let c = cfg(endpoint);
+        sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+
+        let mut other = c.clone();
+        other.model = "other-model".into();
+        let err = sync_embeddings(&store, &other, "emb", |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("--rebuild"));
+
+        other.rebuild = true;
+        let report = sync_embeddings(&store, &other, "emb", |_, _| {}).unwrap();
+        assert_eq!(report.embedded, 2);
+    }
+
+    #[test]
+    fn sync_rejects_bad_table_name_and_batch_size() {
+        let store = store_with(&["# T\n"]);
+        let c = EmbedConfig::default();
+        assert!(sync_embeddings(&store, &c, "a b", |_, _| {}).is_err());
+        let zero = EmbedConfig { batch_size: 0, ..c };
+        assert!(sync_embeddings(&store, &zero, "emb", |_, _| {}).is_err());
+    }
+
+    #[test]
+    fn sync_keeps_the_hnsw_index_current() {
+        let (endpoint, _) = mock_server();
+        let mut store = store_with(&["# T\n\nbody\n"]);
+        let c = cfg(endpoint);
+        sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert!(store.find_vector_index("emb", "embedding").is_some());
+
+        // Nothing changed: the index is left alone.
+        let idle = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert!(!idle.index_built);
+
+        // New content only appends rows, so the index is extended in place
+        // rather than rebuilt.
+        store.add_str("# U\n\nmore text\n").unwrap();
+        let more = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert!(more.embedded > 0 && !more.index_built);
+        let name = store.find_vector_index("emb", "embedding").unwrap();
+        let total: usize = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SELECT count(*) FROM emb")
+            .unwrap()
+            .rows[0][0]
+            .parse()
+            .unwrap();
+        assert_eq!(store.get_vector_index(&name).unwrap().unwrap().len(), total);
+
+        // Removing a row cannot be done in place, so the index is rebuilt.
+        SqlEngine::new(&store)
+            .unwrap()
+            .execute("INSERT INTO emb VALUES ('stale', '[1,0,0]', 'test-model')")
+            .unwrap();
+        let removed = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert_eq!(removed.removed, 1);
+        assert!(removed.index_built);
+        assert!(store.find_vector_index("emb", "embedding").is_some());
+    }
+
+    #[test]
+    fn sync_can_skip_the_index() {
+        let (endpoint, _) = mock_server();
+        let store = store_with(&["# T\n\nbody\n"]);
+        let c = EmbedConfig {
+            build_index: false,
+            ..cfg(endpoint)
+        };
+        let report = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert!(!report.index_built);
+        assert!(store.find_vector_index("emb", "embedding").is_none());
+    }
+
+    #[test]
+    fn semantic_hits_rank_by_embedding_and_use_the_tables_model() {
+        let (endpoint, requests) = mock_server();
+        // The mock embeds a text as [length, 0.5, -1], so the closest block to
+        // a query is the one whose text has the closest length.
+        let store = store_with(&["# a\n\nabcde\n\nabcdefghijklmnopqrstuvwxyz\n"]);
+        let c = cfg(endpoint);
+        sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        requests.lock().unwrap().clear();
+
+        let asking = EmbedConfig {
+            model: "a-different-model".into(),
+            ..c
+        };
+        let hits = semantic_hits(&store, &asking, "emb", "vwxyz", 2).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].content, "abcde");
+        assert!(hits[0].score >= hits[1].score);
+        assert_eq!(
+            requests.lock().unwrap()[0]["model"],
+            "test-model",
+            "the query is embedded with the model the table was built with"
+        );
+    }
+
+    #[test]
+    fn sync_rejects_vectors_of_another_dimension_than_the_table_holds() {
+        let (endpoint, _) = mock_server();
+        let mut store = store_with(&["# T\n\nbody\n"]);
+        let c = cfg(endpoint);
+        sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        // The mock returns 3-D vectors; pretend the table was built with 2-D.
+        SqlEngine::new(&store)
+            .unwrap()
+            .execute("UPDATE emb SET embedding = '[1, 0]'")
+            .unwrap();
+        store.add_str("# U\n\nanother block\n").unwrap();
+
+        let err = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("--rebuild"), "{err}");
+        let rows = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SELECT count(*) FROM emb WHERE embedding = '[1, 0]'")
+            .unwrap();
+        let all = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SELECT count(*) FROM emb")
+            .unwrap();
+        assert_eq!(rows.rows, all.rows, "nothing incompatible was stored");
+
+        let mut rebuild = c;
+        rebuild.rebuild = true;
+        sync_embeddings(&store, &rebuild, "emb", |_, _| {}).unwrap();
+    }
+
+    #[test]
+    fn semantic_hits_fill_the_limit_despite_duplicate_blocks() {
+        let (endpoint, _) = mock_server();
+        // The mock embeds a text as [length, 0.5, -1]; "aaaaa" appears three
+        // times and shares one embedding row.
+        let store = store_with(&[
+            "# a\n\naaaaa\n",
+            "# b\n\naaaaa\n",
+            "# c\n\naaaaa\n\nbbbbbbbbbbbb\n",
+        ]);
+        let c = cfg(endpoint);
+        sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        let hits = semantic_hits(&store, &c, "emb", "aaaaa", 4).unwrap();
+        assert_eq!(hits.len(), 4, "{hits:?}");
+        assert!(hits.iter().any(|h| h.content == "bbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn semantic_hits_explain_what_is_missing() {
+        let (endpoint, _) = mock_server();
+        let store = store_with(&["# T\n\nbody\n"]);
+        let c = cfg(endpoint);
+
+        let no_table = semantic_hits(&store, &c, "emb", "q", 3).unwrap_err();
+        assert!(no_table.to_string().contains("mq-db embed"));
+
+        SqlEngine::new(&store)
+            .unwrap()
+            .execute("CREATE TABLE emb (content_hash TEXT, embedding TEXT, model TEXT)")
+            .unwrap();
+        let empty = semantic_hits(&store, &c, "emb", "q", 3).unwrap_err();
+        assert!(empty.to_string().contains("no embeddings"));
+
+        // Stored vectors of another size than the API returns (3).
+        SqlEngine::new(&store)
+            .unwrap()
+            .execute("INSERT INTO emb VALUES ('h', '[1,2,3,4,5]', 'test-model')")
+            .unwrap();
+        let mismatch = semantic_hits(&store, &c, "emb", "q", 3).unwrap_err();
+        assert!(
+            mismatch.to_string().contains("--dimensions 5"),
+            "{mismatch}"
+        );
+
+        assert!(semantic_hits(&store, &c, "bad name", "q", 3).is_err());
+    }
+
+    /// A file-backed store with `docs` documents of `paras` paragraphs each.
+    fn file_store(
+        docs: usize,
+        paras: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf, DocumentStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.mq-db");
+        let mut base = DocumentStore::new();
+        for d in 0..docs {
+            let body: Vec<String> = (0..paras)
+                .map(|p| format!("paragraph {d}-{p} text"))
+                .collect();
+            base.add_str(&format!("# Doc {d}\n\n{}\n", body.join("\n\n")))
+                .unwrap();
+        }
+        base.save(&path).unwrap();
+        // Like the CLI: open lazily, then read every block.
+        let mut store = DocumentStore::open(&path).unwrap();
+        store.load_all_blocks().unwrap();
+        store.load_all_indexes().unwrap();
+        (dir, path, store)
+    }
+
+    #[test]
+    fn sync_does_not_grow_the_file_per_batch() {
+        let (endpoint, requests) = mock_server();
+        let (_dir, path, mut store) = file_store(10, 9);
+        let c = cfg(endpoint); // batch size 2 => about 50 API batches
+        let report = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert_eq!(report.embedded, 100);
+        assert!(requests.lock().unwrap().len() >= 50);
+
+        let before = std::fs::metadata(&path).unwrap().len();
+        store.vacuum(&path).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        // One INSERT per API batch used to leave dozens of dead copies of the
+        // table behind; a handful of writes leaves at most a few.
+        assert!(
+            before <= after * 3,
+            "file is {before} bytes before vacuum, {after} after: embed rewrote the table per batch"
+        );
+    }
+
+    #[test]
+    fn a_failed_run_keeps_the_embeddings_it_already_has() {
+        // 3 batches of 2 succeed, then the API starts failing.
+        let (endpoint, _) = mock_server_failing_after(3);
+        let store = store_with(&["# T\n\na1\n\na2\n\na3\n\na4\n\na5\n\na6\n\na7\n\na8\n"]);
+        let c = cfg(endpoint);
+        let err = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("failed after"), "{err}");
+
+        let kept = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SELECT count(*) FROM emb")
+            .unwrap();
+        assert_eq!(
+            kept.rows[0][0], "6",
+            "the three finished batches were saved"
+        );
+
+        // A later run only embeds what is missing.
+        let (endpoint, requests) = mock_server();
+        let c = cfg(endpoint);
+        let resumed = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        assert_eq!(resumed.up_to_date, 6);
+        assert_eq!(resumed.embedded, 3);
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+}

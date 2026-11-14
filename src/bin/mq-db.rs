@@ -60,6 +60,46 @@ impl From<TokenizerArg> for TokenizerKind {
     }
 }
 
+/// Where to reach the OpenAI-compatible embeddings API, shared by `embed` and
+/// `find --semantic`.
+#[cfg(feature = "embed")]
+#[derive(clap::Args, Debug)]
+struct EndpointArgs {
+    /// Base URL of the embeddings API (`/embeddings` is appended), e.g.
+    /// http://localhost:11434/v1 for Ollama
+    #[arg(
+        long,
+        env = "MQ_DB_EMBED_ENDPOINT",
+        default_value = "https://api.openai.com/v1"
+    )]
+    endpoint: String,
+
+    /// Environment variable holding the API key (not needed for local
+    /// servers). The key is never taken from the command line.
+    #[arg(long, default_value = "OPENAI_API_KEY")]
+    api_key_env: String,
+
+    /// Ask the model for vectors of this size, if it supports that
+    #[arg(long)]
+    dimensions: Option<usize>,
+}
+
+#[cfg(feature = "embed")]
+impl EndpointArgs {
+    fn config(&self, model: String) -> mq_db::embed::EmbedConfig {
+        mq_db::embed::EmbedConfig {
+            endpoint: self.endpoint.clone(),
+            model,
+            // Empty counts as unset: local servers need no key.
+            api_key: std::env::var(&self.api_key_env)
+                .ok()
+                .filter(|k| !k.is_empty()),
+            dimensions: self.dimensions,
+            ..mq_db::embed::EmbedConfig::default()
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Index Markdown files and save to a .mq-db store file
@@ -120,6 +160,21 @@ enum Commands {
         /// Output format
         #[arg(long, short = 'F', default_value = "table")]
         format: OutputFormat,
+
+        /// Rank by meaning instead of keywords. The query is embedded with
+        /// the model `mq-db embed` used, so run that first.
+        #[cfg(feature = "embed")]
+        #[arg(long)]
+        semantic: bool,
+
+        /// Table `mq-db embed` stored the embeddings in (with --semantic)
+        #[cfg(feature = "embed")]
+        #[arg(long, default_value = "embeddings")]
+        table: String,
+
+        #[cfg(feature = "embed")]
+        #[command(flatten)]
+        api: EndpointArgs,
     },
 
     /// Run an mq query over the store
@@ -200,6 +255,44 @@ enum Commands {
         /// Path to .mq-db store file
         #[arg(short, long, default_value = "store.mq-db")]
         db: PathBuf,
+    },
+
+    /// Compute embeddings for blocks that have none yet, using an
+    /// OpenAI-compatible `/embeddings` endpoint, and store them in a table
+    /// for `cosine_similarity()` search. Re-running only embeds new or
+    /// changed blocks.
+    #[cfg(feature = "embed")]
+    Embed {
+        /// Path to .mq-db store file
+        #[arg(short, long, default_value = "store.mq-db")]
+        db: PathBuf,
+
+        #[command(flatten)]
+        api: EndpointArgs,
+
+        /// Embedding model name
+        #[arg(
+            long,
+            env = "MQ_DB_EMBED_MODEL",
+            default_value = "text-embedding-3-small"
+        )]
+        model: String,
+
+        /// Table that holds the embeddings (content_hash, embedding, model)
+        #[arg(long, default_value = "embeddings")]
+        table: String,
+
+        /// Texts per request
+        #[arg(long, default_value_t = 64)]
+        batch_size: usize,
+
+        /// Replace all stored embeddings, e.g. after changing model
+        #[arg(long)]
+        rebuild: bool,
+
+        /// Do not build or refresh the hnsw index on the table
+        #[arg(long)]
+        no_index: bool,
     },
 
     /// Show all blocks in a document
@@ -531,11 +624,19 @@ async fn main() -> anyhow::Result<()> {
                 if no_spans {
                     store.set_store_spans(false);
                 }
-                if let Some(tokenizer) = tokenizer {
-                    store
-                        .set_tokenizer(tokenizer.into())
-                        .map_err(|e| anyhow::anyhow!(e))?;
-                }
+                let kind = match tokenizer {
+                    Some(t) => t.into(),
+                    None => {
+                        let detected = mq_db::indexes::detect_tokenizer(&files);
+                        if detected != TokenizerKind::Word {
+                            eprintln!(
+                                "note: CJK text detected, using the {detected:?} tokenizer (override with --tokenizer)"
+                            );
+                        }
+                        detected
+                    }
+                };
+                store.set_tokenizer(kind).map_err(|e| anyhow::anyhow!(e))?;
                 store
             } else {
                 maybe_migrate(&output)?;
@@ -704,10 +805,30 @@ async fn main() -> anyhow::Result<()> {
             db,
             limit,
             format,
+            #[cfg(feature = "embed")]
+            semantic,
+            #[cfg(feature = "embed")]
+            table,
+            #[cfg(feature = "embed")]
+            api,
         } => {
             let store = open_store_for_sql(&db)?;
-            let hits = mq_db::search::find_hits(&store, &query, limit)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            #[cfg(feature = "embed")]
+            let hits = if semantic {
+                // The model is read from the table; this one is only a fallback.
+                mq_db::embed::semantic_hits(
+                    &store,
+                    &api.config(String::new()),
+                    &table,
+                    &query,
+                    limit,
+                )
+            } else {
+                mq_db::search::find_hits(&store, &query, limit)
+            };
+            #[cfg(not(feature = "embed"))]
+            let hits = mq_db::search::find_hits(&store, &query, limit);
+            let hits = hits.map_err(|e| anyhow::anyhow!("{}", e))?;
 
             if hits.is_empty() {
                 println!("(no matches for \"{}\")", query);
@@ -937,6 +1058,45 @@ async fn main() -> anyhow::Result<()> {
             println!("  Pages before   {}", report.pages_before);
             println!("  Pages after    {}", report.pages_after);
             println!("  Reclaimed      {}", format_bytes(reclaimed));
+        }
+
+        // embed
+        #[cfg(feature = "embed")]
+        Commands::Embed {
+            db,
+            api,
+            model,
+            table,
+            batch_size,
+            rebuild,
+            no_index,
+        } => {
+            let store = open_store_for_sql(&db)?;
+            let cfg = mq_db::embed::EmbedConfig {
+                batch_size,
+                rebuild,
+                build_index: !no_index,
+                ..api.config(model)
+            };
+            let report = mq_db::embed::sync_embeddings(&store, &cfg, &table, |done, total| {
+                eprint!("\r  embedded {done}/{total}");
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if report.embedded > 0 {
+                eprintln!();
+            }
+            println!(
+                "{} embedded, {} up to date, {} removed → table '{}'{}",
+                report.embedded,
+                report.up_to_date,
+                report.removed,
+                table,
+                if report.index_built {
+                    ", index rebuilt"
+                } else {
+                    ""
+                }
+            );
         }
 
         // show

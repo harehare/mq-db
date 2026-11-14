@@ -14,16 +14,19 @@ use sqlparser::ast::{
     GroupByExpr, OrderByExpr, OrderByKind, OrderBySort, Select, SelectItem,
 };
 
-fn projection_columns(projection: &[SelectItem], first_row: Option<&Row>) -> Vec<String> {
+/// `known_columns` is the pre-WHERE FROM schema, so a wildcard keeps its
+/// names when WHERE filters out every row.
+fn projection_columns(
+    projection: &[SelectItem],
+    first_row: Option<&Row>,
+    known_columns: &[String],
+) -> Vec<String> {
     if projection.len() == 1 && matches!(projection[0], SelectItem::Wildcard(_)) {
-        return first_row
-            .map(|r| {
-                r.columns
-                    .iter()
-                    .map(|c| c.split('.').next_back().unwrap_or(c).to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let cols: &[String] = first_row.map_or(known_columns, |r| &r.columns);
+        return cols
+            .iter()
+            .map(|c| c.split('.').next_back().unwrap_or(c).to_string())
+            .collect();
     }
     projection
         .iter()
@@ -312,7 +315,7 @@ fn eval_agg_expr_value(
 ) -> Value {
     let substituted = substitute_having_expr(expr, group_by_exprs, key_vals, group_rows);
     let dummy = Row {
-        columns: vec![],
+        columns: vec![].into(),
         values: vec![],
     };
     eval_expr(&substituted, &dummy)
@@ -389,7 +392,7 @@ impl<'a> SqlEngine<'a> {
         }
 
         // Plain SELECT
-        let columns = projection_columns(&select.projection, rows.first());
+        let columns = projection_columns(&select.projection, rows.first(), known_columns);
         let mut result: Vec<(Row, Vec<String>)> = rows
             .into_iter()
             .map(|row| {

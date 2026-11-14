@@ -6,9 +6,8 @@ use super::datetime::{
 use super::fts::{BM25_CORPUS, query_tokenizer};
 use super::pattern::compile_regex;
 use super::value::Value;
-use crate::indexes::tokenize;
+use crate::indexes::{for_each_token, tokenize};
 use mq_lang::{DefaultEngine, parse_markdown_input};
-use rustc_hash::FxHashMap;
 
 pub(super) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
     match name.to_lowercase().as_str() {
@@ -80,12 +79,19 @@ pub(super) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             ) else {
                 return Value::Bool(false);
             };
-            let content_terms: std::collections::HashSet<String> =
-                tokenize(content, query_tokenizer()).into_iter().collect();
             let query_terms = tokenize(query, query_tokenizer());
-            Value::Bool(
-                !query_terms.is_empty() && query_terms.iter().all(|t| content_terms.contains(t)),
-            )
+            if query_terms.is_empty() {
+                return Value::Bool(false);
+            }
+            let mut found = vec![false; query_terms.len()];
+            for_each_token(content, query_tokenizer(), |tok| {
+                for (hit, q) in found.iter_mut().zip(&query_terms) {
+                    if q == tok {
+                        *hit = true;
+                    }
+                }
+            });
+            Value::Bool(found.iter().all(|&h| h))
         }
         "score" => {
             let (Some(content), Some(query)) = (
@@ -94,9 +100,8 @@ pub(super) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             ) else {
                 return Value::Float(0.0);
             };
-            let content_terms = tokenize(content, query_tokenizer());
             let query_terms = tokenize(query, query_tokenizer());
-            if content_terms.is_empty() || query_terms.is_empty() {
+            if query_terms.is_empty() {
                 return Value::Float(0.0);
             }
             // Simple term-frequency score, normalised by content length,
@@ -107,15 +112,21 @@ pub(super) fn eval_scalar_function(name: &str, args: &[Value]) -> Value {
             // constraint on the index side). Good enough to rank matches
             // within a single query; a document that repeats a common word
             // many times can outrank one with a rarer, more specific match.
-            let mut freq: FxHashMap<&str, u32> = FxHashMap::default();
-            for t in &content_terms {
-                *freq.entry(t.as_str()).or_default() += 1;
+            let mut counts = vec![0u32; query_terms.len()];
+            let mut total = 0u32;
+            for_each_token(content, query_tokenizer(), |tok| {
+                total += 1;
+                for (count, q) in counts.iter_mut().zip(&query_terms) {
+                    if q == tok {
+                        *count += 1;
+                    }
+                }
+            });
+            if total == 0 {
+                return Value::Float(0.0);
             }
-            let hits: f64 = query_terms
-                .iter()
-                .map(|q| *freq.get(q.as_str()).unwrap_or(&0) as f64)
-                .sum();
-            Value::Float(hits / content_terms.len() as f64)
+            let hits: f64 = counts.iter().map(|&c| f64::from(c)).sum();
+            Value::Float(hits / f64::from(total))
         }
         "bm25" => {
             let (Some(content), Some(query)) = (

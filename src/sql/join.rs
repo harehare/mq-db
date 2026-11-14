@@ -6,6 +6,8 @@ use super::rows::qualify_row;
 use super::value::{JoinKey, Row, Value, value_join_key};
 use rustc_hash::FxHashMap;
 use sqlparser::ast::Expr;
+use std::cell::RefCell;
+use std::sync::Arc;
 
 pub(super) fn parse_display_value(s: &str) -> Value {
     if let Ok(n) = s.parse::<i64>() {
@@ -23,7 +25,7 @@ pub(super) fn output_to_rows(out: &QueryOutput, prefix: &str) -> Vec<Row> {
         .map(|r| {
             qualify_row(
                 Row {
-                    columns: out.columns.clone(),
+                    columns: out.columns.clone().into(),
                     values: r.iter().map(|v| parse_display_value(v)).collect(),
                 },
                 prefix,
@@ -32,13 +34,36 @@ pub(super) fn output_to_rows(out: &QueryOutput, prefix: &str) -> Vec<Row> {
         .collect()
 }
 
+type Columns = Arc<[String]>;
+
+thread_local! {
+    /// Last `(left, right, combined)` column sets. Join loops combine the same
+    /// pair of column sets for every row, so this saves rebuilding the names.
+    /// It owns the `Arc`s, so a cached pointer can never be reused by a
+    /// different allocation.
+    static LAST_COMBINED: RefCell<Option<(Columns, Columns, Columns)>> = const { RefCell::new(None) };
+}
+
+fn combined_columns(l: &Columns, r: &Columns) -> Columns {
+    LAST_COMBINED.with(|cell| {
+        if let Some((cl, cr, out)) = cell.borrow().as_ref()
+            && Arc::ptr_eq(cl, l)
+            && Arc::ptr_eq(cr, r)
+        {
+            return out.clone();
+        }
+        let out: Columns = l.iter().chain(r.iter()).cloned().collect();
+        *cell.borrow_mut() = Some((l.clone(), r.clone(), out.clone()));
+        out
+    })
+}
+
 pub(super) fn combine_rows(l: &Row, r: &Row) -> Row {
-    let mut cols = l.columns.clone();
-    cols.extend(r.columns.iter().cloned());
-    let mut vals = l.values.clone();
+    let mut vals = Vec::with_capacity(l.values.len() + r.values.len());
+    vals.extend(l.values.iter().cloned());
     vals.extend(r.values.iter().cloned());
     Row {
-        columns: cols,
+        columns: combined_columns(&l.columns, &r.columns),
         values: vals,
     }
 }
@@ -46,12 +71,10 @@ pub(super) fn combine_rows(l: &Row, r: &Row) -> Row {
 /// Extends a left row with NULLs for every right-hand column, for a `LEFT
 /// JOIN` left row that found no matching partner.
 pub(super) fn null_extend_row(l: &Row, right_cols: &[String]) -> Row {
-    let mut cols = l.columns.clone();
-    cols.extend(right_cols.iter().cloned());
     let mut vals = l.values.clone();
     vals.extend(right_cols.iter().map(|_| Value::Null));
     Row {
-        columns: cols,
+        columns: l.columns.iter().chain(right_cols).cloned().collect(),
         values: vals,
     }
 }
