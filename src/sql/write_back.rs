@@ -438,33 +438,52 @@ struct Patch {
 /// All the patches were computed and checked before this runs, so a bad
 /// statement writes nothing. Each file is replaced atomically. If a later
 /// write fails, the files already replaced are put back, so a multi-file
-/// statement is applied to all of its files or to none.
+/// statement is applied to all of its files or to none. Two documents that
+/// resolve to the same file are refused, since their patches would overwrite
+/// each other.
 fn commit_patches(store: &mut DocumentStore, patches: &[Patch]) -> Result<(), MqdbError> {
-    let restore = |patches: &[Patch]| {
-        for p in patches {
-            let _ = source_file::write_atomic(&p.path, &p.original);
+    let mut seen = FxHashSet::default();
+    for p in patches {
+        let target = std::fs::canonicalize(&p.path)?;
+        if !seen.insert(target.clone()) {
+            return Err(MqdbError::SqlExec(format!(
+                "several documents in this statement share the source file {}; edit them in separate statements",
+                target.display()
+            )));
+        }
+    }
+    let restore = |patches: &[Patch]| -> Vec<String> {
+        patches
+            .iter()
+            .filter_map(|p| {
+                source_file::write_atomic(&p.path, &p.original)
+                    .err()
+                    .map(|e| e.to_string())
+            })
+            .collect()
+    };
+    let with_failures = |e: MqdbError, failed: Vec<String>| {
+        if failed.is_empty() {
+            e
+        } else {
+            MqdbError::SqlExec(format!("{e}; could not restore: {}", failed.join("; ")))
         }
     };
     for (written, patch) in patches.iter().enumerate() {
         if let Err(e) = source_file::write_atomic(&patch.path, &patch.patched) {
-            restore(&patches[..written]);
-            return Err(e);
+            // The failing file may already have been replaced (e.g. the
+            // directory sync after the rename failed), so restore it too.
+            let failed = restore(&patches[..=written]);
+            return Err(with_failures(e, failed));
         }
     }
-    for (done, patch) in patches.iter().enumerate() {
-        if let Err(e) =
-            store.replace_document(patch.doc_id, &patch.patched, Some(patch.path.clone()))
-        {
-            restore(patches);
-            for earlier in &patches[..done] {
-                let _ = store.replace_document(
-                    earlier.doc_id,
-                    &earlier.original,
-                    Some(earlier.path.clone()),
-                );
-            }
-            return Err(e);
-        }
+    let items: Vec<_> = patches
+        .iter()
+        .map(|p| (p.doc_id, p.patched.clone(), Some(p.path.clone())))
+        .collect();
+    if let Err(e) = store.replace_documents(&items) {
+        let failed = restore(patches);
+        return Err(with_failures(e, failed));
     }
     Ok(())
 }

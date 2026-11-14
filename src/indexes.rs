@@ -1189,3 +1189,46 @@ mod detect_tokenizer_tests {
         assert_eq!(detect_tokenizer(&[]), TokenizerKind::Word);
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use mq_markdown::Markdown;
+    use proptest::prelude::*;
+
+    fn kind() -> impl Strategy<Value = TokenizerKind> {
+        prop::sample::select(vec![
+            TokenizerKind::Word,
+            TokenizerKind::Bigram,
+            TokenizerKind::Trigram,
+        ])
+    }
+
+    proptest! {
+        /// Serialising a built index and reading it back is lossless.
+        #[test]
+        fn index_bytes_round_trip(
+            parts in prop::collection::vec(
+                prop_oneof!["# [a-z日本 ]{1,8}", "[a-z日本語 ]{1,12}", "- [a-z ]{1,8}", "```rust\n[a-z ]{0,6}\n```"],
+                0..8,
+            ),
+            kind in kind(),
+        ) {
+            let md = Markdown::from_markdown_str(&parts.join("\n\n")).unwrap();
+            let blocks = crate::index::build_blocks(0, &md.nodes);
+            let bytes = DocumentIndex::build(&blocks, kind).to_bytes();
+            let again = DocumentIndex::from_bytes(&bytes).unwrap().to_bytes();
+            prop_assert_eq!(bytes, again);
+        }
+
+        #[test]
+        fn from_bytes_never_panics(data in prop::collection::vec(any::<u8>(), 0..256)) {
+            let _ = DocumentIndex::from_bytes(&data);
+        }
+
+        #[test]
+        fn tokens_are_never_empty_and_tokenize_never_panics(text in "\\PC{0,40}", kind in kind()) {
+            prop_assert!(tokenize(&text, kind).iter().all(|t| !t.is_empty()));
+        }
+    }
+}

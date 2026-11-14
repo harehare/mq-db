@@ -433,3 +433,138 @@ pub fn decode_zone_map(data: &[u8]) -> Result<ZoneMaps, MqdbError> {
         frontmatter,
     })
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_block_type() -> impl Strategy<Value = BlockType> {
+        prop::sample::select(vec![
+            BlockType::Heading,
+            BlockType::Paragraph,
+            BlockType::Code,
+            BlockType::List,
+            BlockType::TableCell,
+            BlockType::TableRow,
+            BlockType::TableAlign,
+            BlockType::Blockquote,
+            BlockType::HorizontalRule,
+            BlockType::Html,
+            BlockType::Yaml,
+            BlockType::Toml,
+            BlockType::Math,
+            BlockType::Definition,
+            BlockType::Footnote,
+        ])
+    }
+
+    fn arb_property_value() -> impl Strategy<Value = PropertyValue> {
+        let leaf = prop_oneof![
+            Just(PropertyValue::Null),
+            any::<String>().prop_map(PropertyValue::String),
+            any::<i64>().prop_map(PropertyValue::Int),
+            any::<f64>()
+                .prop_filter("NaN != NaN", |f| !f.is_nan())
+                .prop_map(PropertyValue::Float),
+            any::<bool>().prop_map(PropertyValue::Bool),
+        ];
+        leaf.prop_recursive(3, 16, 4, |inner| {
+            prop::collection::vec(inner, 0..4).prop_map(PropertyValue::Array)
+        })
+    }
+
+    fn arb_span() -> impl Strategy<Value = Span> {
+        (any::<u32>(), any::<u32>(), any::<u32>(), any::<u32>()).prop_map(|(a, b, c, d)| Span {
+            start_line: a as usize,
+            start_col: b as usize,
+            end_line: c as usize,
+            end_col: d as usize,
+        })
+    }
+
+    fn arb_block() -> impl Strategy<Value = Block> {
+        (
+            (any::<u32>(), any::<u32>(), arb_block_type()),
+            any::<String>(),
+            prop::option::of(arb_span()),
+            (any::<u32>(), any::<u32>()),
+            prop::collection::btree_map("[a-z_]{0,12}", arb_property_value(), 0..5),
+        )
+            .prop_map(
+                |((id, document_id, block_type), content, span, (pre, post), props)| {
+                    let mut properties = Properties::new();
+                    for (k, v) in props {
+                        properties.set(k, v);
+                    }
+                    Block {
+                        id,
+                        document_id,
+                        block_type,
+                        content,
+                        span,
+                        pre,
+                        post,
+                        properties,
+                    }
+                },
+            )
+    }
+
+    proptest! {
+        #[test]
+        fn block_round_trips(block in arb_block()) {
+            let bytes = encode_block(&block);
+            let (decoded, used) = decode_block(&bytes).unwrap();
+            prop_assert_eq!(used, bytes.len());
+            prop_assert_eq!(decoded, block);
+        }
+
+        #[test]
+        fn every_strict_prefix_of_a_block_is_an_error(block in arb_block(), cut in any::<prop::sample::Index>()) {
+            let bytes = encode_block(&block);
+            let n = cut.index(bytes.len());
+            prop_assert!(decode_block(&bytes[..n]).is_err());
+        }
+
+        #[test]
+        fn decoders_never_panic_on_arbitrary_bytes(data in prop::collection::vec(any::<u8>(), 0..256)) {
+            let _ = decode_block(&data);
+            let _ = decode_zone_map(&data);
+            let _ = decode_table_rows(&data, 3, 3);
+        }
+
+        #[test]
+        fn table_rows_round_trip(
+            (cols, rows) in (1usize..5).prop_flat_map(|cols| (
+                Just(cols),
+                prop::collection::vec(prop::collection::vec(any::<String>(), cols), 0..6),
+            ))
+        ) {
+            let bytes = encode_table_rows(&rows);
+            prop_assert_eq!(decode_table_rows(&bytes, rows.len(), cols).unwrap(), rows);
+        }
+
+        #[test]
+        fn zone_map_round_trips(
+            slugs in prop::collection::hash_set("[a-z-]{0,8}", 0..5),
+            langs in prop::collection::hash_set("[a-z]{0,8}", 0..5),
+            title in prop::option::of(any::<String>()),
+            tags in prop::collection::vec("[a-z]{0,6}", 0..5),
+            depth in 0u8..=6,
+            frontmatter in prop::collection::vec(("[a-z]{1,6}", arb_property_value()), 0..4),
+        ) {
+            let zm = ZoneMaps {
+                max_heading_depth: depth,
+                heading_slugs: slugs,
+                code_languages: langs,
+                title,
+                tags,
+                frontmatter,
+                ..Default::default()
+            };
+            let decoded = decode_zone_map(&encode_zone_map(&zm)).unwrap();
+            prop_assert_eq!(decoded, zm);
+        }
+    }
+}

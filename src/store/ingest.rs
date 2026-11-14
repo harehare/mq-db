@@ -140,6 +140,43 @@ impl DocumentStore {
         self.do_replace(doc_id, content, path, true)
     }
 
+    /// Replaces several documents and publishes them with one catalog flush.
+    /// If any replacement or the flush fails, every in-memory entry is put
+    /// back to its original and the catalog on disk still references the
+    /// original page chains (nothing is rewritten to recover).
+    pub(crate) fn replace_documents(
+        &mut self,
+        items: &[(DocumentId, String, Option<PathBuf>)],
+    ) -> Result<(), MqdbError> {
+        let mut saved = Vec::with_capacity(items.len());
+        for (id, _, _) in items {
+            let pos = self
+                .documents
+                .iter()
+                .position(|d| d.id == *id)
+                .ok_or_else(|| MqdbError::Storage(format!("no such document: {id}")))?;
+            saved.push((
+                pos,
+                self.documents[pos].clone(),
+                self.doc_indexes[pos].clone(),
+            ));
+        }
+        let result = items
+            .iter()
+            .zip(&saved)
+            .try_for_each(|((id, content, path), (pos, _, _))| {
+                self.do_replace_at(*pos, *id, content, path.clone(), false)
+            })
+            .and_then(|()| self.flush_catalog_to_storage());
+        if result.is_err() {
+            for (pos, doc, idx) in saved {
+                self.documents[pos] = doc;
+                self.doc_indexes[pos] = idx;
+            }
+        }
+        result
+    }
+
     /// Core of [`replace_document`](Self::replace_document). See
     /// [`do_append`](Self::do_append) for what `flush` controls and why.
     fn do_replace(
@@ -298,5 +335,37 @@ impl DocumentStore {
             return Err(err);
         }
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod replace_documents_tests {
+    use crate::DocumentStore;
+
+    #[test]
+    fn a_failing_batch_leaves_every_document_as_it_was() {
+        let mut store = DocumentStore::new();
+        store.add_str("# One\n").unwrap();
+        store.add_str("# Two\n").unwrap();
+        let before: Vec<_> = store.documents().to_vec();
+        let items = vec![
+            (0, "# Changed\n".to_string(), None),
+            (99, "# Missing\n".to_string(), None),
+        ];
+        assert!(store.replace_documents(&items).is_err());
+        assert_eq!(store.documents(), &before[..]);
+    }
+
+    #[test]
+    fn a_batch_replaces_all_documents() {
+        let mut store = DocumentStore::new();
+        store.add_str("# One\n").unwrap();
+        store.add_str("# Two\n").unwrap();
+        let items = vec![
+            (0, "# A\n".to_string(), None),
+            (1, "# B\n".to_string(), None),
+        ];
+        store.replace_documents(&items).unwrap();
+        assert_ne!(store.documents()[0].blocks, store.documents()[1].blocks);
     }
 }

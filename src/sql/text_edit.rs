@@ -139,6 +139,7 @@ pub(super) fn remove_lines(lines: &mut Vec<String>, start: usize, end: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::strategy::Strategy;
 
     #[test]
     fn byte_offset_counts_utf16_units() {
@@ -255,5 +256,91 @@ mod tests {
         let mut l = lines("only");
         remove_lines(&mut l, 0, 1);
         assert!(l.is_empty());
+    }
+
+    proptest::proptest! {
+        /// A returned offset is always a char boundary within the line, and
+        /// consecutive columns advance by one UTF-16 unit per BMP char.
+        #[test]
+        fn byte_offset_is_always_a_char_boundary(line in "\\PC{0,12}", col in 0usize..40) {
+            if let Some(off) = byte_offset(&line, col) {
+                proptest::prop_assert!(line.is_char_boundary(off));
+                let units: usize = line[..off].chars().map(char::len_utf16).sum();
+                proptest::prop_assert_eq!(units + 1, col);
+            }
+        }
+
+        /// Every column that is a char boundary resolves.
+        #[test]
+        fn byte_offset_finds_every_boundary(line in "\\PC{0,12}") {
+            let mut col = 1;
+            for ch in line.chars() {
+                proptest::prop_assert!(byte_offset(&line, col).is_some());
+                col += ch.len_utf16();
+            }
+            proptest::prop_assert_eq!(byte_offset(&line, col), Some(line.len()));
+        }
+
+        /// Setting a cell keeps the row's shape and every other cell, and the
+        /// new text reads back (after unescaping) as the cell's content.
+        #[test]
+        fn set_table_cell_changes_only_that_cell(
+            cells in proptest::collection::vec("[a-z ]{1,5}", 1..5),
+            text in "[a-z|\\\\ ]{0,8}",
+            pick in 0usize..5,
+        ) {
+            let column = pick % cells.len();
+            let line = format!("| {} |", cells.join(" | "));
+            let out = set_table_cell(&line, column, &text).unwrap();
+            let parts = split_row(&out);
+            proptest::prop_assert_eq!(parts.len(), cells.len() + 2);
+            for (i, c) in cells.iter().enumerate() {
+                if i != column {
+                    proptest::prop_assert_eq!(parts[i + 1].trim(), c.trim());
+                }
+            }
+            let want = escape_cell(&text).unwrap();
+            proptest::prop_assert_eq!(parts[column + 1].trim(), want.trim());
+        }
+
+        /// escape_cell leaves no unescaped pipe.
+        #[test]
+        fn escaped_cells_contain_no_bare_pipe(text in "[a-z|\\\\]{0,10}") {
+            let escaped = escape_cell(&text).unwrap();
+            proptest::prop_assert_eq!(split_row(&escaped).len(), 1);
+        }
+
+        /// From text without blank runs, remove_lines never creates one at the
+        /// seam or leaves a blank at the end.
+        #[test]
+        fn remove_lines_tidies_the_seam(
+            lines in proptest::collection::vec(prop_oneof_line(), 0..10)
+                .prop_filter("no blank runs to begin with", |l| {
+                    l.windows(2).all(|w| !(w[0].trim().is_empty() && w[1].trim().is_empty()))
+                }),
+            a in 0usize..10,
+            b in 0usize..10,
+        ) {
+            let n = lines.len();
+            let (start, end) = (a.min(b).min(n), a.max(b).min(n));
+            let mut out = lines.clone();
+            remove_lines(&mut out, start, end);
+            proptest::prop_assert!(out.len() <= n - (end - start));
+            let blank = |l: &String| l.trim().is_empty();
+            if start < out.len() && start > 0 && end > start {
+                proptest::prop_assert!(!(blank(&out[start]) && blank(&out[start - 1])));
+            }
+            if start >= out.len() && end > start {
+                proptest::prop_assert!(out.last().is_none_or(|l| !blank(l)));
+            }
+        }
+    }
+
+    fn prop_oneof_line() -> impl proptest::strategy::Strategy<Value = String> {
+        proptest::prop_oneof![
+            proptest::strategy::Just(String::new()),
+            proptest::strategy::Just("  ".to_string()),
+            "[a-z]{1,4}",
+        ]
     }
 }

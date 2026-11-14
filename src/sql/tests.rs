@@ -4528,3 +4528,257 @@ fn write_back_over_several_files_is_all_or_nothing() {
         .unwrap();
     assert_eq!(still.rows[0][0], "2");
 }
+
+#[rstest]
+#[case::same_path_twice(false)]
+#[cfg_attr(unix, case::symlink_alias(true))]
+fn write_back_refuses_two_documents_sharing_one_file(#[case] via_symlink: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_md(&dir, "a.md", "# A\n\nBody\n");
+    let second = if via_symlink {
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.md");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            link
+        }
+        #[cfg(not(unix))]
+        unreachable!()
+    } else {
+        path.clone()
+    };
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+    store.add_file(&second).unwrap();
+
+    let err = store
+        .execute_sql_mut(
+            "INSERT INTO blocks (document_id, block_type, content) VALUES \
+             (0, 'paragraph', 'A'), (1, 'paragraph', 'B')",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("share the source file"), "{err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# A\n\nBody\n");
+}
+
+#[test]
+fn write_back_failure_on_second_file_restores_first_file_and_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path_a = write_md(&dir, "a.md", "# A\n\nBodyA\n");
+    let path_b = write_md(&dir, "b.md", "# B\n\nBodyB\n");
+    let mut store = DocumentStore::new();
+    store.add_file(&path_a).unwrap();
+    store.add_file(&path_b).unwrap();
+    // The second document's file disappears after indexing.
+    std::fs::remove_file(&path_b).unwrap();
+
+    let res = store.execute_sql_mut(
+        "INSERT INTO blocks (document_id, block_type, content) VALUES \
+         (0, 'paragraph', 'ExtraA'), (1, 'paragraph', 'ExtraB')",
+    );
+    assert!(res.is_err());
+    assert_eq!(std::fs::read_to_string(&path_a).unwrap(), "# A\n\nBodyA\n");
+    let out = store
+        .execute_sql_mut("SELECT count(*) FROM blocks WHERE content = 'ExtraA'")
+        .unwrap();
+    assert_eq!(out.rows[0][0], "0");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_back_in_an_unreadable_directory_fails_without_changing_the_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let path = sub.join("a.md");
+    std::fs::write(&path, "# A\n\nBody\n").unwrap();
+    let mut store = DocumentStore::new();
+    store.add_file(&path).unwrap();
+
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let res = store.execute_sql_mut("UPDATE blocks SET content = 'New' WHERE content = 'Body'");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if res.is_ok() {
+        return; // root ignores directory modes
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "# A\n\nBody\n");
+}
+
+mod write_back_props {
+    use crate::DocumentStore;
+    use proptest::prelude::*;
+
+    /// A document of distinct paragraphs, headings and list items.
+    fn arb_doc() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(0u8..3, 1..8).prop_map(|kinds| {
+            kinds
+                .iter()
+                .enumerate()
+                .map(|(i, k)| match k {
+                    0 => format!("para{i}x"),
+                    1 => format!("# head{i}x"),
+                    _ => format!("- item{i}x"),
+                })
+                .collect()
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// Updating one block rewrites exactly that block's text in the file,
+        /// whatever the line endings or trailing newline, and the file stays
+        /// in sync with the store (a second edit still works).
+        #[test]
+        fn update_touches_only_the_matched_block(
+            blocks in arb_doc(),
+            pick in any::<prop::sample::Index>(),
+            crlf in any::<bool>(),
+            trailing in any::<bool>(),
+        ) {
+            let eol = if crlf { "\r\n" } else { "\n" };
+            let sep = format!("{eol}{eol}");
+            let mut text = blocks.join(&sep);
+            if trailing { text.push_str(eol); }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            std::fs::write(&path, &text).unwrap();
+            let mut store = DocumentStore::new();
+            store.add_file(&path).unwrap();
+
+            let i = pick.index(blocks.len());
+            let target = &blocks[i];
+            let visible = target.trim_start_matches(['#', '-', ' ']);
+            let (prefix, _) = target.split_at(target.len() - visible.len());
+            let sql = format!("UPDATE blocks SET content = 'NEW' WHERE content = '{visible}'");
+            let out = store.execute_sql_mut(&sql).unwrap();
+            prop_assert_eq!(&out.rows[0][0], "1");
+
+            let mut expected = blocks.clone();
+            expected[i] = format!("{prefix}NEW");
+            let mut want = expected.join(&sep);
+            if trailing { want.push_str(eol); }
+            prop_assert_eq!(std::fs::read_to_string(&path).unwrap(), want);
+
+            let again = store
+                .execute_sql_mut("UPDATE blocks SET content = 'NEWER' WHERE content = 'NEW'")
+                .unwrap();
+            prop_assert_eq!(&again.rows[0][0], "1");
+        }
+
+        /// Several blocks of one document updated in a single statement.
+        #[test]
+        fn multi_block_update_rewrites_each_matched_block(
+            blocks in arb_doc(),
+            mask in prop::collection::vec(any::<bool>(), 8),
+            crlf in any::<bool>(),
+        ) {
+            let eol = if crlf { "\r\n" } else { "\n" };
+            let sep = format!("{eol}{eol}");
+            let text = blocks.join(&sep) + eol;
+            let chosen: Vec<usize> = (0..blocks.len()).filter(|i| mask[*i]).collect();
+            prop_assume!(!chosen.is_empty());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            std::fs::write(&path, &text).unwrap();
+            let mut store = DocumentStore::new();
+            store.add_file(&path).unwrap();
+
+            let mut expected = blocks.clone();
+            let mut visibles = Vec::new();
+            for &i in &chosen {
+                let visible = blocks[i].trim_start_matches(['#', '-', ' ']).to_string();
+                let prefix = &blocks[i][..blocks[i].len() - visible.len()];
+                expected[i] = format!("{prefix}NEW");
+                visibles.push(format!("'{visible}'"));
+            }
+            let sql = format!(
+                "UPDATE blocks SET content = 'NEW' WHERE content IN ({})",
+                visibles.join(", ")
+            );
+            let out = store.execute_sql_mut(&sql).unwrap();
+            prop_assert_eq!(out.rows[0][0].clone(), chosen.len().to_string());
+            prop_assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                expected.join(&sep) + eol
+            );
+        }
+
+        /// Deleting a paragraph leaves the other blocks as they were.
+        #[test]
+        fn delete_removes_only_the_paragraph(
+            blocks in arb_doc(),
+            pick in any::<prop::sample::Index>(),
+            crlf in any::<bool>(),
+            trailing in any::<bool>(),
+        ) {
+            let i = pick.index(blocks.len());
+            prop_assume!(blocks[i].starts_with("para"));
+            let eol = if crlf { "\r\n" } else { "\n" };
+            let sep = format!("{eol}{eol}");
+            let mut text = blocks.join(&sep);
+            if trailing { text.push_str(eol); }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            std::fs::write(&path, &text).unwrap();
+            let mut store = DocumentStore::new();
+            store.add_file(&path).unwrap();
+
+            let sql = format!("DELETE FROM blocks WHERE content = '{}'", blocks[i]);
+            store.execute_sql_mut(&sql).unwrap();
+
+            let rest: Vec<&String> = blocks.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, b)| b).collect();
+            let mut want = rest.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(&sep);
+            if trailing && !rest.is_empty() { want.push_str(eol); }
+            prop_assert_eq!(std::fs::read_to_string(&path).unwrap(), want);
+        }
+
+        /// A paragraph inserted without an anchor lands at the end.
+        #[test]
+        fn insert_appends_a_paragraph(
+            blocks in arb_doc(),
+            crlf in any::<bool>(),
+            trailing in any::<bool>(),
+        ) {
+            // A one-line file with no line break has no line ending to keep.
+            prop_assume!(!(crlf && !trailing && blocks.len() == 1));
+            let eol = if crlf { "\r\n" } else { "\n" };
+            let sep = format!("{eol}{eol}");
+            let mut text = blocks.join(&sep);
+            if trailing { text.push_str(eol); }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            std::fs::write(&path, &text).unwrap();
+            let mut store = DocumentStore::new();
+            store.add_file(&path).unwrap();
+
+            store
+                .execute_sql_mut(
+                    "INSERT INTO blocks (document_id, block_type, content) VALUES (0, 'paragraph', 'inserted')",
+                )
+                .unwrap();
+            let mut want = format!("{}{sep}inserted", blocks.join(&sep));
+            if trailing { want.push_str(eol); }
+            prop_assert_eq!(std::fs::read_to_string(&path).unwrap(), want);
+        }
+
+        /// A file edited behind the store's back is never written over.
+        #[test]
+        fn stale_files_are_refused(blocks in arb_doc(), extra in "[a-z]{1,6}") {
+            let text = blocks.join("\n\n") + "\n";
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.md");
+            std::fs::write(&path, &text).unwrap();
+            let mut store = DocumentStore::new();
+            store.add_file(&path).unwrap();
+            let changed = format!("{extra}zz\n\n{text}");
+            std::fs::write(&path, &changed).unwrap();
+            let visible = blocks[0].trim_start_matches(['#', '-', ' ']).to_string();
+            let sql = format!("UPDATE blocks SET content = 'NEW' WHERE content = '{visible}'");
+            prop_assert!(store.execute_sql_mut(&sql).is_err());
+            prop_assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+        }
+    }
+}

@@ -46,7 +46,7 @@ impl SourceLines {
             .iter()
             .map(|l| {
                 if self.crlf {
-                    l.replace('\n', "\r\n")
+                    l.replace("\r\n", "\n").replace('\n', "\r\n")
                 } else {
                     l.clone()
                 }
@@ -107,10 +107,15 @@ pub(super) fn write_atomic(path: &Path, contents: &str) -> Result<(), MqdbError>
     let tmp = dir.join(format!(".{name}.mq-db-{}.tmp", std::process::id()));
 
     let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Owner-only from creation; the original's mode is applied before the rename.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp)?;
+        // Open the directory first so a failure here happens before the rename.
+        #[cfg(unix)]
+        let dir_handle = std::fs::File::open(dir)?;
         file.write_all(contents.as_bytes())?;
         file.set_permissions(permissions)?;
         file.sync_all()?;
@@ -118,7 +123,7 @@ pub(super) fn write_atomic(path: &Path, contents: &str) -> Result<(), MqdbError>
         std::fs::rename(&tmp, &target)?;
         // Make the rename itself durable.
         #[cfg(unix)]
-        std::fs::File::open(dir)?.sync_all()?;
+        dir_handle.sync_all()?;
         Ok(())
     })();
     if let Err(e) = result {
@@ -156,6 +161,13 @@ mod tests {
         let mut parsed = SourceLines::parse("a\r\nb\r\n").unwrap();
         parsed.lines.insert(1, "```\ncode\n```".to_string());
         assert_eq!(parsed.join(), "a\r\n```\r\ncode\r\n```\r\nb\r\n");
+    }
+
+    #[test]
+    fn crlf_in_replacement_text_is_not_doubled() {
+        let mut parsed = SourceLines::parse("a\r\nb\r\n").unwrap();
+        parsed.lines[0] = "x\r\ny".to_string();
+        assert_eq!(parsed.join(), "x\r\ny\r\nb\r\n");
     }
 
     #[test]
@@ -238,5 +250,92 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
         let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(leftovers, 1, "no temp file is left behind");
+    }
+
+    #[rstest::rstest]
+    #[case::lf("a\nb\n", "x\ny")]
+    #[case::crlf("a\r\nb\r\n", "x\r\ny")]
+    #[case::crlf_replacing_lf("a\r\nb", "x\ny")]
+    #[case::lf_file_crlf_text("a\nb", "x\r\ny")]
+    fn replacement_text_never_gets_doubled_carriage_returns(
+        #[case] file: &str,
+        #[case] replacement: &str,
+    ) {
+        let mut parsed = SourceLines::parse(file).unwrap();
+        parsed.lines[0] = replacement.to_string();
+        let joined = parsed.join();
+        assert!(!joined.contains("\r\r"), "{joined:?}");
+        if file.contains("\r\n") {
+            assert_eq!(joined.matches('\n').count(), joined.matches("\r\n").count());
+        }
+    }
+
+    proptest::proptest! {
+        /// Any text with consistent line endings survives parse + join.
+        #[test]
+        fn consistent_texts_round_trip(
+            lines in proptest::collection::vec("[a-z ]{0,6}", 0..8),
+            crlf in proptest::bool::ANY,
+            trailing in proptest::bool::ANY,
+        ) {
+            let eol = if crlf { "\r\n" } else { "\n" };
+            let mut text = lines.join(eol);
+            if trailing && !lines.is_empty() {
+                text.push_str(eol);
+            }
+            let parsed = SourceLines::parse(&text).unwrap();
+            proptest::prop_assert_eq!(parsed.join(), text);
+        }
+
+        /// Replacement text, whatever its endings, never yields `\r\r`, or a bare `\n` in a CRLF file.
+        #[test]
+        fn replacements_keep_the_files_line_endings(
+            replacement in "[a-z]{0,3}(\n|\r\n)?[a-z]{0,3}(\n|\r\n)?[a-z]{0,3}",
+            crlf in proptest::bool::ANY,
+        ) {
+            let file = if crlf { "a\r\nb\r\n" } else { "a\nb\n" };
+            let mut parsed = SourceLines::parse(file).unwrap();
+            parsed.lines[0] = replacement;
+            let joined = parsed.join();
+            proptest::prop_assert!(!joined.contains("\r\r"));
+            if crlf {
+                proptest::prop_assert_eq!(joined.matches('\n').count(), joined.matches("\r\n").count());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_never_leaves_a_group_or_world_readable_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (stop, dir) = (stop.clone(), dir.path().to_path_buf());
+            std::thread::spawn(move || {
+                let mut leaked = false;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                        if e.file_name().to_string_lossy().ends_with(".tmp")
+                            && let Ok(m) = e.metadata()
+                        {
+                            leaked |= m.permissions().mode() & 0o077 != 0;
+                        }
+                    }
+                }
+                leaked
+            })
+        };
+        for i in 0..200 {
+            write_atomic(&path, &format!("new {i}")).unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !watcher.join().unwrap(),
+            "temp file was group/world accessible"
+        );
     }
 }
