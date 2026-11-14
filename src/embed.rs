@@ -243,6 +243,14 @@ pub fn sync_embeddings(
         Ok(())
     };
 
+    // Vectors of different lengths cannot share an index or be compared.
+    let mut dims = engine
+        .execute(&format!("SELECT embedding FROM {table} LIMIT 1"))?
+        .rows
+        .first()
+        .and_then(|r| crate::vector::parse_vector_text(&r[0]))
+        .map(|v| v.len());
+
     let mut failure = None;
     for chunk in todo.chunks(cfg.batch_size) {
         let texts: Vec<String> = chunk.iter().map(|r| r[1].clone()).collect();
@@ -253,6 +261,19 @@ pub fn sync_embeddings(
                 break;
             }
         };
+        if dims.is_none() {
+            dims = vectors.first().map(Vec::len);
+        }
+        if let Some(want) = dims
+            && let Some(bad) = vectors.iter().find(|v| v.len() != want)
+        {
+            failure = Some(MqdbError::Embed(format!(
+                "the model returned {} dimensions but table '{table}' holds {want}; \
+                 use --rebuild to replace them or pass --dimensions {want}",
+                bad.len()
+            )));
+            break;
+        }
         for (row, v) in chunk.iter().zip(&vectors) {
             let tuple = format!(
                 "({}, {}, {})",
@@ -353,16 +374,31 @@ pub fn semantic_hits(
         )));
     }
 
-    let out = engine.execute(&format!(
-        "SELECT d.path, b.block_type, b.content, v.score \
-         FROM vector_search('{table}', 'embedding', {}, {limit}) v \
-         JOIN blocks b ON b.content_hash = v.content_hash \
-         JOIN documents d ON d.id = b.document_id \
-         ORDER BY v.score DESC, d.path ASC LIMIT {limit}",
-        sql_quote(&vector_json(&vector))
-    ))?;
-    Ok(out
-        .rows
+    // One embedding row serves every block with the same content, so `limit`
+    // embeddings can join to fewer than `limit` blocks. Widen the candidate
+    // set until enough blocks come back or every embedding has been tried.
+    let total = engine
+        .execute(&format!("SELECT count(*) FROM {table}"))?
+        .rows[0][0]
+        .parse::<usize>()
+        .unwrap_or(0);
+    let max_k = total.clamp(1, 100_000);
+    let mut k = limit.clamp(1, max_k);
+    let rows = loop {
+        let out = engine.execute(&format!(
+            "SELECT d.path, b.block_type, b.content, v.score \
+             FROM vector_search('{table}', 'embedding', {}, {k}) v \
+             JOIN blocks b ON b.content_hash = v.content_hash \
+             JOIN documents d ON d.id = b.document_id \
+             ORDER BY v.score DESC, d.path ASC LIMIT {limit}",
+            sql_quote(&vector_json(&vector))
+        ))?;
+        if out.rows.len() >= limit || k >= max_k {
+            break out.rows;
+        }
+        k = k.saturating_mul(4).min(max_k);
+    };
+    Ok(rows
         .into_iter()
         .filter_map(|row| {
             let [path, block_type, content, score] = <[String; 4]>::try_from(row).ok()?;
@@ -653,6 +689,53 @@ mod tests {
             "test-model",
             "the query is embedded with the model the table was built with"
         );
+    }
+
+    #[test]
+    fn sync_rejects_vectors_of_another_dimension_than_the_table_holds() {
+        let (endpoint, _) = mock_server();
+        let mut store = store_with(&["# T\n\nbody\n"]);
+        let c = cfg(endpoint);
+        sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        // The mock returns 3-D vectors; pretend the table was built with 2-D.
+        SqlEngine::new(&store)
+            .unwrap()
+            .execute("UPDATE emb SET embedding = '[1, 0]'")
+            .unwrap();
+        store.add_str("# U\n\nanother block\n").unwrap();
+
+        let err = sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("--rebuild"), "{err}");
+        let rows = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SELECT count(*) FROM emb WHERE embedding = '[1, 0]'")
+            .unwrap();
+        let all = SqlEngine::new(&store)
+            .unwrap()
+            .execute("SELECT count(*) FROM emb")
+            .unwrap();
+        assert_eq!(rows.rows, all.rows, "nothing incompatible was stored");
+
+        let mut rebuild = c;
+        rebuild.rebuild = true;
+        sync_embeddings(&store, &rebuild, "emb", |_, _| {}).unwrap();
+    }
+
+    #[test]
+    fn semantic_hits_fill_the_limit_despite_duplicate_blocks() {
+        let (endpoint, _) = mock_server();
+        // The mock embeds a text as [length, 0.5, -1]; "aaaaa" appears three
+        // times and shares one embedding row.
+        let store = store_with(&[
+            "# a\n\naaaaa\n",
+            "# b\n\naaaaa\n",
+            "# c\n\naaaaa\n\nbbbbbbbbbbbb\n",
+        ]);
+        let c = cfg(endpoint);
+        sync_embeddings(&store, &c, "emb", |_, _| {}).unwrap();
+        let hits = semantic_hits(&store, &c, "emb", "aaaaa", 4).unwrap();
+        assert_eq!(hits.len(), 4, "{hits:?}");
+        assert!(hits.iter().any(|h| h.content == "bbbbbbbbbbbb"));
     }
 
     #[test]

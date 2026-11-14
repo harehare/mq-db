@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::storage::catalog::VectorIndexEntry;
-use crate::vector::{HnswIndex, HnswParams, parse_vector_text};
+use crate::vector::{HnswIndex, HnswParams, normalized, parse_vector_text};
 use std::sync::Arc;
 
 /// One named index. `index` is `None` until first used when the store was
@@ -153,6 +153,11 @@ impl DocumentStore {
                 skipped += 1;
                 continue;
             };
+            // Only a vector with a direction can fix the dimension.
+            if index.is_none() && normalized(&vec).is_none() {
+                skipped += 1;
+                continue;
+            }
             let idx = index.get_or_insert_with(|| HnswIndex::new(vec.len(), params));
             if !idx.insert(row_no as u32, &vec) {
                 skipped += 1;
@@ -250,6 +255,20 @@ impl DocumentStore {
     /// Removes the index `name`. Returns whether it existed.
     pub(crate) fn drop_vector_index(&self, name: &str) -> bool {
         self.vector_indexes.write().unwrap().remove(name).is_some()
+    }
+
+    /// Removes the indexes called `names` and returns them, so a failed
+    /// catalog flush can put them back.
+    pub(crate) fn take_vector_indexes(&self, names: &[String]) -> Vec<(String, VectorIndexState)> {
+        let mut guard = self.vector_indexes.write().unwrap();
+        names
+            .iter()
+            .filter_map(|n| guard.remove(n).map(|s| (n.clone(), s)))
+            .collect()
+    }
+
+    pub(crate) fn restore_vector_indexes(&self, removed: Vec<(String, VectorIndexState)>) {
+        self.vector_indexes.write().unwrap().extend(removed);
     }
 
     /// Removes every index on `table` (its rows changed or it was dropped).
@@ -431,6 +450,19 @@ mod tests {
             s.build_vector_index("nope", "v", HnswParams::default())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn an_empty_or_zero_first_vector_does_not_fix_the_dimension() {
+        let (_dir, _path, s) = store_with_table(0);
+        SqlEngine::new(&s)
+            .unwrap()
+            .execute("INSERT INTO emb VALUES ('e', '[]'), ('z', '[0,0]'), ('v', '[1,0]')")
+            .unwrap();
+        let (index, skipped, _) = s
+            .build_vector_index("emb", "v", HnswParams::default())
+            .unwrap();
+        assert_eq!((index.len(), index.dim(), skipped), (1, 2, 2));
     }
 
     #[test]

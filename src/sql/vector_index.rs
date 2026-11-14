@@ -148,12 +148,13 @@ impl SqlEngine<'_> {
         {
             return Err(err(format!("index '{missing}' does not exist")));
         }
-        let dropped = names
-            .iter()
-            .filter(|n| self.store.drop_vector_index(n))
-            .count();
+        let removed = self.store.take_vector_indexes(&names);
+        let dropped = removed.len();
         if dropped > 0 {
-            self.store.flush_catalog_to_storage()?;
+            if let Err(e) = self.store.flush_catalog_to_storage() {
+                self.store.restore_vector_indexes(removed);
+                return Err(e);
+            }
             self.store.note_catalog_mutation(self.session_id);
         }
         Ok(QueryOutput {
@@ -216,10 +217,26 @@ impl SqlEngine<'_> {
             ));
         }
 
+        // Loading an index takes the storage lock, which `INSERT` holds while
+        // waiting for the table lock, so do it before taking the table lock.
+        let index = match self.store.find_vector_index(&table, &column) {
+            Some(name) => self.store.get_vector_index(&name)?,
+            None => None,
+        };
+
         let tables = self.store.custom_tables.read().unwrap();
         let state = tables
             .get(&table)
             .ok_or_else(|| err(format!("vector_search: unknown table '{table}'")))?;
+        if state
+            .columns
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("score"))
+        {
+            return Err(err(format!(
+                "vector_search: table '{table}' has a column named 'score', which would hide the similarity score"
+            )));
+        }
         let col = state
             .columns
             .iter()
@@ -230,18 +247,15 @@ impl SqlEngine<'_> {
                 ))
             })?;
 
-        let hits: Vec<(usize, f32)> = match self.store.find_vector_index(&table, &column) {
-            Some(name) => match self.store.get_vector_index(&name)? {
-                Some(index) if index.dim() == query.len() => index
-                    .search(&query, k, ef)
-                    .into_iter()
-                    .map(|(row, score)| (row as usize, score))
-                    .filter(|(row, _)| *row < state.rows.len())
-                    .collect(),
-                // A query of another length can never match this index.
-                Some(_) => Vec::new(),
-                None => exact_search(&state.rows, col, &query, k),
-            },
+        let hits: Vec<(usize, f32)> = match index {
+            Some(index) if index.dim() == query.len() => index
+                .search(&query, k, ef)
+                .into_iter()
+                .map(|(row, score)| (row as usize, score))
+                .filter(|(row, _)| *row < state.rows.len())
+                .collect(),
+            // A query of another length can never match this index.
+            Some(_) => Vec::new(),
             None => exact_search(&state.rows, col, &query, k),
         };
 
@@ -695,6 +709,33 @@ mod tests {
             vec!["33"],
             "still searchable, now exactly"
         );
+    }
+
+    #[test]
+    fn a_table_with_a_score_column_is_rejected() {
+        let store = DocumentStore::new();
+        let e = SqlEngine::new(&store).unwrap();
+        e.execute("CREATE TABLE s (id TEXT, v TEXT, score TEXT)")
+            .unwrap();
+        e.execute("INSERT INTO s VALUES ('a', '[1,0]', '0')")
+            .unwrap();
+        let err = e
+            .execute("SELECT * FROM vector_search('s', 'v', '[1,0]', 1)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("column named 'score'"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_drop_index_keeps_the_index() {
+        let store = store_with_vectors(10);
+        let e = SqlEngine::new(&store).unwrap();
+        e.execute("CREATE INDEX emb_hnsw ON emb USING hnsw (v)")
+            .unwrap();
+        let removed = store.take_vector_indexes(&["emb_hnsw".to_string()]);
+        assert!(indexes(&e).is_empty());
+        store.restore_vector_indexes(removed);
+        assert_eq!(indexes(&e).len(), 1);
     }
 
     #[test]
