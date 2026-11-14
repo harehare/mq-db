@@ -164,11 +164,11 @@ impl SqlEngine<'_> {
                 state.last_row_page,
             );
             state.rows = new_rows;
+            // Dropped under the write lock so a search never pairs a
+            // surviving index with the changed rows.
+            self.store.drop_vector_indexes_for_table(table);
             previous
         }; // write lock released before flush
-        // Vector indexes describe the old rows; drop them before the flush
-        // so the catalog never pairs them with the changed table.
-        self.store.drop_vector_indexes_for_table(table);
         if let Err(err) = self.store.append_table_rows_to_storage(table, &[]) {
             let mut guard = self.store.custom_tables.write().unwrap();
             if let Some(state) = guard.get_mut(table) {

@@ -119,6 +119,24 @@ impl DocumentStore {
             .min()
     }
 
+    /// Whether `index` is still the one registered as `name` and describes
+    /// exactly `rows` rows. Call with the table's lock held.
+    pub(crate) fn vector_index_matches(
+        &self,
+        name: &str,
+        index: &Arc<HnswIndex>,
+        rows: usize,
+    ) -> bool {
+        self.vector_indexes
+            .read()
+            .unwrap()
+            .get(name)
+            .is_some_and(|s| {
+                s.table_rows as usize == rows
+                    && s.index.as_ref().is_some_and(|i| Arc::ptr_eq(i, index))
+            })
+    }
+
     /// Whether an index called `name` exists, stale or not.
     pub(crate) fn has_vector_index(&self, name: &str) -> bool {
         self.vector_indexes.read().unwrap().contains_key(name)

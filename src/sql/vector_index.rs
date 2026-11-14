@@ -220,7 +220,7 @@ impl SqlEngine<'_> {
         // Loading an index takes the storage lock, which `INSERT` holds while
         // waiting for the table lock, so do it before taking the table lock.
         let index = match self.store.find_vector_index(&table, &column) {
-            Some(name) => self.store.get_vector_index(&name)?,
+            Some(name) => self.store.get_vector_index(&name)?.map(|i| (name, i)),
             None => None,
         };
 
@@ -246,6 +246,15 @@ impl SqlEngine<'_> {
                     "vector_search: table '{table}' has no column '{column}'"
                 ))
             })?;
+
+        // A writer may have changed the table since the index was picked;
+        // writers drop indexes under the table's write lock, so this holds
+        // for as long as we keep the read lock.
+        let index = index.and_then(|(name, index)| {
+            self.store
+                .vector_index_matches(&name, &index, state.rows.len())
+                .then_some(index)
+        });
 
         let hits: Vec<(usize, f32)> = match index {
             Some(index) if index.dim() == query.len() => index
@@ -609,6 +618,21 @@ mod tests {
             .execute("SELECT id FROM vector_search('emb', 'v', '[-0.5, 0.7, 0.2]', 1)")
             .unwrap();
         assert_eq!(hit.rows[0][0], "newer");
+    }
+
+    #[test]
+    fn a_captured_index_is_rejected_once_an_update_changed_the_rows() {
+        let store = store_with_vectors(60);
+        let e = SqlEngine::new(&store).unwrap();
+        e.execute("CREATE INDEX emb_hnsw ON emb USING hnsw (v)")
+            .unwrap();
+        let captured = store.get_vector_index("emb_hnsw").unwrap().unwrap();
+        assert!(store.vector_index_matches("emb_hnsw", &captured, 60));
+
+        // Same row count, so only the identity check can catch this.
+        e.execute("UPDATE emb SET v = '[0, 0, 1]' WHERE id = '1'")
+            .unwrap();
+        assert!(!store.vector_index_matches("emb_hnsw", &captured, 60));
     }
 
     #[test]
