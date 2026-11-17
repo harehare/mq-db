@@ -21,8 +21,8 @@ use crate::MqdbError;
 use crate::indexes::IndexHint;
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SetExpr,
-    SetOperator, SetQuantifier, Value as SqlValue, Values,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, Query, Select,
+    SetExpr, SetOperator, SetQuantifier, Value as SqlValue, Values,
 };
 
 const MAX_RECURSIVE_CTE_ITERATIONS: usize = 10_000;
@@ -401,17 +401,20 @@ impl<'a> SqlEngine<'a> {
             Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(
                 self.resolve_subqueries(inner, outer_row)?,
             ))),
-            Expr::InList {
+            Expr::In {
                 expr: e,
-                list,
+                target: InTarget::List(list),
                 negated,
-            } => Ok(Expr::InList {
+                global,
+            } => Ok(Expr::In {
                 expr: Box::new(self.resolve_subqueries(e, outer_row)?),
-                list: list
-                    .iter()
-                    .map(|x| self.resolve_subqueries(x, outer_row))
-                    .collect::<Result<_, _>>()?,
+                target: InTarget::List(
+                    list.iter()
+                        .map(|x| self.resolve_subqueries(x, outer_row))
+                        .collect::<Result<_, _>>()?,
+                ),
                 negated: *negated,
+                global: *global,
             }),
             Expr::Between {
                 expr: e,
@@ -441,10 +444,11 @@ impl<'a> SqlEngine<'a> {
                     .unwrap_or(Expr::Value(SqlValue::Null.with_empty_span()));
                 Ok(val)
             }
-            Expr::InSubquery {
+            Expr::In {
                 expr: e,
-                subquery,
+                target: InTarget::Subquery(subquery),
                 negated,
+                global,
             } => {
                 let q = self.correlate_subquery(subquery, outer_row);
                 let out = self.exec_query(&q)?;
@@ -466,10 +470,11 @@ impl<'a> SqlEngine<'a> {
                             ));
                         }
                     }
-                    return Ok(Expr::InList {
+                    return Ok(Expr::In {
                         expr: Box::new(needle_expr),
-                        list,
+                        target: InTarget::List(list),
                         negated: *negated,
+                        global: *global,
                     });
                 };
                 let needle_val = eval_expr(&needle_expr, row);

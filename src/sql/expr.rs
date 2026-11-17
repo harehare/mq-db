@@ -10,7 +10,7 @@ use super::scalar::eval_scalar_function;
 use super::value::{Row, Value};
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CeilFloorKind, DateTimeField, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, TrimWhereField, UnaryOperator, Value as SqlValue,
+    FunctionArgExpr, FunctionArguments, InTarget, TrimWhereField, UnaryOperator, Value as SqlValue,
 };
 
 pub(super) fn eval_expr(expr: &Expr, row: &Row) -> Value {
@@ -42,10 +42,11 @@ pub(super) fn eval_expr(expr: &Expr, row: &Row) -> Value {
         },
         Expr::IsNull(inner) => Value::Bool(matches!(eval_expr(inner, row), Value::Null)),
         Expr::IsNotNull(inner) => Value::Bool(!matches!(eval_expr(inner, row), Value::Null)),
-        Expr::InList {
+        Expr::In {
             expr,
-            list,
+            target: InTarget::List(list),
             negated,
+            ..
         } => {
             let val = eval_expr(expr, row);
             let found = list.iter().any(|e| eval_expr(e, row) == val);

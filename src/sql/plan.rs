@@ -9,7 +9,7 @@ use crate::document::ZoneMaps;
 use crate::indexes::{IndexHint, tokenize};
 use rustc_hash::FxHashMap;
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, TableFactor,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, TableFactor,
     TableWithJoins, Value as SqlValue,
 };
 
@@ -237,10 +237,11 @@ fn hint_for_conjunct(expr: &Expr) -> IndexHint {
             }
         }
         // block_type IN ('heading', 'code')
-        Expr::InList {
+        Expr::In {
             expr,
-            list,
+            target: InTarget::List(list),
             negated: false,
+            ..
         } => {
             if expr_col_name(expr).as_deref() == Some("block_type") {
                 let types: Vec<BlockType> = list
