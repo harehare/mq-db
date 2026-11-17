@@ -4,8 +4,8 @@ use super::analysis::{select_own_aliases, value_to_expr};
 use super::expr::eval_expr;
 use super::value::Row;
 use sqlparser::ast::{
-    CaseWhen, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Query, SelectItem,
-    SetExpr,
+    CaseWhen, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, Query,
+    SelectItem, SetExpr,
 };
 
 /// Replaces any `<alias>.<column>` reference in `expr` with its literal
@@ -59,17 +59,20 @@ fn substitute_outer_refs(expr: &Expr, outer_row: &Row, own_aliases: &[String]) -
             outer_row,
             own_aliases,
         ))),
-        Expr::InList {
+        Expr::In {
             expr,
-            list,
+            target: InTarget::List(list),
             negated,
-        } => Expr::InList {
+            global,
+        } => Expr::In {
             expr: Box::new(substitute_outer_refs(expr, outer_row, own_aliases)),
-            list: list
-                .iter()
-                .map(|e| substitute_outer_refs(e, outer_row, own_aliases))
-                .collect(),
+            target: InTarget::List(
+                list.iter()
+                    .map(|e| substitute_outer_refs(e, outer_row, own_aliases))
+                    .collect(),
+            ),
             negated: *negated,
+            global: *global,
         },
         Expr::Between {
             expr,
@@ -218,9 +221,11 @@ fn is_constant_expr(expr: &Expr) -> bool {
         Expr::Between {
             expr, low, high, ..
         } => is_constant_expr(expr) && is_constant_expr(low) && is_constant_expr(high),
-        Expr::InList { expr, list, .. } => {
-            is_constant_expr(expr) && list.iter().all(is_constant_expr)
-        }
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            ..
+        } => is_constant_expr(expr) && list.iter().all(is_constant_expr),
         _ => false,
     }
 }
@@ -250,14 +255,16 @@ pub(super) fn fold_constants(expr: &Expr) -> Expr {
             low: Box::new(fold_constants(low)),
             high: Box::new(fold_constants(high)),
         },
-        Expr::InList {
+        Expr::In {
             expr,
-            list,
+            target: InTarget::List(list),
             negated,
-        } => Expr::InList {
+            global,
+        } => Expr::In {
             expr: Box::new(fold_constants(expr)),
-            list: list.iter().map(fold_constants).collect(),
+            target: InTarget::List(list.iter().map(fold_constants).collect()),
             negated: *negated,
+            global: *global,
         },
         other => other.clone(),
     };

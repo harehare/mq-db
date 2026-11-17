@@ -4,8 +4,8 @@ use super::rows::ident_value;
 use super::value::Value;
 use crate::MqdbError;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, Select, SelectItem, TableFactor,
-    Value as SqlValue,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, Query, Select, SelectItem,
+    TableFactor, Value as SqlValue,
 };
 
 pub(super) fn value_to_expr(v: &Value) -> Expr {
@@ -61,7 +61,11 @@ pub(super) fn collect_column_names(expr: &Expr, out: &mut Vec<String>) {
         | Expr::Ceil { expr, .. }
         | Expr::Floor { expr, .. }
         | Expr::Extract { expr, .. } => collect_column_names(expr, out),
-        Expr::InList { expr, list, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            ..
+        } => {
             collect_column_names(expr, out);
             for e in list {
                 collect_column_names(e, out);
@@ -175,16 +179,23 @@ pub(super) fn validate_projection_columns(
 /// handling so ordinary predicates keep the fast once-only resolution.
 pub(super) fn expr_has_subquery(expr: &Expr) -> bool {
     match expr {
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+        Expr::Subquery(_)
+        | Expr::In {
+            target: InTarget::Subquery(_),
+            ..
+        }
+        | Expr::Exists { .. } => true,
         Expr::BinaryOp { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
         | Expr::Nested(expr)
         | Expr::Cast { expr, .. } => expr_has_subquery(expr),
-        Expr::InList { expr, list, .. } => {
-            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
-        }
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            ..
+        } => expr_has_subquery(expr) || list.iter().any(expr_has_subquery),
         Expr::Between {
             expr, low, high, ..
         } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
@@ -201,7 +212,11 @@ pub(super) fn expr_has_subquery(expr: &Expr) -> bool {
 pub(super) fn collect_subqueries<'e>(expr: &'e Expr, out: &mut Vec<&'e Query>) {
     match expr {
         Expr::Subquery(q) => out.push(q),
-        Expr::InSubquery { expr, subquery, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::Subquery(subquery),
+            ..
+        } => {
             collect_subqueries(expr, out);
             out.push(subquery);
         }
@@ -215,7 +230,11 @@ pub(super) fn collect_subqueries<'e>(expr: &'e Expr, out: &mut Vec<&'e Query>) {
         | Expr::IsNotNull(expr)
         | Expr::Nested(expr)
         | Expr::Cast { expr, .. } => collect_subqueries(expr, out),
-        Expr::InList { expr, list, .. } => {
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            ..
+        } => {
             collect_subqueries(expr, out);
             list.iter().for_each(|e| collect_subqueries(e, out));
         }
