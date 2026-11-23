@@ -5,8 +5,10 @@ use super::value::Value;
 use crate::MqdbError;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, FunctionArguments, InTarget, Query, Select, SelectItem,
-    TableFactor, Value as SqlValue,
+    SetExpr, Statement, TableFactor, Value as SqlValue,
 };
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 
 pub(super) fn value_to_expr(v: &Value) -> Expr {
     match v {
@@ -278,4 +280,39 @@ pub(super) fn select_own_aliases(select: &Select) -> Vec<String> {
         }
     }
     names
+}
+
+/// Whether running `sql` needs block data loaded. `false` only for a plain
+/// `SELECT` that reads `documents` (or no table) with no CTE, join or subquery;
+/// anything unrecognised or unparsable gives `true`, the safe default.
+pub fn statement_needs_blocks(sql: &str) -> bool {
+    let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, sql) else {
+        return true;
+    };
+    let [Statement::Query(q)] = stmts.as_slice() else {
+        return true;
+    };
+    let SetExpr::Select(select) = q.body.as_ref() else {
+        return true;
+    };
+    if q.with.is_some() || select.from.len() > 1 {
+        return true;
+    }
+    if let Some(twj) = select.from.first() {
+        let is_documents = matches!(
+            &twj.relation,
+            TableFactor::Table { name, args: None, .. }
+                if name.to_string().eq_ignore_ascii_case("documents")
+        );
+        if !twj.joins.is_empty() || !is_documents {
+            return true;
+        }
+    }
+    // A second `select` keyword means a subquery, which may read another table.
+    q.to_string()
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| *w == "select")
+        .count()
+        > 1
 }

@@ -83,6 +83,7 @@ mod value;
 mod vector_index;
 mod write_back;
 
+pub use analysis::statement_needs_blocks;
 pub use engine::SqlEngine;
 pub use output::{QueryOutput, html_escape};
 pub use value::Value;

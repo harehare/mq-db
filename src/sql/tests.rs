@@ -3131,6 +3131,46 @@ fn test_sql_json_extract(#[case] json: &str, #[case] path: &str, #[case] expecte
     assert_eq!(out.rows[0][0], expected);
 }
 
+#[rstest::rstest]
+#[case(r#"'{"a":"x","n":3}'->>'a'"#, "x")]
+#[case(r#"'{"a":"x","n":3}'->'a'"#, r#""x""#)]
+#[case(r#"'{"a":"x","n":3}'->>'n'"#, "3")]
+#[case(r#"'{"a":{"b":[10,20]}}'->'a'->'b'->>1"#, "20")]
+#[case(r#"'{"a":{"b":{"c":"deep"}}}'->'a'->'b'->>'c'"#, "deep")]
+#[case(r#"'{"tags":["x","y"]}'->'tags'"#, r#"["x","y"]"#)]
+#[case(r#"'{"a":"x"}'->>'missing'"#, "NULL")]
+#[case(r#"'[1,2]'->>5"#, "NULL")]
+#[case("'not json'->>'a'", "NULL")]
+#[case(r#"CAST('{"n":"42"}'->>'n' AS INTEGER) + 1"#, "43")]
+#[case("CAST('3.9' AS INTEGER)", "3")]
+#[case("CAST('abc' AS INTEGER)", "NULL")]
+#[case("CAST(2 AS FLOAT)", "2")]
+#[case("CAST(7 AS TEXT)", "7")]
+#[case("CAST('true' AS BOOLEAN)", "true")]
+#[case("CAST(NULL AS INTEGER)", "NULL")]
+fn test_sql_json_arrow_and_cast(#[case] expr: &str, #[case] expected: &str) {
+    let store = DocumentStore::new();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine.execute(&format!("SELECT {expr}")).unwrap();
+    assert_eq!(out.rows[0][0], expected);
+}
+
+#[test]
+fn test_sql_properties_arrow_filter() {
+    let mut store = DocumentStore::new();
+    store
+        .add_str("---\ntitle: A\nrank: 3\n---\n\n# A\n")
+        .unwrap();
+    store
+        .add_str("---\ntitle: B\nrank: 1\n---\n\n# B\n")
+        .unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("SELECT properties->>'title' FROM documents WHERE properties->>'rank' > 2")
+        .unwrap();
+    assert_eq!(out.rows, vec![vec!["A".to_string()]]);
+}
+
 #[test]
 fn test_sql_properties_json_escapes_control_characters() {
     let mut store = DocumentStore::new();
@@ -4781,4 +4821,55 @@ mod write_back_props {
             prop_assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
         }
     }
+}
+
+#[rstest::rstest]
+#[case("SELECT 1", false)]
+#[case("SELECT count(*) FROM documents WHERE properties->>'rank' > 5", false)]
+#[case("select title from Documents order by id", false)]
+#[case("SELECT * FROM blocks", true)]
+#[case("SELECT * FROM links", true)]
+#[case("SELECT * FROM my_view", true)]
+#[case(
+    "SELECT * FROM documents d JOIN blocks b ON b.document_id = d.id",
+    true
+)]
+#[case("SELECT * FROM documents, blocks", true)]
+#[case(
+    "SELECT * FROM documents WHERE id IN (SELECT document_id FROM blocks)",
+    true
+)]
+#[case("WITH x AS (SELECT * FROM blocks) SELECT * FROM documents", true)]
+#[case("SELECT * FROM documents UNION SELECT * FROM documents", true)]
+#[case("UPDATE blocks SET content = 'x'", true)]
+#[case("not sql", true)]
+fn test_statement_needs_blocks(#[case] sql: &str, #[case] expected: bool) {
+    assert_eq!(crate::sql::statement_needs_blocks(sql), expected);
+}
+
+#[test]
+fn test_sql_in_subquery_with_large_list_matches_small_list_semantics() {
+    let mut store = DocumentStore::new();
+    for i in 0..40 {
+        store.add_str(&format!("# H{i}\n\ntext\n")).unwrap();
+    }
+    let engine = SqlEngine::new(&store).unwrap();
+    // >= 32 subquery rows takes the hash-set path.
+    let big = engine
+        .execute("SELECT count(*) FROM documents WHERE id IN (SELECT document_id FROM blocks)")
+        .unwrap();
+    assert_eq!(big.rows[0][0], "40");
+    let none = engine
+        .execute("SELECT count(*) FROM documents WHERE id NOT IN (SELECT document_id FROM blocks)")
+        .unwrap();
+    assert_eq!(none.rows[0][0], "0");
+    let and = engine
+        .execute(
+            "SELECT count(*) FROM documents WHERE id IN (SELECT document_id FROM blocks) AND id > 30",
+        )
+        .unwrap();
+    let expected = engine
+        .execute("SELECT count(*) FROM documents WHERE id > 30")
+        .unwrap();
+    assert_eq!(and.rows[0][0], expected.rows[0][0]);
 }

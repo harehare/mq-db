@@ -6,12 +6,65 @@ use super::datetime::eval_extract;
 use super::fts::{Bm25CorpusScope, QUERY_TABLE_BM25, QUERY_TABLE_TOKENIZERS, TokenizerScope};
 use super::pattern::{compile_regex, like_match_str};
 use super::rows::{eval_sql_value, ident_value};
-use super::scalar::eval_scalar_function;
+use super::scalar::{eval_scalar_function, json_arrow};
 use super::value::{Row, Value};
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, CeilFloorKind, DateTimeField, Expr, Function, FunctionArg,
+    BinaryOperator, CaseWhen, CeilFloorKind, DataType, DateTimeField, Expr, Function, FunctionArg,
     FunctionArgExpr, FunctionArguments, InTarget, TrimWhereField, UnaryOperator, Value as SqlValue,
 };
+
+/// Hashable form of a [`Value`] under `==`; `None` for `NaN`, which never equals itself.
+fn set_key(v: &Value) -> Option<(u8, String)> {
+    Some(match v {
+        Value::Str(s) => (0, s.clone()),
+        Value::Int(i) => (1, i.to_string()),
+        Value::Float(f) if f.is_nan() => return None,
+        Value::Float(f) => (2, f.to_bits().to_string()),
+        Value::Bool(b) => (3, b.to_string()),
+        Value::Null => (4, String::new()),
+    })
+}
+
+/// Keeps the rows where `pred` is truthy. A large `x IN (literals)` (what an
+/// uncorrelated `IN (SELECT ...)` expands to) is checked against a hash set
+/// instead of scanning the whole list for every row.
+pub(super) fn retain_matching(rows: &mut Vec<Row>, pred: &Expr) {
+    const MIN_SET_SIZE: usize = 32;
+    match pred {
+        Expr::Nested(inner) => return retain_matching(rows, inner),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            retain_matching(rows, left);
+            return retain_matching(rows, right);
+        }
+        Expr::In {
+            expr,
+            target: InTarget::List(list),
+            negated,
+            ..
+        } if list.len() >= MIN_SET_SIZE => {
+            let keys: Option<std::collections::HashSet<_>> = list
+                .iter()
+                .map(|e| match e {
+                    Expr::Value(v) => set_key(&eval_sql_value(&v.value)),
+                    _ => None,
+                })
+                .collect();
+            if let Some(keys) = keys {
+                rows.retain(|row| {
+                    let found = set_key(&eval_expr(expr, row)).is_some_and(|k| keys.contains(&k));
+                    found != *negated
+                });
+                return;
+            }
+        }
+        _ => {}
+    }
+    rows.retain(|row| eval_expr(pred, row).is_truthy());
+}
 
 pub(super) fn eval_expr(expr: &Expr, row: &Row) -> Value {
     match expr {
@@ -97,7 +150,9 @@ pub(super) fn eval_expr(expr: &Expr, row: &Row) -> Value {
         }
         Expr::Function(f) => eval_function_call(f, row),
         Expr::Nested(inner) => eval_expr(inner, row),
-        Expr::Cast { expr, .. } => eval_expr(expr, row),
+        Expr::Cast {
+            expr, data_type, ..
+        } => eval_cast(eval_expr(expr, row), data_type),
         Expr::Case {
             operand,
             conditions,
@@ -301,6 +356,11 @@ fn eval_binary(left: &Expr, op: &BinaryOperator, right: &Expr, row: &Row) -> Val
                 },
             }
         }
+        BinaryOperator::Arrow | BinaryOperator::LongArrow => json_arrow(
+            &eval_expr(left, row),
+            &eval_expr(right, row),
+            matches!(op, BinaryOperator::LongArrow),
+        ),
         BinaryOperator::StringConcat => {
             let l = eval_expr(left, row);
             let r = eval_expr(right, row);
@@ -317,6 +377,48 @@ fn cmp_op(l: &Expr, r: &Expr, row: &Row, f: impl Fn(std::cmp::Ordering) -> bool)
             .map(f)
             .unwrap_or(false),
     )
+}
+
+/// `CAST(v AS ty)`; `NULL` when the value cannot convert. Other types pass through.
+fn eval_cast(v: Value, ty: &DataType) -> Value {
+    if matches!(v, Value::Null) {
+        return v;
+    }
+    match ty {
+        DataType::Int(_)
+        | DataType::Integer(_)
+        | DataType::BigInt(_)
+        | DataType::SmallInt(_)
+        | DataType::TinyInt(_) => match numeric(v) {
+            Value::Int(i) => Value::Int(i),
+            Value::Float(f) => Value::Int(f.trunc() as i64),
+            Value::Bool(b) => Value::Int(i64::from(b)),
+            _ => Value::Null,
+        },
+        DataType::Float(_) | DataType::Real | DataType::Double(_) | DataType::DoublePrecision => {
+            match numeric(v) {
+                Value::Int(i) => Value::Float(i as f64),
+                f @ Value::Float(_) => f,
+                _ => Value::Null,
+            }
+        }
+        DataType::Text
+        | DataType::String(_)
+        | DataType::Varchar(_)
+        | DataType::Char(_)
+        | DataType::CharVarying(_) => Value::Str(v.display()),
+        DataType::Boolean | DataType::Bool => match &v {
+            Value::Bool(_) => v,
+            Value::Int(i) => Value::Bool(*i != 0),
+            Value::Str(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "t" | "1" => Value::Bool(true),
+                "false" | "f" | "0" => Value::Bool(false),
+                _ => Value::Null,
+            },
+            _ => Value::Null,
+        },
+        _ => v,
+    }
 }
 
 /// A string holding a number, such as a custom table cell, as that number.

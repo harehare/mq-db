@@ -461,6 +461,12 @@ fn load_store(db: &Path) -> anyhow::Result<DocumentStore> {
 
 /// Open the store in lazy mode and load blocks + indexes ready for SQL execution.
 fn open_store_for_sql(db: &Path) -> anyhow::Result<DocumentStore> {
+    open_store(db, true)
+}
+
+/// Like [`open_store_for_sql`], but skips loading blocks and indexes when
+/// `with_blocks` is false (the query reads catalog metadata only).
+fn open_store(db: &Path, with_blocks: bool) -> anyhow::Result<DocumentStore> {
     if !db.exists() {
         anyhow::bail!(
             "Store file not found: {}\nRun `mq-db index <files...>` to create it.",
@@ -470,6 +476,9 @@ fn open_store_for_sql(db: &Path) -> anyhow::Result<DocumentStore> {
     maybe_migrate(db)?;
     let mut store =
         DocumentStore::open(db).map_err(|e| anyhow::anyhow!("Failed to open store: {}", e))?;
+    if !with_blocks {
+        return Ok(store);
+    }
     store
         .load_all_blocks()
         .map_err(|e| anyhow::anyhow!("Failed to load blocks: {}", e))?;
@@ -974,7 +983,9 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let mut store = open_store_for_sql(&db)?;
+            let needs_blocks =
+                write_back || !attach.is_empty() || mq_db::sql::statement_needs_blocks(&sql);
+            let mut store = open_store(&db, needs_blocks)?;
             attach_all(&store, &attach)?;
             let out = if write_back {
                 store.execute_sql_mut(&sql)

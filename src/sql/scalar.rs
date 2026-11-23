@@ -649,7 +649,11 @@ fn extract_json_path(json: &str, path: &str) -> Value {
             return Value::Null;
         }
     }
-    match cur {
+    json_to_value(cur)
+}
+
+fn json_to_value(v: serde_json::Value) -> Value {
+    match v {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(b),
         serde_json::Value::Number(n) => match n.as_i64() {
@@ -658,5 +662,26 @@ fn extract_json_path(json: &str, path: &str) -> Value {
         },
         serde_json::Value::String(s) => Value::Str(s),
         other => Value::Str(other.to_string()),
+    }
+}
+
+/// `json -> key` (`as_text = false`, JSON text out) and `json ->> key`
+/// (`as_text = true`, typed SQL value out). `key` is an object key or array index.
+pub(super) fn json_arrow(json: &Value, key: &Value, as_text: bool) -> Value {
+    let Some(parsed) = json
+        .as_str()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+    else {
+        return Value::Null;
+    };
+    let found = match key {
+        Value::Str(k) => parsed.get(k.as_str()),
+        Value::Int(i) => usize::try_from(*i).ok().and_then(|i| parsed.get(i)),
+        _ => None,
+    };
+    match found {
+        None => Value::Null,
+        Some(v) if as_text => json_to_value(v.clone()),
+        Some(v) => Value::Str(v.to_string()),
     }
 }

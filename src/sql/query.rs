@@ -4,7 +4,7 @@ use super::analysis::{
     collect_subqueries, expr_has_subquery, validate_expr_columns, validate_projection_columns,
 };
 use super::engine::SqlEngine;
-use super::expr::eval_expr;
+use super::expr::{eval_expr, retain_matching};
 use super::external::table_factor_ident;
 use super::fts::{
     Bm25CorpusScope, QUERY_HAS_BM25, TableBm25Scope, TableTokenizersScope, TokenizerScope,
@@ -352,7 +352,7 @@ impl<'a> SqlEngine<'a> {
                 }
             } else {
                 let resolved = fold_constants(&self.resolve_subqueries(where_expr, None)?);
-                rows.retain(|row| eval_expr(&resolved, row).is_truthy());
+                retain_matching(&mut rows, &resolved);
             }
         }
 
