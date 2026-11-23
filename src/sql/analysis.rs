@@ -13,7 +13,7 @@ use sqlparser::parser::Parser;
 pub(super) fn value_to_expr(v: &Value) -> Expr {
     match v {
         Value::Int(n) => Expr::Value(SqlValue::Number(n.to_string(), false).with_empty_span()),
-        Value::Float(n) => Expr::Value(SqlValue::Number(n.to_string(), false).with_empty_span()),
+        Value::Float(n) => Expr::Value(SqlValue::Number(format!("{n:e}"), false).with_empty_span()),
         Value::Bool(b) => Expr::Value(SqlValue::Boolean(*b).with_empty_span()),
         Value::Str(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone()).with_empty_span()),
         Value::Null => Expr::Value(SqlValue::Null.with_empty_span()),
@@ -282,6 +282,11 @@ pub(super) fn select_own_aliases(select: &Select) -> Vec<String> {
     names
 }
 
+/// Cheap text check shared with the engine: does the query call `bm25(`?
+pub(super) fn sql_uses_bm25(sql: &str) -> bool {
+    sql.to_ascii_lowercase().contains("bm25(")
+}
+
 /// Whether running `sql` needs block data loaded. `false` only for a plain
 /// `SELECT` that reads `documents` (or no table) with no CTE, join or subquery;
 /// anything unrecognised or unparsable gives `true`, the safe default.
@@ -295,7 +300,7 @@ pub fn statement_needs_blocks(sql: &str) -> bool {
     let SetExpr::Select(select) = q.body.as_ref() else {
         return true;
     };
-    if q.with.is_some() || select.from.len() > 1 {
+    if q.with.is_some() || select.from.len() > 1 || sql_uses_bm25(sql) {
         return true;
     }
     if let Some(twj) = select.from.first() {

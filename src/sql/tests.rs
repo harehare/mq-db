@@ -3148,11 +3148,30 @@ fn test_sql_json_extract(#[case] json: &str, #[case] path: &str, #[case] expecte
 #[case("CAST(7 AS TEXT)", "7")]
 #[case("CAST('true' AS BOOLEAN)", "true")]
 #[case("CAST(NULL AS INTEGER)", "NULL")]
+#[case("CAST('18446744073709551615' AS INTEGER)", "NULL")]
+#[case("CAST('9223372036854775807' AS INTEGER)", "9223372036854775807")]
+#[case("CAST('-9223372036854775808' AS INTEGER)", "-9223372036854775808")]
+#[case("CAST('-9223372036854775809' AS INTEGER)", "NULL")]
+#[case("CAST('1e30' AS INTEGER)", "NULL")]
+#[case("CAST('-3.9' AS INTEGER)", "-3")]
 fn test_sql_json_arrow_and_cast(#[case] expr: &str, #[case] expected: &str) {
     let store = DocumentStore::new();
     let engine = SqlEngine::new(&store).unwrap();
     let out = engine.execute(&format!("SELECT {expr}")).unwrap();
     assert_eq!(out.rows[0][0], expected);
+}
+
+#[test]
+fn test_sql_where_constant_float_cast_keeps_fraction() {
+    let mut store = DocumentStore::new();
+    store.add_str("# A\n\nx\n\ny\n").unwrap();
+    let engine = SqlEngine::new(&store).unwrap();
+    let out = engine
+        .execute("SELECT id FROM documents WHERE block_count / CAST(2 AS FLOAT) > 1.25")
+        .unwrap();
+    let all = engine.execute("SELECT block_count FROM documents").unwrap();
+    let n: f64 = all.rows[0][0].parse().unwrap();
+    assert_eq!(out.rows.len(), usize::from(n / 2.0 > 1.25));
 }
 
 #[test]
@@ -4842,6 +4861,7 @@ mod write_back_props {
 #[case("WITH x AS (SELECT * FROM blocks) SELECT * FROM documents", true)]
 #[case("SELECT * FROM documents UNION SELECT * FROM documents", true)]
 #[case("UPDATE blocks SET content = 'x'", true)]
+#[case("SELECT title FROM documents WHERE bm25(title, 'widget') > 0", true)]
 #[case("not sql", true)]
 fn test_statement_needs_blocks(#[case] sql: &str, #[case] expected: bool) {
     assert_eq!(crate::sql::statement_needs_blocks(sql), expected);

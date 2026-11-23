@@ -391,7 +391,10 @@ fn eval_cast(v: Value, ty: &DataType) -> Value {
         | DataType::SmallInt(_)
         | DataType::TinyInt(_) => match numeric(v) {
             Value::Int(i) => Value::Int(i),
-            Value::Float(f) => Value::Int(f.trunc() as i64),
+            Value::Float(f) => match float_to_i64(f) {
+                Some(i) => Value::Int(i),
+                None => Value::Null,
+            },
             Value::Bool(b) => Value::Int(i64::from(b)),
             _ => Value::Null,
         },
@@ -421,13 +424,24 @@ fn eval_cast(v: Value, ty: &DataType) -> Value {
     }
 }
 
+/// Truncates toward zero; `None` for non-finite or outside `[-2^63, 2^63)`.
+fn float_to_i64(f: f64) -> Option<i64> {
+    let t = f.trunc();
+    (t.is_finite() && (-9223372036854775808.0..9223372036854775808.0).contains(&t))
+        .then_some(t as i64)
+}
+
 /// A string holding a number, such as a custom table cell, as that number.
 /// Anything else is returned unchanged.
 fn numeric(v: Value) -> Value {
     match &v {
         Value::Str(s) => {
-            if let Ok(n) = s.trim().parse::<i64>() {
+            let t = s.trim();
+            if let Ok(n) = t.parse::<i64>() {
                 Value::Int(n)
+            } else if is_integer_text(t) {
+                // Integer syntax that overflowed i64: don't round through f64.
+                v
             } else if let Some(f) = s.trim().parse::<f64>().ok().filter(|f| f.is_finite()) {
                 Value::Float(f)
             } else {
@@ -436,6 +450,11 @@ fn numeric(v: Value) -> Value {
         }
         _ => v,
     }
+}
+
+fn is_integer_text(s: &str) -> bool {
+    let d = s.strip_prefix(['+', '-']).unwrap_or(s);
+    !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn arith_op(
