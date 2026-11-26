@@ -118,7 +118,7 @@ impl<'a> SqlEngine<'a> {
             }
         }
         let prev_has_bm25 = QUERY_HAS_BM25.with(std::cell::Cell::get);
-        QUERY_HAS_BM25.with(|c| c.set(trimmed.to_ascii_lowercase().contains("bm25(")));
+        QUERY_HAS_BM25.with(|c| c.set(super::analysis::sql_uses_bm25(trimmed)));
         let _bm25_guard = Bm25QueryScope(prev_has_bm25);
 
         struct ColumnNeedsScope(ColumnNeeds);

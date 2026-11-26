@@ -25,7 +25,11 @@ SELECT id, document_id, block_type, content, pre, post,
 
 ```sql
 SELECT path FROM documents
-WHERE json_extract(properties, 'owner') = 'alice';
+WHERE properties->>'owner' = 'alice';
+
+-- `->` returns JSON text, `->>` returns a typed value; chain them for nesting
+SELECT path FROM documents
+WHERE CAST(properties->>'rank' AS INTEGER) >= 3;
 ```
 
 ## `links`
