@@ -389,7 +389,7 @@ fn eval_cast(v: Value, ty: &DataType) -> Value {
         | DataType::Integer(_)
         | DataType::BigInt(_)
         | DataType::SmallInt(_)
-        | DataType::TinyInt(_) => match numeric(v) {
+        | DataType::TinyInt(_) => match int_cast_operand(v) {
             Value::Int(i) => Value::Int(i),
             Value::Float(f) => match float_to_i64(f) {
                 Some(i) => Value::Int(i),
@@ -439,16 +439,23 @@ fn numeric(v: Value) -> Value {
             let t = s.trim();
             if let Ok(n) = t.parse::<i64>() {
                 Value::Int(n)
-            } else if is_integer_text(t) {
-                // Integer syntax that overflowed i64: don't round through f64.
-                v
-            } else if let Some(f) = s.trim().parse::<f64>().ok().filter(|f| f.is_finite()) {
+            } else if let Some(f) = t.parse::<f64>().ok().filter(|f| f.is_finite()) {
                 Value::Float(f)
             } else {
                 v
             }
         }
         _ => v,
+    }
+}
+
+/// Like `numeric`, but whole-number text outside `i64` becomes `Null` rather than a rounded float.
+fn int_cast_operand(v: Value) -> Value {
+    match &v {
+        Value::Str(s) if is_integer_text(s.trim()) && s.trim().parse::<i64>().is_err() => {
+            Value::Null
+        }
+        _ => numeric(v),
     }
 }
 

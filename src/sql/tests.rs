@@ -3154,6 +3154,9 @@ fn test_sql_json_extract(#[case] json: &str, #[case] path: &str, #[case] expecte
 #[case("CAST('-9223372036854775809' AS INTEGER)", "NULL")]
 #[case("CAST('1e30' AS INTEGER)", "NULL")]
 #[case("CAST('-3.9' AS INTEGER)", "-3")]
+#[case("CAST('18446744073709551616' AS FLOAT)", "18446744073709552000")]
+#[case("'18446744073709551616' / 2", "9223372036854776000")]
+#[case("'18446744073709551616' + 0", "18446744073709552000")]
 fn test_sql_json_arrow_and_cast(#[case] expr: &str, #[case] expected: &str) {
     let store = DocumentStore::new();
     let engine = SqlEngine::new(&store).unwrap();
